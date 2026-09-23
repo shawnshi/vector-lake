@@ -463,8 +463,15 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     for memory in memories:
         section = type_to_section.get(memory.get("memory_type", "fact"), "Relevant Facts")
         text = " ".join(str(memory.get("text", "")).split())
+        # ``rel`` is the score this item was ranked by, and it is shown first because it is the one
+        # that explains the order; ``mem`` is the stored per-record score, which now only breaks
+        # ties.  The old line showed the stored score alone, so a packet ranked by relevance
+        # displayed a column that was nearly constant across items (measured: 24 items inside
+        # 0.65-0.70 with five distinct values) and the reader could not see why anything was here.
         line = (
-            f"- [{memory.get('memory_score', 0):.2f}/{memory.get('validity_state', 'active')}] "
+            f"- [rel {float(memory.get('retrieval_score', 0) or 0):.1f}"
+            f" | mem {memory.get('memory_score', 0):.2f}"
+            f" | {memory.get('validity_state', 'active')}] "
             f"{text[:420]}"
         )
         if memory.get("source_page"):

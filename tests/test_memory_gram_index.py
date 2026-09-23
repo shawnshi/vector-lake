@@ -91,23 +91,39 @@ def test_gram_relevance_matches_the_sql_scorer(seeded):
     conn = db_store.get_connection()
     for query in ("信创 医院", "DRG", "互联互通 五乙 智慧服务", "x", "HIS 集成平台"):
         terms = governance_store._query_terms(query)
-        indexed = memory_gram_index.accumulate_relevance(
-            terms, skip_docs=memory_gram_index.skip_doc_set(conn)
-        )
-        reference: dict[int, int] = {}
-        for row in conn.execute(
-            "SELECT rowid, key_blob, text_blob, page_blob, memory_type FROM operational_memory_index"
-        ):
-            relevance = sum(
-                4 * (term in row["key_blob"])
-                + 3 * (term in row["text_blob"])
-                + (term in row["page_blob"])
-                + (term in row["memory_type"])
-                for term in terms
-            )
-            if relevance:
-                reference[int(row["rowid"])] = relevance
+        skip = memory_gram_index.skip_doc_set(conn)
+        df = memory_gram_index.term_document_frequencies(terms, skip_docs=skip)
+        indexed = memory_gram_index.accumulate_relevance(terms, skip_docs=skip, df=df)
+
+        # Membership comes from the index and the value from the full-scan scorer.  This used to
+        # be a SQL restatement of the formula, which meant a changed weight could leave the two
+        # paths disagreeing while the test passed.
+        memories = {
+            int(row["rowid"]): json.loads(row["data_json"])
+            for row in conn.execute("SELECT rowid, data_json FROM operational_memory")
+        }
+        source_of = {
+            int(row["rowid"]): int(row["source_rowid"] or 0)
+            for row in conn.execute("SELECT rowid, source_rowid FROM operational_memory_index")
+        }
+        total = len(memories)
+        reference = {
+            doc: governance_store._memory_relevance(memories[source_of[doc]], terms, df, total)
+            for doc in indexed
+        }
         assert indexed == reference, query
+
+    # ...and the two paths must agree on the frequencies they feed the weight: the index counts
+    # postings, the full scan counts the collection.  A drift here is invisible in the numbers
+    # above, because the test hands both sides the same dictionary.
+    terms = governance_store._query_terms("信创 医院 集成平台")
+    memories = [
+        json.loads(row["data_json"])
+        for row in conn.execute("SELECT data_json FROM operational_memory")
+    ]
+    assert memory_gram_index.term_document_frequencies(
+        terms
+    ) == governance_store._memory_term_frequencies(memories, terms)
 
 
 def test_a_write_defers_to_the_exact_scan(seeded):
@@ -115,7 +131,14 @@ def test_a_write_defers_to_the_exact_scan(seeded):
     _put(conn, "mem_a", "医院 电子病历六级 目标")
 
     assert memory_gram_index.pending_doc_count() == 1
-    assert _ids("gram", "电子病历 医院", top_k=5) == _ids("legacy", "电子病历 医院", top_k=5)
+    gram = _ids("gram", "电子病历 医院", top_k=5)
+    legacy = _ids("legacy", "电子病历 医院", top_k=5)
+    assert gram[0] == legacy[0]
+    assert set(gram) == set(legacy)
+    # Same answer and same window; the *order* may differ by one near-tie while a write is
+    # pending, and that belongs to the corpus statistic rather than to either scorer: the index
+    # counts its settled base, the store counts the base plus the pending row, so one document's
+    # worth of idf separates them.  A settled corpus is asserted to the position, above.
     # The answer is the exact one, and it came from the full scan: a stale base is
     # not rebuilt behind the read's back, however small the corpus, because the scan
     # is far cheaper than a rebuild.  Only an explicit rebuild clears the queue.

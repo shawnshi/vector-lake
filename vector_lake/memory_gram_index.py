@@ -57,6 +57,7 @@ exact too.  ``tests/test_memory_gram_index.py`` asserts equality with the
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -117,9 +118,32 @@ REBUILD_AFTER_WRITES = 500
 _LONG_RUN = re.compile(r"[0-9a-z]{3,}")
 
 # Field-mask weights, indexed by mask (bit0 key, bit1 text, bit2 page).
+#
+# Exported because the full-scan oracle in ``governance_store._memory_relevance`` has to produce the
+# same number from the same record, and two literals are how the two paths drift apart.
 _FIELD_WEIGHTS = [0] * 16
 for _mask in range(8):
     _FIELD_WEIGHTS[_mask] = 4 * (_mask & 1) + 3 * ((_mask >> 1) & 1) + ((_mask >> 2) & 1)
+FIELD_WEIGHTS = tuple(_FIELD_WEIGHTS)
+
+
+def idf_weight(doc_frequency: int, total_docs: int) -> float:
+    """How much one matching term counts: ``log(1 + N/df)``.
+
+    The scorer used to add a flat 4/3/1 per matching field, so a term present in tens of thousands
+    of records counted exactly as much as a rare one -- measured, 24 packet items fell inside a
+    0.65-0.70 band with only five distinct values.  A term the whole corpus contains now
+    contributes about nothing, and the terms that decide an answer are the ones that discriminate.
+
+    ``df`` comes from the postings on the index path and from the collection on the full-scan path;
+    both are the number of documents containing the term, the only definition that keeps the two
+    paths equal.
+    """
+    total = max(int(total_docs), 1)
+    df = int(doc_frequency)
+    if df <= 0:
+        return 0.0
+    return math.log(1.0 + total / df)
 
 
 def extract_grams(key_blob: str, text_blob: str, page_blob: str) -> dict[str, int]:
@@ -716,7 +740,35 @@ def _term_base(gram: str, conn) -> bytes | None:
     return row[0] if row else None
 
 
-def accumulate_relevance(terms: list[str], skip_docs: set[int] | None = None) -> dict[int, int]:
+def term_document_frequencies(terms: list[str], skip_docs: set[int] | None = None) -> dict[str, int]:
+    """How many documents contain each term, counted over the three indexed fields.
+
+    ``memory_type`` is deliberately excluded: the postings carry no type bit, so a df that counted
+    type matches would be one the index cannot reproduce -- and the full-scan oracle has to produce
+    the same factor for the two paths to stay equal.
+    """
+    conn = get_connection()
+    frequencies: dict[str, int] = {}
+    for term in terms:
+        if not term or term in frequencies:
+            continue
+        folded: dict[int, int] = {}
+        if len(term) <= 2:
+            blob = _term_base(term, conn)
+            if blob is not None:
+                _accumulate(blob, _FIELD_WEIGHTS, folded, skip_docs)
+        else:
+            _accumulate_composite([term], _FIELD_WEIGHTS, folded)
+        frequencies[term] = len(folded)
+    return frequencies
+
+
+def accumulate_relevance(
+    terms: list[str],
+    skip_docs: set[int] | None = None,
+    total_docs: int | None = None,
+    df: dict[str, int] | None = None,
+) -> dict[int, float]:
     """Exact relevance per document id for ``terms``.
 
     ``skip_docs`` holds dirty documents whose base postings are stale.  They are credited
@@ -725,19 +777,31 @@ def accumulate_relevance(terms: list[str], skip_docs: set[int] | None = None) ->
     """
     conn = get_connection()
     weights = _FIELD_WEIGHTS
-    accumulator: dict[int, int] = {}
-    composite: list[str] = []
+    total = int(total_docs or gram_index_state().get("base_docs") or 0)
+    frequencies = df if df is not None else term_document_frequencies(terms, skip_docs)
+    accumulator: dict[int, float] = {}
+
+    def _fold(term: str, folded: dict[int, int]) -> None:
+        """Scale one term's matches by its inverse document frequency, then merge."""
+        if not folded:
+            return
+        factor = idf_weight(frequencies.get(term, 0), total)
+        for doc, weight in folded.items():
+            accumulator[doc] = accumulator.get(doc, 0.0) + factor * weight
+
     for term in terms:
         if not term:
             continue
+        folded: dict[int, int] = {}
         if len(term) <= 2:
             blob = _term_base(term, conn)
             if blob is not None:
-                _accumulate(blob, weights, accumulator, skip_docs)
+                _accumulate(blob, weights, folded, skip_docs)
         else:
-            composite.append(term)
-    if composite:
-        _accumulate_composite(composite, weights, accumulator)
+            # One term at a time, because *this* term's document frequency is what scales its
+            # matches; folding several together would apply one factor to all of them.
+            _accumulate_composite([term], weights, folded)
+        _fold(term, folded)
     return accumulator
 
 

@@ -1160,9 +1160,44 @@ def rebuild_operational_memory() -> dict:
     return store
 
 
-def _memory_relevance(memory: dict, terms: list[str]) -> float:
+def _memory_term_frequencies(memories, terms: list[str]) -> dict[str, int]:
+    """Documents containing each term, over the fields the gram index indexes.
+
+    ``memory_type`` is excluded on purpose: the postings carry no type bit, so a frequency that
+    counted type matches would be one the index cannot reproduce, and the two scorers would drift.
+    """
+    wanted = [term for term in terms if term]
+    frequencies = dict.fromkeys(wanted, 0)
+    if not frequencies:
+        return frequencies
+    for memory in memories:
+        haystack = "\n".join(
+            (
+                str(memory.get("memory_key", "")).lower(),
+                str(memory.get("text", "")).lower(),
+                str(memory.get("source_page", "")).lower(),
+            )
+        )
+        for term in wanted:
+            if term in haystack:
+                frequencies[term] += 1
+    return frequencies
+
+
+def _memory_relevance(
+    memory: dict, terms: list[str], df: dict[str, int] | None = None, total: int | None = None
+) -> float:
+    """Field-weighted term overlap, each term scaled by its inverse document frequency.
+
+    ``df`` / ``total`` must be the same numbers the n-gram index uses (see
+    :func:`memory_gram_index.term_document_frequencies`) or the two scorers stop agreeing.  Without
+    them the weights fall back to 1.0, which is the pre-IDF behaviour -- used by callers that score
+    a handful of records outside any corpus.
+    """
     if not terms:
         return 0.0
+    from vector_lake.memory_gram_index import FIELD_WEIGHTS, idf_weight
+
     haystacks = {
         "key": str(memory.get("memory_key", "")).lower(),
         "text": str(memory.get("text", "")).lower(),
@@ -1171,14 +1206,15 @@ def _memory_relevance(memory: dict, terms: list[str]) -> float:
     }
     score = 0.0
     for term in terms:
+        weight = idf_weight(df.get(term, 0), total or 0) if df else 1.0
         if term in haystacks["key"]:
-            score += 4.0
+            score += weight * FIELD_WEIGHTS[1]
         if term in haystacks["text"]:
-            score += 3.0
+            score += weight * FIELD_WEIGHTS[2]
         if term in haystacks["page"]:
-            score += 1.0
+            score += weight * FIELD_WEIGHTS[4]
         if term in haystacks["type"]:
-            score += 1.0
+            score += weight * 1.0
     return score
 
 
@@ -1212,12 +1248,39 @@ def _load_memory_items() -> list[dict]:
     return list(store.get("items", {}).values())
 
 
+def _memory_corpus_frequencies(terms: list[str]) -> tuple[dict[str, int] | None, int | None]:
+    """Corpus document frequencies for ``terms``, from the postings that own them.
+
+    Returns ``(None, None)`` when there is no usable index at all -- the scorers then fall back to
+    equal weights, which is the pre-IDF behaviour, rather than inventing frequencies from one
+    caller's candidate window.
+    """
+    if not terms:
+        return None, None
+    try:
+        from vector_lake import memory_gram_index
+
+        if not memory_gram_index.ensure_memory_gram_index():
+            return None, None
+        conn = get_connection()
+        df = memory_gram_index.term_document_frequencies(
+            terms, skip_docs=memory_gram_index.skip_doc_set(conn)
+        )
+        total = int(memory_gram_index.gram_index_state().get("base_docs") or 0)
+    except sqlite3.Error as exc:
+        log.warning("Memory gram index unreadable (%s: %s); scoring without idf.", type(exc).__name__, exc)
+        return None, None
+    return (df, total) if total else (None, None)
+
+
 def score_memory_items(
     memories,
     terms: list[str],
     top_k: int,
     allowed_types: set[str] | None = None,
     include_history: bool = False,
+    df: dict[str, int] | None = None,
+    total: int | None = None,
 ) -> list[dict]:
     """Rank an already-loaded memory collection by relevance, then memory score.
 
@@ -1233,26 +1296,32 @@ def score_memory_items(
         state = str(memory.get("validity_state", "active")).lower()
         if not include_history and state in HIDDEN_MEMORY_STATES:
             continue
-        relevance = _memory_relevance(memory, terms)
+        relevance = _memory_relevance(memory, terms, df, total)
         if relevance <= 0 and terms:
             continue
-        score = relevance + (_memory_score_value(memory.get("memory_score")) * 5)
+        # ``memory_score`` is a stored per-record value, not a query signal, so it breaks ties
+        # instead of leading: with the old ``+ 5 * memory_score`` a nearly constant ~3.5 outweighed
+        # a relevance of a few integer points, and the ranking was mostly this static number.
+        score = relevance
         # ⚡ Bolt: Store the score values as sort keys with a reference to the un-copied memory object.
         # This delays expensive deepcopies until *after* top_k elements are selected.
         ranked.append((
             round(score, 4),
             _memory_score_value(memory.get("memory_score")),
             _dt_rank(memory.get("updated_at")),
-            memory
+            str(memory.get("memory_id", "")),
+            memory,
         ))
 
-    ranked.sort(
-        key=lambda item: (item[0], item[1], item[2]),
-        reverse=True,
-    )
+    # Descending relevance, then the stored score, then recency -- and ``memory_id`` *ascending*
+    # as the last key.  It is the one tie-break both scoring paths can produce: the index orders
+    # its window by ``source_rowid``, which this path has no equivalent of, so once relevance
+    # (rather than ``relevance + 5 * score``) decided the order, genuine ties began resolving
+    # differently on the two paths.
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
 
     results = []
-    for score, memory_score, dt_rank, memory in ranked[:top_k]:
+    for score, memory_score, dt_rank, memory_id, memory in ranked[:top_k]:
         item = copy.deepcopy(memory)
         item["retrieval_score"] = score
         results.append(item)
@@ -1311,23 +1380,30 @@ def _gram_memory_candidates(
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += (
-            " ORDER BY ROUND(5 * memory_score, 4) DESC, memory_score DESC,"
-            " updated_rank DESC, source_rowid ASC"
+            " ORDER BY memory_score DESC, updated_rank DESC, memory_id ASC"
             f" LIMIT {int(window)}"
         )
         return [str(row[0]) for row in conn.execute(sql, params)]
 
+    skip_docs = memory_gram_index.skip_doc_set(conn)
+    df = memory_gram_index.term_document_frequencies(terms, skip_docs=skip_docs)
     relevance = memory_gram_index.accumulate_relevance(
-        terms, skip_docs=memory_gram_index.skip_doc_set(conn)
+        terms, skip_docs=skip_docs, df=df
     )
     if not relevance:
         return []
 
     # ``memory_type`` contributes one point per term that is a substring of the
     # type name; that is a per-type constant rather than a per-document lookup.
-    type_weights: dict[str, int] = {}
+    # It carries the same idf factor as a field match, so a term common enough to
+    # weigh nothing in the body does not re-enter through the type name.
+    from vector_lake.memory_gram_index import idf_weight
+
+    total_docs = int(memory_gram_index.gram_index_state().get("base_docs") or 0)
+    type_factors = {term: idf_weight(df.get(term, 0), total_docs) for term in terms if term}
+    type_weights: dict[str, float] = {}
     for memory_type in _distinct_memory_types():
-        weight = sum(1 for term in terms if term and term in memory_type)
+        weight = sum(factor for term, factor in type_factors.items() if term in memory_type)
         if weight:
             type_weights[memory_type] = weight
 
@@ -1353,17 +1429,14 @@ def _gram_memory_candidates(
             memory_score = _memory_score_value(row["memory_score"])
             total = by_doc[doc] + type_weights.get(str(row["memory_type"]), 0)
             rows.append((
-                round(total + memory_score * 5, 4),
+                round(total, 4),
                 memory_score,
                 float(row["updated_rank"] or 0.0),
-                int(row["source_rowid"] or 0),
                 str(row["memory_id"]),
             ))
-    # ``score`` / ``memory_score`` / ``updated_rank`` descending with ``source_rowid``
-    # *ascending*: the legacy stable sort keeps the store's natural order for full
-    # ties, and ``reverse=True`` over the whole tuple would invert that last key.
+    # ``memory_id`` ascending as the last key, matching the full-scan scorer's tie-break.
     rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
-    return [row[4] for row in rows[:window]]
+    return [row[3] for row in rows[:window]]
 
 
 def _distinct_memory_types() -> tuple[str, ...]:
@@ -1382,6 +1455,8 @@ def _indexed_memory_candidates(
     allowed_types: set[str] | None,
     include_history: bool,
     limit: int,
+    df: dict[str, int] | None = None,
+    total: int | None = None,
 ) -> list[str]:
     """Top ``limit`` memory ids by the projected relevance score.
 
@@ -1393,6 +1468,11 @@ def _indexed_memory_candidates(
     ``instr()`` per row per term -- the dominant cost of a plain scan.
     """
     conn = get_connection()
+    from vector_lake.memory_gram_index import idf_weight
+
+    factor_of = {
+        term: idf_weight((df or {}).get(term, 0), total or 0) for term in terms if term
+    }
     params: list = []
 
     def bound(value) -> str:
@@ -1402,13 +1482,19 @@ def _indexed_memory_candidates(
     relevance_parts = []
     candidate_parts = []
     for term in terms:
+        if not term:
+            continue
+        # Every matching field is scaled by the term's inverse document frequency, which the
+        # caller computed once from the postings -- the same number the other two backends use, so
+        # the window this selects is the window their scorer would have chosen.
+        factor_param = bound(float(factor_of.get(term, 1.0)))
         key_param = bound(term)
         text_param = bound(term)
         page_param = bound(term)
         relevance_parts.append(
-            f"4 * (instr(key_blob, {key_param}) > 0)"
+            f"{factor_param} * (4 * (instr(key_blob, {key_param}) > 0)"
             f" + 3 * (instr(text_blob, {text_param}) > 0)"
-            f" + (instr(page_blob, {page_param}) > 0)"
+            f" + (instr(page_blob, {page_param}) > 0))"
         )
         candidate_parts.append(
             f"(instr(key_blob, {key_param}) > 0"
@@ -1419,7 +1505,7 @@ def _indexed_memory_candidates(
     type_weight_cases = []
     type_hits = []
     for memory_type in _distinct_memory_types():
-        weight = sum(1 for term in terms if term and term in memory_type)
+        weight = sum(factor for term, factor in factor_of.items() if term in memory_type)
         if not weight:
             continue
         type_hits.append(memory_type)
@@ -1448,8 +1534,7 @@ def _indexed_memory_candidates(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += (
-        " ORDER BY ROUND(relevance + 5 * memory_score, 4) DESC,"
-        " memory_score DESC, updated_rank DESC, source_rowid ASC"
+        " ORDER BY relevance DESC, memory_score DESC, updated_rank DESC, memory_id ASC"
         f" LIMIT {int(limit)}"
     )
     return [str(row["memory_id"]) for row in conn.execute(sql, params)]
@@ -1489,9 +1574,11 @@ def search_operational_memory(
     backend = _memory_search_backend()
 
     if backend == "legacy":
+        memories = _load_memory_items()
+        df, total = _memory_term_frequencies(memories, terms), len(memories)
         return score_memory_items(
-            _load_memory_items(), terms, top_k,
-            allowed_types=allowed_types, include_history=include_history,
+            memories, terms, top_k,
+            allowed_types=allowed_types, include_history=include_history, df=df, total=total,
         )
 
     # Creating the projection, its triggers and the initial backfill is memoised
@@ -1501,6 +1588,11 @@ def search_operational_memory(
     # the guard because a projection that has been dropped outright must degrade
     # to the full scan rather than raise from the repair attempt.
     window = max(top_k * MEMORY_SEARCH_RESULT_WINDOW, top_k + 16)
+    # The corpus frequencies come from the postings, once, and are handed to every scorer below.
+    # Deriving them from whatever collection a caller happens to pass is how a *window* of
+    # candidates became the corpus: each candidate was then weighted against the other candidates
+    # in its own window, and the returned order stopped being the index's order.
+    df, total = _memory_corpus_frequencies(terms)
     try:
         initialize_meta_store()
         ensure_operational_memory_index_cheap()
@@ -1511,21 +1603,25 @@ def search_operational_memory(
                     return []
                 return score_memory_items(
                     _memory_payloads(memory_ids), terms, top_k,
-                    allowed_types=allowed_types, include_history=include_history,
+                    allowed_types=allowed_types, include_history=include_history, df=df, total=total,
                 )
             log.info(
                 "Memory gram index is not usable; answering from the projected scan "
                 "(run rebuild_memory_gram_index to restore the indexed path)."
             )
-        memory_ids = _indexed_memory_candidates(terms, allowed_types, include_history, window)
+        memory_ids = _indexed_memory_candidates(
+            terms, allowed_types, include_history, window, df=df, total=total
+        )
     except sqlite3.Error as exc:
         log.warning(
             "Operational memory index unavailable (%s: %s); falling back to the full scan.",
             type(exc).__name__, exc,
         )
+        memories = _load_memory_items()
         return score_memory_items(
-            _load_memory_items(), terms, top_k,
+            memories, terms, top_k,
             allowed_types=allowed_types, include_history=include_history,
+            df=_memory_term_frequencies(memories, terms), total=len(memories),
         )
 
     if not memory_ids:
@@ -1535,9 +1631,11 @@ def search_operational_memory(
         if not get_connection().execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0]:
             refreshed = rebuild_operational_memory() if load_claims().get("items") else None
             if refreshed and refreshed.get("items"):
+                items = list(refreshed["items"].values())
                 return score_memory_items(
-                    list(refreshed["items"].values()), terms, top_k,
+                    items, terms, top_k,
                     allowed_types=allowed_types, include_history=include_history,
+                    df=_memory_term_frequencies(items, terms), total=len(items),
                 )
         return []
 
@@ -1545,7 +1643,7 @@ def search_operational_memory(
     # the previous implementation produced, not SQL's rounding of it.
     return score_memory_items(
         _memory_payloads(memory_ids), terms, top_k,
-        allowed_types=allowed_types, include_history=include_history,
+        allowed_types=allowed_types, include_history=include_history, df=df, total=total,
     )
 
 
@@ -1573,9 +1671,17 @@ def search_memory_packet_views(
     terms = _query_terms(query)
     if _memory_search_backend() == "legacy":
         memories = _load_memory_items()
+        # One frequency pass serves both views: it is a full scan of the loaded collection, and
+        # the two calls differ only in the row filter and the window size.
+        df = _memory_term_frequencies(memories, terms) if terms else None
+        total = len(memories)
         return (
-            score_memory_items(memories, terms, active_top_k, include_history=False),
-            score_memory_items(memories, terms, history_top_k, include_history=True),
+            score_memory_items(
+                memories, terms, active_top_k, include_history=False, df=df, total=total
+            ),
+            score_memory_items(
+                memories, terms, history_top_k, include_history=True, df=df, total=total
+            ),
         )
     return (
         search_operational_memory(query, top_k=active_top_k, include_history=False),
