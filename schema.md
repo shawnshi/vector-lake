@@ -134,11 +134,31 @@ Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" ph
 B. Exempted & Synthesis Files (Semi-Structured)
 Target Files: Source_*.md, Synthesis_*.md.
 Constraint: DO NOT apply the Dual-Schema timeline format to these files.
-For Source_*.md: Use free-form summaries and extract lists.
+
+For Source_*.md: free-form summaries and extract lists remain allowed, and this exemption is why
+the corpus's `Source_*` pages carry 3 200 distinct H2 headings. A **recommended** skeleton is now
+declared in `templates/Source.md` (`## 来源核验`, `## 概要摘录`, `## 结构化摘录`), matching the
+three headings the corpus already uses most. It is not enforced, because enforcing it would
+require rewriting 1 798 existing pages; new sources should follow it, and the retrieval layer can
+depend on those three names existing.
+
 For Synthesis_*.md: MUST instantiate a lightweight semantic skeleton before free-form analysis. The document MUST begin with:
 ## 核心合成论点 (Core Synthesized Claims) (No-Pronoun Constraint enforced).
 ## 支撑拓扑 (Supporting Topology) (Listing critical [predicate:: [[Target]]] vectors driving the synthesis).
-Free-form markdown analysis follows.
+Free-form markdown analysis follows. This is the one section rule the schema gate enforces
+(`schema_validator.validate_schema`), and all 22 live synthesis pages satisfy it.
+
+C. Generated Artifacts (Not Authored)
+Target Files: `System_Community_*.md` (the clustering daemon's community indexes).
+Constraint: these are pages the wiki writes **about itself**, not knowledge nodes. They are exempt
+from `domain`, `epistemic-status` and `sources`, carry `categories: [System]`, and every other
+layer (indexer, link resolution, governance extraction) skips them.
+
+The namespace is not a knowledge namespace. 235 knowledge pages had been filed under `System_` by
+2026-09-23; because the whole system skips that prefix, they were absent from the index,
+unreachable by link, and exempt from three required fields. The authoring gate therefore refuses
+a **new** node whose filename starts with `System_` unless it is an artifact; existing ones are
+left for a rename pass. Use a knowledge prefix (`Concept_`, `Source_`, `Vendor_`, ...) instead.
 
 5. Workflows
 (Standard workflows for Ingestion, Query-to-Page, and Linting remain intact. Trigger MCP tools enqueue_governance_item for conflicts, and resolve_governance_item for node merges.)
