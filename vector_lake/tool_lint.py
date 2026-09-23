@@ -234,6 +234,9 @@ def lint_vector_lake(auto_fix: bool = False):
     stubs_refused = 0
     #: how many pages assert a controlled metric, keyed by the tier that supports them.
     metric_tiers: Counter = Counter()
+    #: the census line, rendered under section 16 but not a finding.  A healthy census must not
+    #: make the section read FAIL -- it did, until this was separated from ``issues``.
+    metric_evidence_summary: list[str] = []
 
     parsed = {}
     id_map = {}
@@ -564,7 +567,7 @@ def lint_vector_lake(auto_fix: bool = False):
             for tier, count in metric_tiers.most_common()
             if tier != "<none>"
         )
-        issues["evidence"].append(
+        metric_evidence_summary.append(
             f"coverage: {total_asserting - missing} of {total_asserting} metric-asserting page(s) "
             f"declare a tier ({spread or 'none declared'})"
         )
@@ -840,6 +843,11 @@ def lint_vector_lake(auto_fix: bool = False):
         if key == "similarity":
             lines.extend(f"    {line}" for line in collision_summary)
             sample_limit = 5
+        elif key == "evidence":
+            # Same shape as the collision summary: the census is context for the findings, not
+            # one of them, so it must not turn a clean section into a FAIL.
+            lines.extend(f"    {line}" for line in metric_evidence_summary)
+            sample_limit = 10
         else:
             sample_limit = 10
         for item in items[:sample_limit]:
