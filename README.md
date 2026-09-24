@@ -27,6 +27,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 | 删除类命令默认演练 | `gc` / `delete` 默认 dry-run，必须 `--apply` 才落盘 | 保持默认；仅在确认 dry-run 输出后追加 `--apply` |
 | 修复类工具需要后置重建 | `wiki-restore` 会恢复 Markdown，但索引投影需单独重建 | 按其输出末尾提示运行 `projection-rebuild-index --apply` |
 | 全量重建成本随语料线性增长 | 冷启动需对全部正文分词（5000 页约 100 秒）；未变更节点会被跳过 | 仅在有结构变更时全量重建；日常依赖增量更新 |
+| 检索成本几乎全在向量臂，且随语料线性 | 7,164 页实例上单查询热态中位 **210 ms**，其中向量臂 **167 ms（80%）**、Phase-2 重排 6 ms、FTS 臂 2 ms（2026-09-24 审计实测）。`vec_embeddings` 走 sqlite-vec 的 `vec0`，是 C 实现的**线性** KNN、没有 ANN 索引，按此比例 10 万页约 **2.3 s**（**线性外推，未实测**） | 语料再大一个量级时给向量臂换 ANN 索引（HNSW/IVF）或降维；当前规模下无需处理 |
 | 人工编辑会经过校验 | 未通过 schema / 目的契约校验的手改页面会被拒绝并保留原文件，日志给出原因 | 修复页面后重新保存，或查看守护进程状态文件的 `current_action` |
 
 ## Architecture
@@ -154,6 +155,8 @@ graph TD
 - `decision`：已批准或当前有效的决策。
 - `task_state`：任务状态、阻塞项、待处理事项。
 
+**类型的来源（2026-09-24 起）**：槽位**只由声明决定** —— claim 自带的 `memory_type`，或命名了槽位的 `claim_type`；其余一律 `fact`。此前 `infer_memory_type` 在没有声明时会扫正文关键词（`方案/采用` → decision、`状态` → task_state、`偏好` → preference），实测它把两个非 fact 槽位**整个伪造**了出来：产出的 6,681 条里，4,842 条 decision **全部**是正文恰好含这些词的页面小节（键名如 `decision_物理机制_mechanism` 465 条、`decision_2_证据时间线` 331 条、`decision_中文摘要` 112 条），1,338 条 task_state 同理；431 条推断出的 preference **任何问法都匹配不到**（偏好是“某人想要什么”的陈述，不是含“偏好”二字的句子）。槽位的合法写入方是 `tool_memory`（把 `memory_type` 写进页面 frontmatter）。也没有结构化替代可用：模板 H2 只有编译事实/证据时间线/Graph Integration/来源核验/概要摘录/结构化摘录，而正文中带“决策/状态”的小节（`决策含义`、`状态机与阶段门`）都是领域内容，按小节名映射同样会误判。存量按可复核的判别式改判（记录来自 claim 且被删规则能从其自身文本复现出相同类型 → `fact`，6,610 条；显式声明者恰恰复现不出，71 条未动）。
+
 每条运行态记忆会计算：
 
 - `confidence_score`
@@ -164,6 +167,8 @@ graph TD
 - `validity_factor`
 - `memory_score`
 
+**相关性的计算（2026-09-24 起）**：字段命中权重（key 4 / text 3 / page 1 / type 1）**按词的逆文档频率缩放** —— `log(1 + N/df)`，`df` 从词法 postings 统计（全量扫描路径从集合统计，两条路径定义一致且有测试钉住）。改前是扁平权重，出现在数万条记录里的词与稀有词等权；而排序键是 `relevance + memory_score × 5`，静态的 `memory_score`（≈0.35–0.70）乘 5 后压过只有几个整数点的相关性 —— **排序主要由一个与查询无关的存储值决定**。现在“先相关性、`memory_score` 只裁决平局”，且两条路径的平局终键统一为 `memory_id` 升序（`source_rowid` 与插入序的分歧会让同一查询在索引路径与全量扫描下给出不同顺序）。`memory_type` **不参与** df 统计：postings 没有 type 位，把它算进去就是索引复现不了的频率。
+
 冲突规则：
 
 - 显式 contradiction：`authority_score > confidence_score > updated_at`。
@@ -171,6 +176,8 @@ graph TD
 - 失败侧标记为 `superseded`；无法裁决时保留 `conflicted`。
 
 `query` 会优先生成 Memory Packet，再按预算拼接相关 wiki 页面。Memory Packet 包含当前偏好、决策、任务状态、相关事实、冲突/陈旧告警和证据指针。
+
+包的每行形如 `- [rel 211.6 | mem 0.70 | active] <正文>`：`rel` 是**决定该行名次**的相关性分（排序因此可审计），`mem` 是仍具自身含义的存储分（它只用于平局）。改前只显示 `mem`，于是“按相关性排序”的包会显示一列几乎恒定的数字 —— 实测 24 条落在 0.65–0.70、仅 5 个不同值。
 
 ## Storage Layout & Architecture
 
@@ -356,7 +363,7 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_STALE_TASK_MAX_AGE_SECONDS`：兜底把多旧的摄取任务视为陈旧（默认 `86400` 秒）。
 - `VECTOR_LAKE_RUNNER_STALE_SECONDS`：Runner / 监督器心跳过期阈值，默认 `2400` 秒。
 - `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
-- `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。
+- `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。**尚未在判定集上验收**（无 yes/no 结论可引用，不要把它当作已验证的改进）。实现上每次查询都会用 40 篇候选重建一次 bm25s 索引（实测 6 ms，可忽略）；重排故障时 fail-open（保留上游顺序并记 warning，不会丢结果）。
 - `VECTOR_LAKE_ENTITY_NAME_PRIORITY`：查询**点名**某一页时是否让其优先于“只是在谈论它”的页，默认 `0`（关）。开启后按实体名在查询中的**位置**分层（提问把主语放在最前，“X 的公司战略…”、“X 关于 Y”），层内仍按混合分排序。机制来源：九个问法（三个主体）显示裸实体名让主体页排第 1（1.000），加上分析式框架词（“核心价值、优势及市场竞争力”）后掉到第 2/5/6/13 名，因为那些词出现在**分析该实体的文档**里而不在实体自己的页上。
   **判定：默认保持 `0`。** 注册口径为 r3 标注集（`search_eval_labels_r3_p.jsonl` / `_r3_consensus.jsonl`，300 条）+ `--vectors snapshot` + `search_replay.py --compare`：primary nDCG@5 **+0.0275**（CI [+0.005, +0.051]，p=0.015，**CI 不含 0 通过**）、MRR **+0.0551**（CI [+0.025, +0.087]，p=0.000），但**最小效应量 +0.143 SD 未达注册门槛 +0.30 SD**，且 **recall 回退 −0.0070** → 规则 **NOT MET**。回退的机制已记录：“点名”不等于“要它”——`shawnshi` 这类查询把人物页提到第 1，而标签要的是技能产品页。判定与数值见 `benchmarks/search_eval_decisions_round3.md` 末节。
 - `VECTOR_LAKE_FUSION`：FTS 与向量两路的融合方式。默认 `sum`（历史行为：`-bm25` 与 `sim²·15` 两个原始量级相加）；`rrf` 改按名次融合（`Σ 1/(60+rank)`，常量见 `tool_search.RRF_K`），并把**图扩展也表达成同一量纲的第三路名次**。
@@ -531,7 +538,17 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-本轮实测结果（2026-09-20）：
+本轮实测结果（2026-09-24）：
+
+- `python -m pytest -p no:cacheprovider -q` → **1476 passed**。
+- `python cli.py lint` → 16 节中 13 节 PASS；已知 FAIL 为 8 Orphan（10）、9 Name Collisions（22）、12 Governance Debt（18,243 条无来源声明）。
+- **真实数据检索审计**（`benchmarks/audit_search_real_data.py`，r3 判定集 300 查询全量 + 100 查询逐页归因，冻结向量）：nDCG@5 **0.7512**、MRR **0.7652**、recall@5 **0.8224**、success@5 **0.8667**；标注相关页 **87.5%** 进 top-5、**12.0%** 进了候选池但被排到窗口外、0.5% 未召回 —— 瓶颈在**排序**而非召回。候选池来源构成：向量 69.4% / 图扩展 15.0% / FTS 10.2% / 两路同源 5.4%。
+- **排序不变量**（真实数据）：top-5 是更大窗口的前缀 **100/100**、同查询重复调用一致 **100/100**、`top_k=5` 满窗 **100/100**；500 条存储向量范数全为 **1.0000**（`1 − L2²/2` 当作余弦换算的前提成立）。
+- **`VECTOR_LAKE_SOURCE_RANK_PENALTY` 首次验收**（`audit` 提出假设 → 注册实验）：关闭（1.0）比默认（0.6）**低 0.0740 nDCG@5**（CI [−0.098, −0.051]）、recall −0.0530、MRR −0.0742、success −0.0226，四指标同向且 CI 全排除 0 → 默认成立。
+
+可复用的度量器件：`benchmarks/search_replay.py`（回放 + `--compare` 配对统计，冻结向量见 `--vectors snapshot`）、`benchmarks/criterion_satisfiability.py`（查询可满足性）、`benchmarks/verify_source_penalty_window.py`（窗口长度不变量）、`benchmarks/audit_search_cost_and_loss.py`（成本与损失归因）、`benchmarks/bench_hot_paths.py`（热点延迟）。判定与历史写在 `benchmarks/search_eval_decisions*.md`。
+
+上一轮实测结果（2026-09-20）：
 
 - `python -m pytest -p no:cacheprovider -q` → **1274 passed**。
 - `python -m compileall -q vector_lake tests` → OK。
