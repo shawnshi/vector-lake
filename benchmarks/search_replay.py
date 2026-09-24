@@ -826,6 +826,10 @@ def main() -> int:
             "author_facet": os.environ.get("VECTOR_LAKE_AUTHOR_FACET", "off"),
             "author_boost": os.environ.get("VECTOR_LAKE_AUTHOR_BOOST", ""),
             "author_sources": os.environ.get("VECTOR_LAKE_AUTHOR_SOURCES", ""),
+            # The source demotion is a ranking preference like the others, and it had never been
+            # scored on this label set: an audit of where the judged-relevant pages are lost found
+            # 7 of 12 "in the pool, ranked out" pages were Sources, so its 0.6 is a hypothesis.
+            "source_rank_penalty": os.environ.get("VECTOR_LAKE_SOURCE_RANK_PENALTY", ""),
             "top_k": args.top_k,
             "vectors": args.vectors,
             "labels": str(args.labels),
