@@ -821,6 +821,11 @@ def main() -> int:
             # as "the same configuration" -- which is the honest reading, and it also means two runs
             # with different ranking behaviour would otherwise look identical in the record.
             "entity_name_priority": os.environ.get("VECTOR_LAKE_ENTITY_NAME_PRIORITY", "0"),
+            # Same reason: the author facet changes the ordering when it is on, and an unrecorded
+            # switch makes two materially different runs look like one configuration.
+            "author_facet": os.environ.get("VECTOR_LAKE_AUTHOR_FACET", "off"),
+            "author_boost": os.environ.get("VECTOR_LAKE_AUTHOR_BOOST", ""),
+            "author_sources": os.environ.get("VECTOR_LAKE_AUTHOR_SOURCES", ""),
             "top_k": args.top_k,
             "vectors": args.vectors,
             "labels": str(args.labels),

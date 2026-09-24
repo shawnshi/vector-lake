@@ -12,6 +12,7 @@ import ast
 import operator
 
 from vector_lake import governance_store, search_ledger
+from vector_lake import author_facet
 from vector_lake.node_vocabulary import strip_prefix
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
@@ -1042,6 +1043,39 @@ def _search_scored_pages(
         (score * penalty if node.get("type", "").lower() == "source" else score, node)
         for score, node in reranked
     ]
+    # The author facet: off by default, and expressed as a *score* multiplier rather than a tier for
+    # the same reason the entity tier had to move -- the sort below reads scores, so anything that
+    # only reorders is discarded.  Authorship is not in the text: 131 of the 149 pages written from
+    # raw/article never name the author, so "what did he say about X" cannot find them by words.
+    author_mode = author_facet.author_facet_mode()
+    if author_mode != "off":
+        author_keys = author_facet.author_page_keys()
+        if author_keys:
+            if author_mode == "filter":
+                narrowed = [(s, n) for s, n in penalised if n.get("_key") in author_keys]
+                vector_notes.append(
+                    f"VECTOR_LAKE_AUTHOR_FACET=filter: {len(narrowed)} of {len(penalised)} "
+                    f"candidates are pages from {', '.join(author_facet.author_source_prefixes())}."
+                )
+                penalised = narrowed
+            else:
+                # A *relative* additive lift, not a multiplier: the blended scores are min-max
+                # normalised over the pool, so the pool's minimum is exactly 0.0 and no multiplier can
+                # lift it (measured: a x60 boost left the bottom candidate at 0.0).  Scaling the lift by
+                # the pool's own maximum keeps it dimension-free, which matters because ``rrf`` fusion
+                # produces scores around 0.016 rather than 0-1.
+                bonus = author_facet.author_boost()
+                pool_max = max((score for score, _ in penalised), default=0.0)
+                lift = bonus * pool_max
+                promoted = sum(1 for _s, n in penalised if n.get("_key") in author_keys)
+                vector_notes.append(
+                    f"VECTOR_LAKE_AUTHOR_FACET=boost: {promoted} of {len(penalised)} candidates "
+                    f"lifted by {lift:.3f} ({bonus}x pool max) as the author's own pages."
+                )
+                penalised = [
+                    (score + lift if node.get("_key") in author_keys else score, node)
+                    for score, node in penalised
+                ]
     # The entity tier belongs *here*, at the final ordering: the sort below is by score, so a tier
     # expressed inside the reranker (which only reorders, it does not rescore) was overwritten by
     # this very statement -- measured, the switch changed no rank at all.
@@ -1175,6 +1209,7 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     wiki_blocks: list[str] = []
     wiki_used = 0
     page_count = 0
+    author_keys = author_facet.author_page_keys() if author_facet.annotate_enabled() else frozenset()
     for score, node in scored_pages:
         key = node["_key"]
         filepath = os.path.join(wiki_dir, f"{key}.md")
@@ -1184,7 +1219,11 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
                 snippet = re.sub(r"^---.*?---\s*", "", handle.read(), flags=re.DOTALL)[:2500]
         except OSError:
             snippet = ""
-        block = f"- **{node.get('title', key)}** (score: {score:.3f})\n  {snippet}\n\n"
+        # An authorship marker, never a filter: the reader can tell the author's own writing from
+        # writing about him, which no amount of page text says (131 of 149 author pages never name
+        # him).  It does not change which pages are retrieved.
+        marker = " `[author]`" if key in author_keys else ""
+        block = f"- **{node.get('title', key)}**{marker} (score: {score:.3f})\n  {snippet}\n\n"
         if wiki_used + len(block) > wiki_budget:
             break
         wiki_blocks.append(block)
