@@ -21,3 +21,9 @@ tests_tmp/
 *.pid
 # Per-machine config (see config.example.json); must never reach a public repo.
 config.json
+
+# Rust build artifacts
+target/
+**/target/
+*.whl
+

@@ -43,9 +43,15 @@ from vector_lake.tool_purpose import review_strategic_purpose
 from vector_lake.tool_maintenance import (
     IDEMPOTENCY_TABLES,
     backup_retention_report,
+    claim_projection_drift_report,
     idempotency_index_report,
+    repair_claim_pointers,
     repair_idempotency_keys,
 )
+from vector_lake.evidence_gap_dispatch import claim_evidence_queue
+from vector_lake.provenance_backfill import backfill_provenance, revert_provenance_backfill
+from vector_lake.provenance_legacy import accept_unrecorded_provenance
+from vector_lake.anchor_backfill import backfill_anchors, draft_anchors
 
 
 __all__ = [
@@ -84,8 +90,16 @@ __all__ = [
     "memory_gram_index_report",
     "IDEMPOTENCY_TABLES",
     "backup_retention_report",
+    "claim_projection_drift_report",
+    "claim_evidence_queue",
+    "backfill_provenance",
+    "revert_provenance_backfill",
+    "accept_unrecorded_provenance",
+    "draft_anchors",
+    "backfill_anchors",
     "idempotency_index_report",
     "repair_idempotency_keys",
+    "repair_claim_pointers",
     "search_vector_lake",
     "sync_vector_lake",
     "trace_vector_lake",

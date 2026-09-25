@@ -1901,12 +1901,20 @@ def create_change_set(
     page_summaries = []
     page_fingerprints = []
 
+    # One resolution map for the whole batch.  ``claim_extractor`` asks the index which page a link
+    # target names (that question has one owner, ``link_resolution``); the memo behind this call
+    # costs 0.2 ms, and without hoisting it a 7 000-page rebuild would build the map per page.
+    from vector_lake.page_index_projection import link_target_resolver
+
+    resolve_target = link_target_resolver()
     for page_path in page_paths:
         if not os.path.exists(page_path):
             continue
         frontmatter, body, raw_content = read_markdown_file(page_path)
         page_fingerprints.append(hashlib.sha1(raw_content.encode("utf-8")).hexdigest())
-        extracted = extract_page_objects(page_path, frontmatter, body)
+        extracted = extract_page_objects(
+            page_path, frontmatter, body, resolve_target=resolve_target
+        )
         proposed_entities.extend(extracted["entities"])
         proposed_claims.extend(extracted["claims"])
         proposed_evidence.extend(extracted["evidence"])
@@ -2145,18 +2153,30 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             affected_page_params,
         ).fetchall()
         old_claim_ids = {row["claim_id"] for row in old_claim_rows}
-        # `claim_graph_edges` is keyed by *claim ids*, not page keys, so filtering it
-        # by page key matched nothing: a page rewrite that retired a claim left
-        # every edge pointing at that claim dangling forever.  Delete by the claim
-        # ids this delta actually touches, then let `save_graph_edges` re-add the
-        # surviving ones.
+        # ``claim_graph_edges`` carries two key spaces and the previous predicate used one for
+        # the other.  Its rows are page keys on the live corpus (``Concept_...``/``Source_...``,
+        # plus the ``entity_<hex>`` ids ``delete_node_cascade`` removes by), while
+        # ``save_graph_edges`` is also handed claim ids for cross-page edges.  Filtering the
+        # table only by claim ids matched nothing in the page-key space: a rewritten page kept
+        # one stale edge set per rewrite (232 rows on the live corpus still point at a page key
+        # that no longer exists).  Both arms are therefore needed and scoped differently:
+        #   * page keys -- the outgoing edges of the pages this delta owns, re-addable from the
+        #     new content by ``save_graph_edges``;
+        #   * the claims this delta touches, both directions -- the documented contract for the
+        #     claim-id space (``test_change_set_apply_deletes_both_edge_directions``), where an
+        #     edge owned by another page names a claim of this one.
+        edge_keys = sorted(set(affected_page_keys) | old_entity_ids)
         touched_claim_ids = sorted(
             old_claim_ids | {record["claim_id"] for record in proposed_claims if record.get("claim_id")}
         )
+        if edge_keys:
+            # One JSON parameter instead of a placeholder list: see ``_json_id_list`` for why
+            # the placeholder form cannot hold a bulk batch's key set.
+            conn.execute(
+                "DELETE FROM claim_graph_edges WHERE source_id IN (SELECT value FROM json_each(?))",
+                (_json_id_list(edge_keys),),
+            )
         if touched_claim_ids:
-            # One JSON parameter instead of two placeholder lists: see
-            # ``_json_id_list`` for why the placeholder form cannot hold a bulk
-            # batch's claim set.
             touched_claim_json = _json_id_list(touched_claim_ids)
             conn.execute(
                 "DELETE FROM claim_graph_edges "

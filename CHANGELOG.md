@@ -1,5 +1,390 @@
 # Unreleased
 
+## 指向 claim 的三处投影：一个哈希不够用了（`timeline_events` 的 93 行孤儿）
+
+`timeline_events` 的行是按**内容寻址**的：`id = sha256(claim_id, event_date, text)`。这让“被带外改写的行”
+可被检出，但也让**删除**依赖同一个哈希——同步删行时它从**库里现存的 claim** 重算这个哈希，只要那次重算
+不再命中当初写入的那一行，行就活过了它的 claim。
+
+实测发端：活库 `timeline_events` 7644 行、canonical timeline claim 7551 条 → **missing 0 / extra 93**。
+93 行只在出错的那一侧（投影多、canonical 不漏），`search_timeline` 的 parity 闸门是全有或全无，因此
+**整张表的索引路径全程不可达**（每次查询都返回 `[DEGRADED]` 并从 canonical 全表扫描作答）。
+
+时间定位（对四份历史快照只读重算，规则在 09-18 / 09-19 / 09-20 / 09-22 快照上均复现 missing 0 / extra 0，
+说明重算与写入器同规则）：
+
+| 快照 | claims | timeline claims | tl 行数 | parity |
+|---|---|---|---|---|
+| 2026-09-20 23:02 | 99 574 | 9 974 | 9 974 | 0 / 0 |
+| **2026-09-22 13:56** | 98 847 | 7 652 | 7 652 | **0 / 0** |
+| **2026-09-23 14:38** | 69 672 | 7 550 | 7 643 | **0 / 93** |
+
+即引入窗口是 09-22 13:56 → 09-23 14:38：一次批量 canonical 回收丢掉 30 280 个 claim_id、退掉 860 个 page key
+（`bullet-claim` −28 363），其中 timeline-event claim 少了 **102** 条，而投影只跟着删了 **9** 行——**91% 的受影响
+claim 绕过了投影同步**。90 行可回溯的那批全部来自带 `community_id`/`level` 的生成物页面（它们的 claim 本就
+应当被清掉，页面文件仍在），另 3 行是页面键改名后身份移动。
+
+修复分三层：
+
+- **归因列**：`timeline_events.claim_id`（+ `idx_timeline_claim`）。投影每行记下它是从哪条 claim 投出来的，
+  于是孤儿可以被指名（此前只能靠 `description` 文本反查），删除也改成按 `claim_id`：那是重写动不了的输入。
+  哈希删除保留给该列出现之前的旧行（它们 `claim_id IS NULL`，哈希是最后一点证据）。
+- **`repair_timeline_projection`**：先按 `claim_id` 判孤儿（认领 claim 已不在 canonical）、再按哈希判无归因的旧行，
+  并区分“claim 还在但哈希变了”的身份移动行（删旧插新）；`stale` 判据从 `event_date_source IS NULL` 放宽到
+  “三个列任一为空或 `claim_id` 为空”，三类列一律**就地**改写，`extracted_at` 不动。
+- **活库收敛**：`timeline-repair --apply` 改写 7551 行补上 `claim_id`（0 删 0 插），写锁 2.4 s；随后
+  `claim_id IS NULL` 0 行、指向 canonical 之外的 0 行、parity 0 / 0。该列在 schema 里是加法，回滚就是把它置 NULL。
+
+## 另外两处指向 claim 的表，没有人会读它们
+
+同一次批量回收留下两处死指针，而这两处**没有任何读者**会让它们显形：
+
+- `evidence.supports_claim_ids` / `contradicts_claim_ids`：活库 84 606 个指针里 **25 220 个**指向已不存在的
+  claim（分布 25 217 行；25 214 个来自 2026-07-14 的**一次**批量事件，两个月里从此未变——09-22 快照是 25 221）。
+- `claim_graph_edges`：按**页面键**存行，而增量路径的删除谓词用的是 **claim id**，在页面键空间里一条也匹配不到，
+  于是每次重写页面都把上一批已退休的链接留下（活库 232 行端点已无页面）。
+
+新增 `claim_pointer_report` / `repair_claim_pointers`（CLI `claim-pointer-report` / `claim-pointer-repair
+[--apply] [--edges]`）：
+
+| 动作 | 活库实测 |
+|---|---|
+| 从 evidence JSON 里摘掉死 id | 25 220 个 / 25 217 行，写锁按 2000 行分批，**整场 3.0 s** |
+| 回滚点 | `wiki/.meta/migrations/2026-09-24-claim-pointer-prune.rollback.jsonl`（25 447 行：25 217 条指针 + 230 条边改写），写一条才写库一条 |
+| `--edges`：按解析器改回页面键 | **230** 行（`Concept_CoMET` → `Product_CoMET`、`Atrium Health` → `Institution_Atrium-Health`、`Agentic Orchestration` → `Concept_Agentic-Orchestration`…） |
+| 收敛后 | evidence 死指针 0、`operational_memory` 0、边端点解析不到 2 行（解析器也答不了，保持原样） |
+| 副作用 | 边改写中 64 行与既有 (source,target,relation) 重合而并成一行：10 487 → 10 423 |
+
+口径上的两个“不”：**只摘指针，不改正文、locator、source，也不动 `updated_at`**（丢指针不是新证据，不该推新鲜度时钟）；
+**只改边的 target，不改 source**（source 是边的出处页，用核名规则改写它等于把边挂到另一页的 provenance 上；
+解析器答不了的目标也保持原字面量——那是边写入器的既定行为，属链接质量信号）。
+
+`doctor`（`deep_projection_checks`）现在一并报这些计数，`evidence` 死指针或 memory 死指针会让体检落到 `degraded`，
+而“目标解析不到”只报不降级（它是信号，不是漂移）；探针本身的增量开销见下一节。
+
+## 边删除谓词用错了键空间
+
+`claim_graph_edges` 同时收两种键：页面键（活库实际形状：`Concept_*`/`Source_*`，以及 `delete_node_cascade`
+一并删掉的 `entity_<hex>`）与 claim id（`save_graph_edges` 收的跨页边）。旧谓词只按 claim id 过滤，于是：
+页面键空间里**什么都没删**（就是上面那 232 行的来源），而 claim id 空间里连**存活** claim 的入边也删了——
+那是本 delta 没有提案可恢复的（属别的页面）。现在按键空间分开：页面键走 `source_id`（本 delta 拥有的出边，
+`save_graph_edges` 会按新内容补回），claim id 保留双向删除（既有契约，
+`test_change_set_apply_deletes_both_edge_directions` 守着它）。
+
+## 回归测试
+
+`tests/test_timeline_projection.py` 新增 3 例（带外改日期后退掉 claim 不留孤儿——先断言“重算的哈希确实不再命中
+存行”，否则这测试就没在考 `claim_id`；投影行记下来源 claim；`repair` 就地补列且保留 `extracted_at`），
+`tests/test_claim_pointer_drift.py` 3 例（报告计数、只摘死指针并留回滚行、只改 target 且保留解析不到的目标），
+`tests/test_runtime_health.py` 2 例（死指针落 degraded；解析不到的边端点不降级）。全量 **1484 passed**（改动前 1479）。
+
+## 边目标的字面量：第二个生产者（已修）
+
+`claim_extractor` 建边时把 `[[...]]` 的**字面量**直接当 `target_id` 存（`claim_extractor.py:294`），而索引器走的是
+唯一所有者 `link_resolution.resolve_link_target`——这正是该模块要消掉的那类“一问两答”，在 claim 边这一侧还活着，
+也是上面那 230 行可回键边的来源。现在：
+
+- `extract_page_objects(..., resolve_target=None)`；省略时用它从 `page_index_projection.link_target_resolver()` 取，
+  于是**所有调用点一次到位**（包括以后新增的）。那个适配器只负责把索引交给 `link_resolution`。
+- **只改边的 `target_id`**（那个字段是**键**），`links` / `triples` 保留页面声明的字面量；`create_change_set` 的批量循环
+  把解析器提到循环外，一批只建一次（活库实测建一次 0.20 s，memo 探针 0.2 ms）。
+- memo 以数据库身份 + `page_index_nodes` 的 `COUNT(*)/MAX(rowid)` 为键（两个索引only 读，0.2 ms），
+  避免两个隔离语料共享同一张表。
+- **无索引就不答**：索引为空、不存在或不可读时返回 `None`，调用方保留字面量。这一条还顺手守住了
+  “dry-run 不得创建 SQLite”——`get_connection()` 会**创建**库文件，而 `migrate_existing_wiki(dry_run=True)`
+  有断言守着这一点（测试先报出来，修复即在连接前先看库文件在不在）。
+- 活库实测解析结果：`Concept_CoMET` → `Product_CoMET`、`Atrium Health` → `Institution_Atrium-Health`、
+  `Agentic Orchestration` → `Concept_Agentic-Orchestration`；`B-Soft` 无页可答，**保持原样**（那 2 行仍是链接质量信号）。
+
+新增测试 3 例：`tests/test_claim_pointer_drift.py` 两例（有索引时 `target_id` 变页面键而 `links`/`triples` 不变；无索引时保留字面量）、
+`tests/test_canonical_change_sets.py` 一例端到端（页面重写后 `claim_graph_edges` 只有解析后的目标——两个修复的合流证明）。
+
+## 深度体检的增量开销：一次正优化被实测否掉
+
+把死指针计数换成 `json_each` 的 SQL 形式**更慢**：活库 84 556 行 evidence，Python 逐行 `json.loads` **0.72 s**，
+SQL **0.86-1.00 s**（要统计每个指针，不像裸 `EXISTS` 那样短路，SQLite 还要为每个指针做一次关联查找）。
+所以逐行扫描保留，只在注释里记下成本；真正常驻的开销是另一半——`operational_memory` 的 69 716 行 `NOT IN` 到
+`claims` 主键 **0.71 s**（`NOT EXISTS` 一样）。两项合计 **~1.65 s**，因此整个探针待在 `deep_projection_checks` 后面；
+另外把链路解析器改成**惰性构建**（只有真的存在端点不在页面键里的边行时才建，活库 0.17 s），
+以及把页面键集合提到外层（不再每行重查）。
+
+## 运行态：守护进程家族换到当前代码
+
+`timeline_events` / `claim_graph_edges` 的两个写入缺陷只存在于**改动前启动的进程**里，所以重启是必要的：
+
+| 项 | 结果 |
+|---|---|
+| 重启时间 | 2026-09-24 19:14:14（本地），上一代启动于 09-23 18:27 |
+| 新家族 | watchdog `31124` → runner service `7796` → runner `16828`（旧 `15040/16008/10232` 已退场） |
+| 验证 | `doctor`：`Watchdog Status: [processing] Ingest runner supervised (pid 7796…)`；新日志 0 error / 0 traceback；outbox completed 39 555 → 39 557；State Consistency 7167/7167/7167 |
+| 前置条件 | 只在**稳定空闲窗口**动作：`ingest_processing.json` 连续空 + 无模型宿主进程，否则放弃（不愿杀掉在飞的摄取）；两次尝试分别卡在“有在飞任务”和“探针假阳性”，实际执行成功那次是第三次 |
+| MCP server | **无需重启**：宿主按调用拉取（实测 13:38:04 的调用产生了 13:38:04 创建的进程），因此永远跑当前代码 |
+
+两条踩坑记录，后续不要再花时间重测：
+
+- “有没有模型宿主在跑”不能用 `*ingest_model_pi_subagents*` 子串判断：runner service 与 runner **自己的命令行**就带着
+  `--model-cmd "python scripts/ingest_model_pi_subagents.py"`，匹配必然命中这两个长驻进程；探针必须排除 `*ingest_runner*`。
+- `powershell Start-Process` 拉起的分离进程会**继承父进程的 stdout 管道**，所以
+  `subprocess.run([...,'Start-Process',...], capture_output=True)` 会一直阻塞到那个后台进程退出（重启其实已完成，
+  卡住的是等待本身）。要把拉起与验证分开，不要让验证写在同一管道里。
+
+## lint 第 17 项：页面声明的 raw 出处是否还在（只报不修）
+
+这一项此前**不存在**：lint 的断链检查只走 `[[...]]`，而全模块唯一碰到 `sources` 的地方是“缺就补空列表”。
+于是“页面声明的出处指向一个不存在的文件”在整套审计面上完全不可见。
+
+新检查（`17. Source Path Resolution`，`tool_lint.py`）逐页读 `sources`，只看 `raw/` 前缀的条目
+（非 `raw/` 的条目指向页键或规范 Source 名，不是文件，存在性不是它回答的问题），分三类报：路径仍在 / 已不在 /
+**路径本身在页面里就是坏的**（含 `?`/U+FFFD）。已不在的再走一次 raw 树（~2.4k 文件、0.3 s，仅在该分支内）按
+basename 归类：唯一命中就报**它搬到哪了**，多个同名就说不确定，零个就点名缺失。
+
+**它不修，而且不提供修复分支。** frontmatter 声明与 SQLite `sources` 行目前是**互相一致**的——
+`source_id = _stable_id("source", raw_ref)`，是路径字符串的哈希——所以只改页面会把同一个 source 变成
+“文件说一个路径、数据库说另一个路径”，正是一个问题两个答案。回指的归属是一次**provenance 迁移**：两侧一起搬，
+并且把它连带的 `evidence` / `claims` / `claim_index` 行一起动（实测这 174 条的连带面：evidence 1 190 行、
+claims 1 366 行、claim_index 1 366 行）。因此该检查只报，读者从报告里就能拿到搬迁后的位置。
+
+活库首跑（与独立审计脚本逐项对齐）：
+
+| 项 | 数 |
+|---|---|
+| 检查的 `raw/` 声明 | 5 163（另有 2 498 条非 `raw/` 形式，不在范围内） |
+| 仍在 | 4 000 |
+| 已不在 | 1 162 |
+| 页内路径即坏 | 1（`Person_Adam-Marblestone.md`，写入时已被替换成 `?`） |
+| 其中可按 basename 找到新位置 | 174，集中在 9 种搬移（`raw/news` → `2026Q2`/`2026Q3` 共 118、`2026Q2` → `2026Q3` 44） |
+
+## 两个被证伪的前提（没有执行，留给决策）
+
+lint 报告引发的两个“显然”的动作，在动手前各自被数据推翻了：
+
+1. **“174 条可重定位的回写 frontmatter”**：新路径 **66/81** 已经有自己的 `sources` 行——旧布局与新布局**各摄取过一次**，
+   是两份 source 身份，不是一条待改的路径。回写等于合并两份身份（见上，连带 1 190 + 1 366 + 1 366 行），
+   属于 `merge`/迁移，不属于文本回填。
+2. **“31 个 Q2/Q3 僵尸页是重复页，删除”**：实测是 **42** 个（不是 31），且它们不是空壳也不是重复页——每页是
+   `provenance-only standalone` 摄取产出的 3 条要点摘要（约 500 字符 / 6 条 claim），而 Q3 对应页是 11–53 条 claim 的全文；
+   两边正文相似度 0.05–0.21（模板不同）。其中 8 天的 `content_hash` 是真正的 sha256 且**等于现存 Q3 文件的 sha256**，
+   即“同一份文件曾在 Q2 路径下（后被搬走）”。42 天的 raw 文件今天都在 `raw/news/2026Q3/`，所以删除不会丢原件；
+   但（a）11 天没有 Q3 对应页，删了就没了 wiki 记录（可重摄取），（b）**1 个页（20260704）被 12 个实体页当作出处锚点引用**，
+   直接删会制造 12 条断链。删除的目标集与副作用因此与授权时的描述不一致，停在决策前。
+
+## 无出典声明债的治理队列入口：按 cohort 分批派（18 243 条 / 2 220 页）
+
+lint 的第 12 项只报一个总数（18 243）。分解后的形状是：
+
+| 缺口形状（提取器自己记录的） | claim | 页 | 其中早于提取器归属字段 |
+|---|---|---|---|
+| 整页**一支出典都没声明** | 17 317 | 2 052 | 17 211（99.4%） |
+| 声明了多处、**该段没说哪一处** | 926 | 168 | 715 |
+
+实测活库里**恰好只声明一个 source 的页面从不产生缺口**（那时每个块都有锚点），所以“缺口形状”与“修法”
+是同一个问题：前者归**摄取合同**（页面没带出处），后者归**块自己缺锚点**。另一个决定“能不能修”的事实：
+98% 的欠债来自**没有 `extractor_name` 的 claim**（该字段存在之前写入的），集中在 2026-06（14 741）与
+2026-07（3 151）。
+
+队列里原有这套欠债，但粒度是**一条 claim 一个 item**：`source='unsupported-claim-governance'` 的 684 条
+`evidence-gap`（419 已解决 / 265 已确认），而**它的生产者已不在代码里**（全仓搜不到这个 source 字符串）。
+18 243 条按那个粒度既盖不住，也会把其他 pending 项挤出去。
+
+新增 `claim-evidence-queue`（`vector_lake/evidence_gap_dispatch.py`）：
+
+- cohort = `(缺口形状, 页前缀或摄取月份)`，**一个 item 覆盖一个批次**（默认 `--batch-pages 100`，
+  `--group prefix|month` 选轴）。item 带 `owner` / `reason` / `fix` / `cohort{state,key,batch_index,batch_key,cohort_version,page_count,claim_count,legacy_claim_count}`。
+- **幂等**：`item_id` 由 `(state, group, cohort, batch)` 派生，已在队列里的批次跳过；页面集变了的批次报为
+  stale 而**不是**另开一条。默认 dry-run，`--apply` 才写。
+- `search_queries` **故意留空**：`research` 把前 5 条 pending item 的查询当检索指令，而出处不是外部检索能补的东西——
+  填进去等于把真正可检索的项挤出那个窗口。
+- `review` 的图标表补上 `evidence-gap: [E]`（之前落回通用 `[*]`，混在 suggestion 里）。
+- 读的是 canonical `claims` 而非 `claim_index`（后者投影了 `evidence_gap` 却没有 `extractor_name`，而时代分裂决定能不能修），
+  一个 `json_extract` pass、不解码 payload。
+
+活库执行：`--batch-pages 200` 得 23 个批次，**覆盖恰好 2 220 页 / 18 243 条**（就是全部欠债，可作覆盖校验），
+队列 pending 1 000 → 1 023，写锁 1.8 s；重跑得 `skipped 23, enqueued 0`。
+
+文件：新 `vector_lake/evidence_gap_dispatch.py` + `tests/test_evidence_gap_dispatch.py`（7 例），
+wiring 到 `tools.py` / `cli_app.py` / `mcp_server.py` / README；全量 **1501 passed**。
+（1501 而不是 1498：`tests/test_static_scope.py` 按 `vector_lake/*.py` 做 parametrize，任何新模块自动多出
+3 个静态范围用例——它们是真正的门（函数局部 import 前使用、引用未绑定名），不是噪声。）
+
+## 无出处声明的存量：可恢复的 25% 已回填，不可恢复的 75% 已决策
+
+上一节入队前，我先把「出处能不能查回来」测到底，结果推翻了当时的推定：那 2 008 页的「历史出处」是
+**占位符** `Source_Auto_Fixed`（`schema_validator.PLACEHOLDER_SOURCES`），2026-09-20 08:06–08:33 的那次批量重写
+只是把占位符清掉，**正文一字未改**（2 008/2 008 的 body 完全相同）。逐页严格判据：**6 页**历史上出现过真
+`raw/` 路径，**2 001 页只有占位符**，**45 页没有任何写入历史**——出处不是被清空的，是**从未记录**。
+
+因此只剩两条**精确**规则（相似度反推一律排除：综述页的泛化陈述会被错归到一个不相干的 raw 文件，等于伪造出处）：
+
+| 规则 | 页 | claim |
+|---|---|---|
+| `jobs.payload` 的 `{filepath, canonical_name}` 账本 | 142 | 1 450 |
+| `canonical_source_name` 在 raw 树上的唯一逆匹配 | 210 | 3 181 |
+| **合计已回填** | **352** | **4 631** |
+
+新增 `provenance-backfill`（`vector_lake/provenance_backfill.py`）：写入走唯一的 mutation 路径（每页仍是
+schema 校验 + `verify_asset` + canonical change set），每页**先**把改前全文写进
+`wiki/.meta/migrations/2026-09-24-provenance-backfill.rollback.jsonl` 再提交，`--revert` 可整批回放。
+执行：先单页金丝雀（diff 正好一行：`sources: []` → `sources: ["raw/…"]`，该页 14 条 claim 全部挂上 evidence），
+再以 50 页/批跑完 351 页（1 m 51 s）。结果：
+
+- 有缺口的 claim **18 243 → 13 612**（`no_source` 17 317 → **12 686**，正好等于预测的 4 631），**0 条半状态**
+  （不存在“有缺口却有 evidence”的 claim）。
+- 352 行 outbox 全部 `completed`。过程中 18 次 `WinError 5: Access is denied` 的 `tmp → 最终名` 替换失败只是**瞬时的**：
+  错误日志写的是“canonical 已提交、投影失败”，deferred-projection 机制随后重做，文件全部正确落盘；
+  遗留的 16 个 `.tmp` 已清（另有 2 个 2026-09-23 的旧残留，不是本次产生，未动）。
+- 多义 68 页（多个 raw 文件归一到同一 canonical 名）与无匹配 1 632 页**不猜**，留给决策。
+
+剩下的 **1 700 页 / 12 686 条**的归宿按你的决定记为「接受为遗产债」，由 `provenance-accept` 落在
+`wiki/.meta/provenance_legacy_accepted.json`（页面清单 + 判据 + 证据 + 68 页多义候选 + 96 个 Source / 62 个 Event
+可再访候选）。`compute_debt_metrics` 据此把两个数分开：
+
+| 指标 | 值 | 含义 |
+|---|---|---|
+| `unsupported_claim_count` | **926** | 开口债务，全部是 `ambiguous_source`（块没说用哪一处出处） |
+| `legacy_unsourced_claim_count` | **12 686** | 出处从未记录，已决策 |
+
+lint 第 12 项把后者作为 **census** 显示（不再计入 FAIL），于是那一个数恢复成信号而不是常数；第 17 项同时从
+5 163 条声明涨到 **5 515** 条（+352 正是回填的那批，全部可解析）——两个检查互相验证。
+
+不写 1 700 页 frontmatter 是故意的：那是 1 700 次 canonical 变更与重提取，对一个读者不据此行动的标签来说
+爆炸半径过大；账本是可读、可版本化、可回滚的文件，以后查到真出处把页面从里面摘出去即可。
+17 个 `no_source` cohort item 已用 `--resolution provenance-decided` 结算，
+6 个 `ambiguous_source` item 继续 pending（那 889 条块必须逐块判定，属下一阶段）。
+
+文件：新 `vector_lake/provenance_backfill.py`、`vector_lake/provenance_legacy.py`、
+`tests/test_provenance_backfill.py`（8 例），改 `governance_metrics.py`（口径拆分）、`tool_lint.py`（census）、
+`cli_app.py` / `tools.py` / README；全量 **1515 passed**（含两个新模块自动带出的 6 个静态范围用例）。
+
+## 多源页的锚点比对：两侧用了两种拼法（926 条 `ambiguous_source` 的真实成因）
+
+追那 926 条时先看了「能工作的页面」怎么写锚点，结果发现一页都没有：该样本共 400 个声明≥2 个出处的页面，
+里面**只有 1 页**有 evidence（Vendor_Epic-Systems），而它的锚点指向的是**Source 页键**（追加分支自己发明的 id），
+不是任何声明文件。读代码即得根因：
+
+```python
+sources = normalize_sources(frontmatter.get("sources") or [])   # raw/…md，保留扩展名
+found_sources.append(... .replace(".md", ""))                   # 锚点侧剥掉扩展名
+...
+if len(sources) > 1 and page_type != "source" and raw_ref not in inline_sources:
+    continue   # 两侧永远不等 → 恒为真
+```
+
+即：**声明了多处出处的页面，无论块怎么写锚点，都永远挂不上 evidence**（`page_type == 'source'` 与单出处路径不受影响）。
+修法是一个 `_source_key()` 同时用在去重与闸门两侧，于是「带不带 `.md` 拼的是同一个出处」——不再给同一份文件铸第二个 source id。
+新增 `tests/test_source_anchor_matching.py` 5 例（锚到声明出处、无锚点仍不挂、逐块归到它自己提名的那一个、不带扩展名的拼法即同一个、
+单出处路径不变），另在活库上对那个唯一有 evidence 的多源页做重提取金丝雀：51 条 claim / 48 条有 evidence / 3 条有缺口，**前后完全一致**。
+
+**但今天修它的产出是 0**，因为那 926 条块的成因已经查到底（三条机械规则逐条实测）：
+
+| 机械规则 | 产出 | 实测 |
+|---|---|---|
+| 块文本里出现声明出处的名字 | 0 | 15 条在散文里提到某个 stem，3 条有脚注 `[^1]: Source_…`；880 条没有任何脚注，43 条脚注指的是别的 |
+| 块文本出现在某个声明出处文件里 | 0 | 843 条在任何声明文件里找不到（是编译改写、不是引用），83 条太短，102 个声明出处文件已不在盘上 |
+| 修本节的归一化缺陷 | 0（但是**前提**） | 不修它，手写的 `(Source: [[raw/…]])` 也依然不生效 |
+
+所以我更早说的「37 条可自动补锚点」是宽松启发式，**撤回**：那批块没有以任何可读形式说出自己用的是哪一处出处。
+926 条仍然只能逐块内容判定（块↔出处的对应关系本身是编译者的判断，不是可搜到的文本），
+但机制已就位：写完锚点后的下一次抽取就会挂上 evidence。
+
+## 926 条 `ambiguous_source`：257 条可核验归属，其中 240 条已落锚
+
+按“逐块起草锚点供确认”做成了两个工具：
+
+- **`anchor-draft`**（`vector_lake/anchor_backfill.py`）：确定性规则，不用模型。取块里在候选出处之间**只有部分出处有**的
+  判别术语（CJK 2/3-gram 与拉丁/数字 token），只用满足「某处覆盖 ≥0.75、该处独占术语 ≥2 个、领先第二名 ≥0.20、
+  判别词总量 ≥4」时才提出归属，并附上**承载最多匹配词的那一行原文与行号**；其余一律弃权并写明原因。
+  第一版没有样板过滤，把「本页只记录证据中明确出现的定义、机制…」也归了源（靠共享泛化词碰上的假阳性），
+  加过滤后 301 → 257，并把 156 条样板块单列为 `page_scaffolding`。
+- **`anchor-backfill`**：只写被确认的（`--only 1,2,5,9-14`，复核文件 `wiki/.meta/anchor_review.md` 按批编号），
+  走唯一 mutation 路径，每页改前全文先落 `wiki/.meta/migrations/2026-09-24-anchor-backfill.rollback.jsonl`。
+
+实测分布（926 条）：提出 **257**、样板句 **156**、可读声明出处不足 2 个无法判别 **280**、各出处无法区分 **155**、
+声明出处**一个都不在盘上** **78**。
+
+三次实测踩到的坑，都已变成代码里的约束与测试：
+
+1. **锚点必须贴紧追加，不能带空格**。`_clean_claim_text` 先折叠空白再剔 `(Source: …)`，所以
+   `…职责 (Source: …)` 清完留下一个尾随空格——另一个文本、另一个 `claim_id`。首个金丝雀就把 3 条 claim 铸了新 id、
+   旧 id 变死指针。贴紧追加则清理后与原文本逐字节相同，现有 claim 原地拿到 `inline_sources`。
+2. **出处路径自带括号时必须跳过**：剔除正则非贪婪到第一个 `)`，`…重构 (2026)_final.md` 被切半，残渣 `.md]])`
+   进入存库文本（实测 4 页 / 16 块重铸 id）。
+3. **定位块所在行只走正文、跳过纯标题行**：前一次尝试把锚点加到了 `### 物理机制 (Mechanism)` 标题与一行
+   frontmatter 上，被写入门以 schema/YAML 错误拒绝——门拦住了，并且没造成破坏，但不能靠门来当参数校验。
+   定位器改为「从块首 24 字起逐步加长直到唯一命中」后，同一天的多个时间线条目也不再互相撞车。
+
+**执行结果**：240 条写入、**240/240 全部挂上 evidence**（`verified: 240/240`），`ambiguous_source` **930 → 690**，
+**claims 总数 70 093 不变**、逐页 claim-id 集合比较**变更 0 页**（含一页专门的重提取对照），存库文本里没有新增一个
+`(Source:` 残渣，`timeline-repair` dry run 0/0/0、`claim-pointer-report` 0 死指针、doctor 一致。
+
+**剩余 686 条**：17 条待人（2 条无法唯一定位、3 条行内已有被截断的 `(Source: …)` 片段、12 条出处路径含括号，
+后者需换一种 bracket-safe 写法）、156 条样板块（**本不该是 claim**，与治理队列里那条 stub 审计同家族）、
+280 条可读出处不足 2 个、155 条各出处无法区分、78 条声明出处全部不在盘上（与 lint 第 17 项同源）。
+后三类没有一个字面依据可附，用相似度反推就是伪造出处，故保持开口。
+
+文件：新 `vector_lake/anchor_backfill.py`、`tests/test_anchor_backfill.py`（7 例），
+改 `cli_app.py` / `tools.py` / README；全量 **1530 passed**。
+
+## 所谓「156 条样板块」：自己的测量把自己推翻（真数是 3 596，且已有不清理的决定）
+
+我上一轮说「156 条样板块本不该是 claim，值得单独清理」是**错的**。逐条归因后发现：156 里 **110 条只是匹配了
+`Last Reshaped`** —— 那是模板给**真实声明**附加的页脚（`ACE引擎（多智能体协同引擎）是卫宁健康… (Last Reshaped: 2026-06-28)`），
+于是 **107 条有实质内容的声明被我自己的过滤挡在起草之外**。修正后标记表只保留「描述页面自身」的句子，
+另立 `not_a_claim` 类处理纯记账；重新起草从这一组里救回 **53 条**，其中 **35 条已落锚（35/35 验证通过）**，
+其余 18 条是同一批跳过类别（2 无法唯一定位、3 行内截断片段、13 出处含括号）。
+
+债务范围内真正的「非 claim」只有：页面自述句 **43 条**（提取器故意把范围句保留为 claim，
+见 `_is_page_scope_disclaimer`）+ 记账行 **13 条**（8 条 `[System Directive:` + 5 条 V11 迁移标记）。
+9 条在债务内的记账行已通过重提取页面清掉（4 页各 −1、0 新增；修了守卫后另 5 页各 −1、0 新增）。
+
+修掉的守卫 bug：那 5 行是 `[2026-07-11] [Observation] Node auto-migrated to V11 schema.`，日期前缀是
+**故意保留**在 claim 文本里的（见 `_parse_temporal`），所以 `_is_page_boilerplate` 必须剥掉**全部**前导 `[...]`：
+只剥一个会剩下 `[Observation] …` 而漏判。已修 + 加测试，今后不会再铸这类行。
+
+而全量测量把「清理」从一个杂活变成了一个**决策**：含这两个标记的行共 **3 596 条 / 3 269 页**
+（summary 3 214、compiled-truth 293、timeline-event 73、bullet-claim 12、assertion 4），
+**3 596 条全部满足提取器自己的「不是 claim」判据**。但它们没有缺口、不在债务里，
+清退它们意味着重提取 3 269 页（占语料 45%），而治理队列里**已有明确决定不清退存量 stub 行**
+（`gov_4fb0d52a49e2`，`pi-agent/vl-provenance-stub-audit-20260914`：“存量记录未清退 —— 已明确决定不放宽
+cleanup_placeholder_claims”）。因此除了债务内的那 9 条，其余一律未动；这一家族留给决策。
+
+本轮总账：锚点共写 **275 条**（240 + 35），`ambiguous_source` **930 → 646**；claims 总数 70 093 → 70 084
+（差的 9 条就是被清掉的非 claim 行）；timeline parity 0/0/0、死指针 0、doctor 一致；全量 **1532 passed**。
+
+## 3 269 页重提取：清退 4 602 行非 claim，但前提是两个生产者修复
+
+授权是一次全库重提取（清退 3 596 行非 claim 行）。预演先推翻了它的前提——**重提取对其中绝大多数是无效的**：
+
+- **3 214 行是页面 `summary` 声明**，它由 `_body_summary(body)` —— **正文前 320 字符**（开头就是标题 + System Directive）
+  —— 铸成，且**每次重提取都会原样铸回**（抽样 6/6 消失不了；200 页样本里 169 页重提取后毫无变化）。
+  修 `_body_summary`：取**第一个非样板块**并用 `_clean_claim_text` 清洗（它同时是 claim 文本与
+  `page-summary` 的 evidence 文本，不能把标记与锚点带进去）。效果：`Concept_AI医学影像` 的 summary 从
+  `# AI医学影像 ## 1. 编译事实 *[System Directive: …` 变成 `Concept_AI医学影像 是基于人工智能提取和分析影像学数据的技术…`。
+- 预演顺带暴出一处**潜伏崩溃**：`enforce_claim_dict` 在**块循环内部**（505 行）导入，却在 559 行的 summary 处使用；
+  当一页的所有块都被样板门跳过时，循环体到不了导入语句 → `UnboundLocalError`（实测 8 页）。
+  把 import 提到模块顶部（该文件本就已从 `wiki_utils` 顶层导入）。修后这些页能正常抽取，且显示**本来就是空壳**（0 条 claim）。
+
+重提取本身按批（300 页/调用）执行，**安全门在批内**：逐页重算 claim 集与库中对比——
+`purge_only` 才写，`loses_content` / `empty_result` / `extraction_error` 跳过并报告；
+「页面只剩非 claim 行」另立 `empty_after_purge`（这种页本来就该是 0 条，不是危险形状）。
+每一条将被删除的 claim（id + 完整 payload）先逐行落盘：
+`wiki/.meta/migrations/2026-09-25-non-claim-purge.rollback.jsonl`（33 MB）。
+
+**执行结果**：应用 **4 164 页**、删除 **4 602 行**（逐行核对全为非 claim）、重新铸出 4 828 条（被换文本的 summary），
+非 claim 行 **3 596 → 3**。timeline parity 0/0/0、死指针 0、memory 死指针 0、doctor 7170/7170/7170、全量 **1536 passed**。
+副产品：重推导顺带把 50 条 `no_source` 缺口挂上了 evidence（`_source_key` 修复 + summary 重铸）。
+
+**剩下 3 行在 3 页上，均因连帯损失而被安全门挡住**（逐页实测）：
+
+| 页 | 连帯会失去 | 判定 |
+|---|---|---|
+| `Concept_反熵防御罩` | 一条 `timeline-event`：`Frequently reported as "Active" across multiple daily Mentat logic audits…` | 是审计记账而非知识，但不在标记集里 |
+| `Concept_AI-Native-SDLC` | 一条**真实** `bullet-claim`（它与指令**共处一个块**；样板门是包含式匹配，整块被拒） | 不能默不作声地删 |
+| `Source_…集群架构白皮书20260511-Full` | 旧 summary 被新 summary 取代（两者都是真实内容） | 实际无损，但需人看一眼 |
+
+由此登记一条发现：`_is_page_boilerplate` 的**包含式**匹配比它的文档说明宽——一个只要“提到”指令的块就整块被拒，
+因而连坐真实声明（上表第二行就是实例）。改成“支配式”（剥掉标记后所剩无几）可以同时清掉那 3 行并救回那条真实声明，
+但它会再次改变全库抽取结果（需再一轮重提取），所以只登记、未改。
+
 ## `vec_embeddings.entity_id` → `page_key`：列的读音终于和它的内容一致
 
 这一列一直存的是**页键**（`Concept_...`），却叫 `entity_id` —— 与隔壁 `entities.entity_id`（`entity_<hex>`，另一个标识符）同名。

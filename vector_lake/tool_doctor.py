@@ -116,6 +116,12 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
             detail += "; no add_word() on this backend (custom dictionary terms ignored)"
         checks.append(("Tokenizer Backend", True, detail))
 
+    try:
+        import vector_lake_core
+        checks.append(("Native Acceleration", True, f"vector-lake-core v{vector_lake_core.version()} (Rust fast-core active)"))
+    except ImportError:
+        checks.append(("Native Acceleration", True, "pure-python (optional vector-lake-core not installed)"))
+
     # The retrieval ledger is the only record of what search answered, so whether it is on and
     # how much it holds belongs in the same report as everything else that can silently be off.
     try:

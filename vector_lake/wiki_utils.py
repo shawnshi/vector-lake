@@ -16,6 +16,12 @@ from vector_lake import get_extension_root, host_env
 from vector_lake.node_vocabulary import NODE_PREFIXES, NODE_TYPE_ALTERNATION, NON_NODE_WIKI_FILES
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
+try:
+    import vector_lake_core
+    HAVE_CORE = True
+except ImportError:
+    vector_lake_core = None
+    HAVE_CORE = False
 
 _META_DIR_CACHE = None
 _CONFIG_CACHE: dict = {}
@@ -425,6 +431,18 @@ def normalize_sources(value) -> list[str]:
 def split_frontmatter(content: str) -> tuple[dict, str]:
     if not content.startswith("---\n") and not content.startswith("---\r\n"):
         return {}, content
+
+    if HAVE_CORE:
+        yaml_part, body_part = vector_lake_core.fast_split_frontmatter(content)
+        if not yaml_part and body_part == content:
+            return {}, content
+        try:
+            frontmatter = load_yaml(yaml_part) or {}
+        except yaml.YAMLError:
+            raise
+        if not isinstance(frontmatter, dict):
+            frontmatter = {}
+        return frontmatter, body_part
     
     match = re.search(r'\r?\n---(?:\r?\n|$)', content)
     if not match:
@@ -658,6 +676,8 @@ def sanitize_wiki_node(filepath: str | Path):
 
 
 def _count_list_items(body: str, section_marker: str) -> int:
+    if HAVE_CORE:
+        return vector_lake_core.fast_count_list_items(body, section_marker)
     count = 0
     in_section = False
     for line in io.StringIO(body):

@@ -361,6 +361,30 @@ def assess_runtime_health(
                 f"missing={timeline_drift['missing']},extra={timeline_drift['extra']}"
             )
 
+        # The surfaces that point *at* claims had no reader that would notice a dead pointer:
+        # ``evidence.supports_claim_ids`` named retired claims for two months (25 220 of them,
+        # all but 6 from one 2026-07-14 bulk pass) and the ``claim_graph_edges`` delta filtered a
+        # page-key table by claim ids, so it never removed a retired page's links.  Counted here
+        # rather than left for an operator to find.  Edge endpoints the resolver cannot answer
+        # are reported but not degraded: keeping the raw target is what the edge writer does on
+        # purpose, so it is a link-quality signal, not drift.
+        try:
+            from vector_lake.tool_maintenance import claim_projection_drift
+
+            pointer_drift = claim_projection_drift(prepare=False)
+            detail["claim_pointer_drift"] = {
+                key: value for key, value in pointer_drift.items() if key != "sample_edges"
+            }
+            if pointer_drift["dead_pointers"] or pointer_drift["memory_rows"]:
+                degraded.append(
+                    "claim_pointer_drift:"
+                    f"evidence_rows={pointer_drift['evidence_rows']},"
+                    f"dead_pointers={pointer_drift['dead_pointers']},"
+                    f"memory_rows={pointer_drift['memory_rows']}"
+                )
+        except Exception as exc:  # noqa: BLE001 - a health probe must not fail the assessment
+            warnings.append(f"claim_pointer_drift_probe_failed:{type(exc).__name__}")
+
     return {
         "ok": not issues and not degraded,
         "hard_ok": not issues,

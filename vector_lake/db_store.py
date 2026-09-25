@@ -1456,15 +1456,24 @@ def _entities_format_is_stale(conn: sqlite3.Connection) -> bool:
 
 
 def _timeline_format_is_stale(conn: sqlite3.Connection) -> bool:
-    """Read-only: is the ``timeline_events.event_date_source`` column missing?
+    """Read-only: is ``timeline_events`` missing a column or index the writer names?
 
     Columns added by ``_init_db_once`` need this, or a database that already has every
     sentinel takes the fast path and never runs the ``ALTER`` -- which is how
     ``repair_timeline_projection`` came to ask for a column that did not exist yet on a
     corpus whose schema was otherwise complete.  Same shape as
     :func:`_entities_format_is_stale`.
+
+    ``claim_id`` is the second such column: the event id is content-addressed
+    (``sha256(claim_id, event_date, text)``), so a row could say *what* it held but not
+    *which claim* it came from, and a claim retired by anything other than the delta path
+    left a row nobody could attribute.  The index is required with the column because the
+    sync deletes by it on every claim delta.
     """
-    return "event_date_source" not in _table_xcolumns(conn, "timeline_events")
+    columns = _table_xcolumns(conn, "timeline_events")
+    if "event_date_source" not in columns or "claim_id" not in columns:
+        return True
+    return "idx_timeline_claim" not in _index_names(conn)
 
 
 def _index_names(conn: sqlite3.Connection) -> set[str]:
@@ -1790,6 +1799,7 @@ def _init_db_once(db_key: str):
         conn.execute("""
             CREATE TABLE IF NOT EXISTS timeline_events (
                 id TEXT PRIMARY KEY,
+                claim_id TEXT,
                 event_date TEXT,
                 event_date_source TEXT,
                 action TEXT,
@@ -1809,8 +1819,17 @@ def _init_db_once(db_key: str):
         # them; ``init_db`` only guarantees the column is there to write to.
         if "event_date_source" not in _table_xcolumns(conn, "timeline_events"):
             conn.execute("ALTER TABLE timeline_events ADD COLUMN event_date_source TEXT")
+        # ``claim_id`` says which canonical claim a row was projected from.  The event id is
+        # a hash, so without this column an orphan row cannot be traced back to the claim
+        # that produced it -- and the delta's delete recomputes that hash from the *stored*
+        # claim, which stops matching as soon as anything rewrites the claim outside the
+        # delta path.  With the column the delete is exact and identity-independent; rows
+        # written earlier carry NULL and are converged by ``repair_timeline_projection``.
+        if "claim_id" not in _table_xcolumns(conn, "timeline_events"):
+            conn.execute("ALTER TABLE timeline_events ADD COLUMN claim_id TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(event_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_entity ON timeline_events(entity_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_claim ON timeline_events(claim_id)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_files (
                 filepath TEXT PRIMARY KEY,

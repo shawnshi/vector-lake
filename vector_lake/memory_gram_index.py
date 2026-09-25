@@ -67,6 +67,13 @@ import time
 from vector_lake import db_store
 from vector_lake.db_store import get_connection, init_db, transaction
 
+try:
+    import vector_lake_core
+    HAVE_CORE = True
+except ImportError:
+    vector_lake_core = None
+    HAVE_CORE = False
+
 log = logging.getLogger("vector-lake-memory-gram-index")
 
 #: Bumped when a previously written base can no longer be trusted to be exact.
@@ -168,6 +175,8 @@ def extract_grams(key_blob: str, text_blob: str, page_blob: str) -> dict[str, in
 
 def _pack(postings) -> bytes:
     """``[(doc, mask), ...]`` in ascending doc order -> packed little-endian blob."""
+    if HAVE_CORE:
+        return vector_lake_core.pack_postings(list(postings))
     from array import array
 
     values = array("I")
@@ -180,6 +189,8 @@ def _pack(postings) -> bytes:
 
 def _entries(blob: bytes):
     """Packed blob -> ``[(doc, mask), ...]``."""
+    if HAVE_CORE:
+        return vector_lake_core.unpack_postings(blob)
     from array import array
 
     values = array("I")
@@ -196,6 +207,11 @@ def _entries(blob: bytes):
 
 def _accumulate(blob: bytes, weights: list[int], accumulator: dict, skip=None) -> None:
     """Fold one posting list into ``accumulator`` (``doc -> relevance``)."""
+    if HAVE_CORE:
+        res = vector_lake_core.accumulate_postings(blob, weights, set(skip) if skip else None)
+        for doc, score in res.items():
+            accumulator[doc] = accumulator.get(doc, 0) + score
+        return
     from array import array
 
     values = array("I")

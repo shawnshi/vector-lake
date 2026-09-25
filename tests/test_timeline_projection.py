@@ -1,7 +1,12 @@
 import json
 
 from vector_lake import db_store, governance_store
-from vector_lake.tool_timeline import rebuild_timeline_events_from_claims, search_timeline_events
+from vector_lake.tool_timeline import (
+    rebuild_timeline_events_from_claims,
+    repair_timeline_projection,
+    search_timeline_events,
+    timeline_projection_parity,
+)
 
 
 def test_timeline_projection_rebuilds_from_claims(isolated_memory):
@@ -79,6 +84,74 @@ def test_timeline_projection_tracks_add_update_and_type_conversion(isolated_memo
     restored = _claim("claim_delta", "Source_Delta", "Restored timeline value")
     _apply_page("Source_Delta", [restored])
     assert conn.execute("SELECT description FROM timeline_events").fetchone()[0] == "Restored timeline value"
+
+
+def test_retiring_a_claim_whose_date_moved_out_of_band_leaves_no_orphan(isolated_memory):
+    """The September leak, reproduced end to end.
+
+    Rows are projected in parity, a later pass rewrites the claim's date outside the delta
+    path, and then the claim is retired through the delta.  The delete used to recompute the
+    event hash from the *current* claim, which no longer named the stored row -- so the row
+    outlived its claim (90 rows on the live corpus at 93 -> 0 after repair).  Keying the
+    delete on ``claim_id`` is what removes it.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _apply_page("Source_Moved", [_claim("claim_moved", "Source_Moved", "Event that moves")])
+    assert conn.execute("SELECT COUNT(*) FROM timeline_events").fetchone()[0] == 1
+
+    moved = json.loads(
+        conn.execute("SELECT data_json FROM claims WHERE claim_id = 'claim_moved'").fetchone()["data_json"]
+    )
+    moved["temporal_anchor"] = "2026-08-01"
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE claims SET data_json = ? WHERE claim_id = 'claim_moved'", (json.dumps(moved),)
+        )
+
+    # The load-bearing fact: what the delta can recompute no longer names the stored row.
+    from vector_lake.tool_timeline import _event_from_claim_row
+
+    stored_id = conn.execute("SELECT id FROM timeline_events").fetchone()["id"]
+    current = conn.execute(
+        "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
+        "WHERE f_claim_type = 'timeline-event'"
+    ).fetchone()
+    assert _event_from_claim_row(current)["id"] != stored_id, (
+        "the recomputed hash still matches, so this test would not exercise claim_id"
+    )
+
+    _apply_page("Source_Moved", [])
+
+    assert conn.execute("SELECT COUNT(*) FROM timeline_events").fetchone()[0] == 0
+    assert timeline_projection_parity()["extra"] == 0
+
+
+def test_projection_rows_record_the_claim_they_came_from(isolated_memory):
+    """The column an orphan is attributed by; the event id alone is a one-way hash."""
+    db_store.init_db()
+    _apply_page("Source_Attr", [_claim("claim_attr", "Source_Attr", "Attributed event")])
+
+    row = db_store.get_connection().execute("SELECT claim_id FROM timeline_events").fetchone()
+    assert row["claim_id"] == "claim_attr"
+
+
+def test_repair_backfills_claim_id_in_place(isolated_memory):
+    """A row written before the claim_id column keeps its ``extracted_at`` while converging."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _apply_page("Source_Repair", [_claim("claim_repair", "Source_Repair", "Repairable event")])
+    stored = conn.execute("SELECT extracted_at FROM timeline_events").fetchone()["extracted_at"]
+    with db_store.transaction():
+        conn.execute("UPDATE timeline_events SET claim_id = NULL")
+
+    assert "rewrite 1 row" in repair_timeline_projection(dry_run=True)
+    repair_timeline_projection(dry_run=False)
+
+    row = conn.execute("SELECT claim_id, extracted_at FROM timeline_events").fetchone()
+    assert row["claim_id"] == "claim_repair"
+    assert row["extracted_at"] == stored
+    assert timeline_projection_parity()["extra"] == 0
 
 
 def test_page_delete_only_removes_its_own_timeline_event(isolated_memory):

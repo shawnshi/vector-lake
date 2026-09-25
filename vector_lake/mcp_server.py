@@ -264,6 +264,31 @@ def sync_vector_lake() -> str:
         return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
 
 @mcp.tool()
+def claim_evidence_queue(
+    apply: bool = False,
+    group: str = "prefix",
+    batch_pages: int = 100,
+    page_limit: int = 25,
+) -> str:
+    """Dispatch the unsupported-claim debt to the governance queue as cohort batches.
+
+    Args:
+        apply: Enqueue the batches.  Defaults to a dry run that only reports the plan.
+        group: Cohort axis -- ``prefix`` (the page prefix) or ``month`` (the claim's created month).
+        batch_pages: Pages covered by one governance item.
+        page_limit: Page names stored on each item.
+    """
+    try:
+        return tools.claim_evidence_queue(
+            dry_run=not apply, group=group, batch_pages=batch_pages, page_limit=page_limit
+        )
+    except Exception as e:
+        import traceback
+        logging.error(f"MCP Tool Exception (claim_evidence_queue): {e}\n{traceback.format_exc()}")
+        return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
+
+
+@mcp.tool()
 def lint_vector_lake(auto_fix: bool = False) -> str:
     """Run self-healing audit on the Wiki nodes.
     

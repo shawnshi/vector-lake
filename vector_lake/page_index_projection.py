@@ -42,13 +42,81 @@ import os
 import sqlite3
 import threading
 
-from vector_lake.db_store import get_connection, init_db, transaction
+from vector_lake.db_store import get_connection, get_db_path, init_db, transaction
+from vector_lake.link_resolution import build_link_map, declared_names_from_nodes, resolve_link_target
 from vector_lake.wiki_utils import get_index_path
 from vector_lake.wiki_utils import get_meta_dir
 
 log = logging.getLogger("vector-lake-page-index")
 
 ADJACENCY_CACHE_LIMIT = 1
+
+# ``link_target_resolver`` memo.  Keyed on the two index-only numbers below, so a per-page
+# caller pays one build per index change, not one per page.
+_LINK_RESOLVER_CACHE: dict = {"fingerprint": None, "resolver": None}
+
+
+def link_target_resolver():
+    """``resolve(name) -> page key | None`` over the published node index, or ``None``.
+
+    Who answers "which page does this link name" is ``link_resolution``; this is the adapter that
+    hands it the index it resolves against.  It exists because the two producers of edges had two
+    rules: the indexer resolved through ``link_resolution``, while ``claim_extractor`` stored the
+    link's **literal text** as the edge target -- the "one question, two answers" defect the
+    resolution module was created to end, still live on the claim-graph side.  Live measurement of
+    where that left the corpus: 232 of 10 487 ``claim_graph_edges`` rows had an endpoint no page
+    answers, 230 of which the resolver could answer (``Concept_CoMET`` -> ``Product_CoMET``).
+
+    Memoised against the node projection's row count and highest rowid -- both index-only reads,
+    0.2 ms warm on the live corpus -- so a 7 000-page batch pays one 0.20 s build instead of 7 000.
+
+    Returns ``None`` when the projection is empty, absent, or unreadable.  A caller must then keep
+    the target as written: no index means no answer, and guessing one would invent a page key.
+    """
+    # ``get_connection`` *creates* the database file when it is absent, and this is called from
+    # the extractor, which runs on dry-run paths too -- ``migrate_existing_wiki(dry_run=True)``
+    # asserts that no SQLite file appears, and it did.  A database that does not exist has no
+    # index to answer with, so the guard is also the honest answer: keep the target as written.
+    if not get_db_path().exists():
+        return None
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM page_index_nodes"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        log.debug("No node index to resolve link targets against: %s", exc)
+        return None
+    count, highest = int(row[0]), int(row[1])
+    if not count:
+        return None
+    # The database identity is part of the key, not only the row numbers: two isolated corpora
+    # (tests, a backup being inspected) can both hold one node, and a memo keyed on the numbers
+    # alone would answer one with the other's index.  Same reason ``tool_timeline``'s parity
+    # fingerprint carries the path.
+    fingerprint = (str(get_db_path()), count, highest)
+    if _LINK_RESOLVER_CACHE["fingerprint"] == fingerprint:
+        return _LINK_RESOLVER_CACHE["resolver"]
+
+    nodes: dict[str, dict] = {}
+    for node in conn.execute("SELECT node_key, node_json FROM page_index_nodes"):
+        try:
+            payload = json.loads(node["node_json"])
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        nodes[str(node["node_key"])] = {
+            "title": payload.get("title"),
+            "aliases": payload.get("aliases") or [],
+        }
+    link_map, _core_pages, unique_cores, _contested = build_link_map(
+        nodes.keys(), declared_names_from_nodes(nodes)
+    )
+    resolver = lambda target: resolve_link_target(str(target), link_map, unique_cores)  # noqa: E731
+    _LINK_RESOLVER_CACHE["fingerprint"] = fingerprint
+    _LINK_RESOLVER_CACHE["resolver"] = resolver
+    return resolver
 
 def index_file_stamp() -> tuple[float, int] | None:
     path = get_index_path()

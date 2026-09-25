@@ -208,3 +208,37 @@ def test_page_rewrite_survives_claim_ids_beyond_the_sql_variable_ceiling(isolate
         (json.dumps(claim_ids),),
     ).fetchone()[0]
     assert remaining == 0, "the superseded claims must be retired by the rewrite"
+
+
+def test_rewritten_page_stores_the_resolved_edge_target(isolated_memory, monkeypatch):
+    """Both fixes composing: the page-key delete and the resolver's answer.
+
+    The extractor stored the link's literal text (``Concept_CoMET``) while the indexer resolved
+    it (``Product_CoMET``); the delta's delete also filtered a page-key table by claim ids, so
+    the literal row would have been left behind by the rewrite.
+    """
+    monkeypatch.setenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", "1")
+    _write_purpose_contract(isolated_memory)
+    page = isolated_memory / "wiki" / "Concept_Edges.md"
+    original = _concept("Concept_Edges").replace(
+        "\n## 2. 证据时间线", "\n[validates:: [[Concept_CoMET]]]\n\n## 2. 证据时间线"
+    )
+    page.write_text(original, encoding="utf-8")
+    governance_store.ensure_canonical_store_populated()
+
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT OR REPLACE INTO page_index_nodes (node_key, node_json) VALUES (?, ?)",
+            ("Product_CoMET", json.dumps({"title": "CoMET", "aliases": []})),
+        )
+
+    page.write_text(original + "\n", encoding="utf-8")
+    governance_store.sync_pages_to_canonical([str(page)], origin="probe", auto_approve=True)
+
+    rows = {
+        (row["source_id"], row["target_id"])
+        for row in conn.execute("SELECT source_id, target_id FROM claim_graph_edges")
+    }
+    assert ("Concept_Edges", "Product_CoMET") in rows
+    assert ("Concept_Edges", "Concept_CoMET") not in rows

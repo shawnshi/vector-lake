@@ -157,6 +157,55 @@ Usage Examples:
     )
     repair_parser.add_argument("--table", choices=list(tools.IDEMPOTENCY_TABLES), default="mutation_outbox", help="Table to repair (default: mutation_outbox).")
     repair_parser.add_argument("--apply", action="store_true", help="Clear the redundant keys. Defaults to dry-run; no row is deleted either way.")
+
+    subparsers.add_parser(
+        "claim-pointer-report",
+        help="[MAINTENANCE] Report pointers on claim-derived surfaces that name a missing claim.",
+    )
+
+    claim_pointer_parser = subparsers.add_parser(
+        "claim-pointer-repair",
+        help="[MAINTENANCE] Prune dead claim pointers (evidence), optionally re-key resolvable edges.",
+    )
+    claim_pointer_parser.add_argument("--apply", action="store_true", help="Write the repair. Defaults to dry-run; the rollback file is written first.")
+    claim_pointer_parser.add_argument("--edges", action="store_true", help="Also re-key claim_graph_edges rows whose endpoint the link resolver can answer.")
+
+    claim_evidence_parser = subparsers.add_parser(
+        "claim-evidence-queue",
+        help="[MAINTENANCE] Dispatch the unsupported-claim debt to the governance queue as cohort batches.",
+    )
+    claim_evidence_parser.add_argument("--apply", action="store_true", help="Enqueue the batches. Defaults to dry-run.")
+    claim_evidence_parser.add_argument("--group", choices=["prefix", "month"], default="prefix", help="Cohort axis: page prefix (default) or the claim's created month.")
+    claim_evidence_parser.add_argument("--batch-pages", type=int, default=100, help="Pages per governance item (default: 100).")
+    claim_evidence_parser.add_argument("--page-limit", type=int, default=25, help="Page names stored on each item (default: 25).")
+
+    provenance_backfill_parser = subparsers.add_parser(
+        "provenance-backfill",
+        help="[MAINTENANCE] Restore `sources:` declarations the ingest ledgers still record.",
+    )
+    provenance_backfill_parser.add_argument("--apply", action="store_true", help="Write the restorations. Defaults to dry-run; every page's prior text is written to the rollback file first.")
+    provenance_backfill_parser.add_argument("--batch", type=int, default=50, help="Pages per mutation batch (default: 50).")
+    provenance_backfill_parser.add_argument("--limit", type=int, default=None, help="Restore at most this many pages (for a canary run).")
+    provenance_backfill_parser.add_argument("--revert", default=None, metavar="ROLLBACK_FILE", help="Instead of restoring, put back every page named in this rollback file.")
+
+    provenance_accept_parser = subparsers.add_parser(
+        "provenance-accept",
+        help="[MAINTENANCE] Record that the pages whose provenance was never recorded are accepted as legacy debt.",
+    )
+    provenance_accept_parser.add_argument("--apply", action="store_true", help="Write the acceptance ledger. Defaults to dry-run.")
+
+    subparsers.add_parser(
+        "anchor-draft",
+        help="[MAINTENANCE] Draft anchors for multi-source blocks that never named which source they used.",
+    )
+
+    anchor_backfill_parser = subparsers.add_parser(
+        "anchor-backfill",
+        help="[MAINTENANCE] Write the confirmed anchors and re-extract, so evidence can attach.",
+    )
+    anchor_backfill_parser.add_argument("--apply", action="store_true", help="Write the anchors. Defaults to dry-run; each page's prior text lands in the rollback file first.")
+    anchor_backfill_parser.add_argument("--only", default=None, metavar="LIST", help="Confirm only these review numbers, e.g. 1,2,5,9-14 (default: every proposal).")
+    anchor_backfill_parser.add_argument("--batch", type=int, default=10, help="Pages per mutation batch (default: 10).")
     return parser
 
 
@@ -280,6 +329,45 @@ def main() -> int:
             print(tools.repair_idempotency_keys(
                 table=getattr(args, "table", "mutation_outbox"),
                 dry_run=not getattr(args, "apply", False),
+            ))
+        elif args.command == "claim-pointer-report":
+            print(tools.claim_projection_drift_report())
+        elif args.command == "claim-pointer-repair":
+            print(tools.repair_claim_pointers(
+                dry_run=not getattr(args, "apply", False),
+                edges=getattr(args, "edges", False),
+            ))
+        elif args.command == "claim-evidence-queue":
+            print(tools.claim_evidence_queue(
+                dry_run=not getattr(args, "apply", False),
+                group=getattr(args, "group", "prefix"),
+                batch_pages=getattr(args, "batch_pages", 100),
+                page_limit=getattr(args, "page_limit", 25),
+            ))
+        elif args.command == "provenance-backfill":
+            if getattr(args, "revert", None):
+                print(tools.revert_provenance_backfill(
+                    args.revert,
+                    batch=getattr(args, "batch", 50),
+                    dry_run=not getattr(args, "apply", False),
+                ))
+            else:
+                print(tools.backfill_provenance(
+                    dry_run=not getattr(args, "apply", False),
+                    batch=getattr(args, "batch", 50),
+                    limit=getattr(args, "limit", None),
+                ))
+        elif args.command == "provenance-accept":
+            print(tools.accept_unrecorded_provenance(
+                dry_run=not getattr(args, "apply", False),
+            ))
+        elif args.command == "anchor-draft":
+            print(tools.draft_anchors())
+        elif args.command == "anchor-backfill":
+            print(tools.backfill_anchors(
+                only=getattr(args, "only", None),
+                apply=getattr(args, "apply", False),
+                batch=getattr(args, "batch", 10),
             ))
     except Exception as exc:
         print(f"Error executing command '{args.command}': {exc}", file=sys.stderr)

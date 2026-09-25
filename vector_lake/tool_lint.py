@@ -4,11 +4,13 @@ import os
 import re
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake.wiki_utils import (
     VALID_PREFIXES,
+    get_raw_dir,
     get_wiki_dir,
     entity_identity_key,
     normalize_entity_name,
@@ -233,7 +235,7 @@ def lint_vector_lake(auto_fix: bool = False):
     required_fields = list(REQUIRED_FIELDS)
 
     files = [name for name in listed if name not in NON_NODE_WIKI_FILES]
-    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "domain", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment", "evidence"]}
+    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "domain", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment", "evidence", "source_path"]}
     fixes_applied = 0
     stubs_refused = 0
     #: how many pages assert a controlled metric, keyed by the tier that supports them.
@@ -241,6 +243,9 @@ def lint_vector_lake(auto_fix: bool = False):
     #: the census line, rendered under section 16 but not a finding.  A healthy census must not
     #: make the section read FAIL -- it did, until this was separated from ``issues``.
     metric_evidence_summary: list[str] = []
+    #: the same shape for section 12: how much of the unsupported-claim debt was decided to be
+    #: unrecorded provenance rather than left open.  A decision is context, not a finding.
+    governance_summary: list[str] = []
 
     parsed = {}
     id_map = {}
@@ -845,10 +850,106 @@ def lint_vector_lake(auto_fix: bool = False):
             f"  of which: no source recorded {metrics.get('unsourced_claim_count', 0)}, "
             f"source not named by the block {metrics.get('ambiguous_source_claim_count', 0)}"
         )
+    if metrics.get("legacy_unsourced_claim_count"):
+        # Reported under the same section because it is the other half of the same number, but as
+        # a census: the provenance of these pages was never recorded and that was decided, so
+        # there is nothing left to do about them and they cannot fail the section.
+        governance_summary.append(
+            f"accepted as legacy (provenance never recorded, decision recorded): "
+            f"{metrics['legacy_unsourced_claim_count']} claim(s) over "
+            f"{metrics.get('legacy_accepted_page_count', 0)} page(s) -- "
+            f"{metrics.get('legacy_acceptance_ledger', '')}"
+        )
     if metrics["stale_claim_count"] > 0:
         issues["governance"].append(f"Stale claims: {metrics['stale_claim_count']}")
     if metrics["pending_change_set_count"] > 0:
         issues["governance"].append(f"Pending change sets: {metrics['pending_change_set_count']}")
+
+    # 17. Source Path Resolution -- reported, and deliberately without a repair branch.
+    #
+    # Nothing in this pass asked whether a page's declared provenance still names a file: the
+    # broken-link check walks ``[[...]]`` targets only, and the one other mention of ``sources``
+    # is the frontmatter fill-in above.  It matters because the declaration is what a reader
+    # follows back to the raw document, and the raw tree has been reorganised under it more than
+    # once (``raw/news/*`` -> ``raw/news/2026Qx/*``, ``raw/DHLS-*`` ->
+    # ``raw/DigitalHealthLecturesScout/``).
+    #
+    # Never repaired here.  The declaration and the SQLite ``sources`` row agree with each other
+    # -- ``source_id`` is ``_stable_id("source", raw_ref)``, a hash of the path string -- so
+    # rewriting the page alone would leave the file naming one path and the database another for
+    # the same source, which is the "one question, two answers" shape this module exists to
+    # remove.  Repointing belongs to a provenance migration that moves both sides and the rows
+    # referencing them together.
+    raw_root = get_raw_dir()
+    memory_root = raw_root.parent
+    source_path_summary: list[str] = []
+    checked_paths = 0
+    resolved_paths = 0
+    corrupted_sources: list[tuple[str, str]] = []
+    unresolved_sources: list[tuple[str, str]] = []
+    for filename, data in parsed.items():
+        declared = data["fm"].get("sources") or []
+        if isinstance(declared, str):
+            declared = [declared]
+        for entry in declared:
+            # An entry that does not start with ``raw/`` names a wiki page or a canonical source
+            # name, not a file on disk, so existence is not a question it answers.
+            ref = str(entry or "").strip().strip("'\"")
+            if not ref.startswith("raw/"):
+                continue
+            checked_paths += 1
+            if "?" in ref or "\ufffd" in ref:
+                corrupted_sources.append((filename, ref))
+            elif os.path.exists(os.path.join(str(memory_root), *ref.split("/"))):
+                resolved_paths += 1
+            else:
+                unresolved_sources.append((filename, ref))
+
+    for filename, ref in corrupted_sources:
+        issues["source_path"].append(f"{filename}: the stored path is corrupted: {ref}")
+
+    if unresolved_sources:
+        # One walk of the raw tree, only when something is unresolved: ~2.4k files (0.3 s), which
+        # a corpus whose declarations all resolve should not pay for.
+        by_basename: dict[str, list[str]] = defaultdict(list)
+        for candidate in raw_root.rglob("*"):
+            if candidate.is_file():
+                by_basename[candidate.name].append(
+                    str(candidate.relative_to(memory_root)).replace("\\", "/")
+                )
+        moves: Counter = Counter()
+        for filename, ref in unresolved_sources:
+            candidates = by_basename.get(Path(ref).name, [])
+            if not candidates:
+                issues["source_path"].append(
+                    f"{filename}: no file named {Path(ref).name} under raw/: {ref}"
+                )
+            elif len(candidates) > 1:
+                # Naming the basename is not enough to repoint it, and guessing would be worse
+                # than saying so: two raw files share a name and only a human knows which.
+                issues["source_path"].append(
+                    f"{filename}: {len(candidates)} files share that name, cannot resolve: {ref}"
+                )
+            else:
+                issues["source_path"].append(f"{filename}: {ref} -> {candidates[0]} (moved)")
+                moves[f"{ref.rsplit('/', 1)[0]} -> {candidates[0].rsplit('/', 1)[0]}"] += 1
+        if moves:
+            source_path_summary.append(
+                f"{sum(moves.values())} unresolved path(s) name a file that exists elsewhere under "
+                f"raw/, in {len(moves)} move pattern(s):"
+            )
+            source_path_summary.extend(
+                f"    {count:>4}  {pattern}" for pattern, count in moves.most_common(5)
+            )
+
+    if checked_paths:
+        # The census sits above the samples the way the collision and metric-evidence summaries
+        # do: context for the findings, not one of them.
+        source_path_summary.insert(
+            0,
+            f"checked {checked_paths} declared raw path(s): {resolved_paths} resolve, "
+            f"{len(unresolved_sources)} do not, {len(corrupted_sources)} corrupted in the page",
+        )
 
     check_names = {
         "frontmatter": "1. Frontmatter Completeness",
@@ -872,6 +973,10 @@ def lint_vector_lake(auto_fix: bool = False):
         # Appended for the same reason as ``domain``: the numbered sections are referenced across
         # time, so a new check goes last rather than renumbering the ones an operator already reads.
         "evidence": "16. Metric Evidence",
+        # Appended for the same reason as ``domain`` and ``evidence``: the numbered sections are
+        # referenced across time, so a new check goes last rather than renumbering the ones an
+        # operator already reads.
+        "source_path": "17. Source Path Resolution",
     }
 
     total_issues = sum(len(items) for items in issues.values())
@@ -896,6 +1001,14 @@ def lint_vector_lake(auto_fix: bool = False):
             # Same shape as the collision summary: the census is context for the findings, not
             # one of them, so it must not turn a clean section into a FAIL.
             lines.extend(f"    {line}" for line in metric_evidence_summary)
+            sample_limit = 10
+        elif key == "source_path":
+            # Same shape again: how many declarations resolve, and which moves explain the rest.
+            lines.extend(f"    {line}" for line in source_path_summary)
+            sample_limit = 5
+        elif key == "governance":
+            # The decided half of the unsupported-claim debt is context for the findings above it.
+            lines.extend(f"    {line}" for line in governance_summary)
             sample_limit = 10
         else:
             sample_limit = 10

@@ -16,6 +16,13 @@ from vector_lake import author_facet
 from vector_lake.node_vocabulary import strip_prefix
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
+try:
+    import vector_lake_core
+    HAVE_CORE = True
+except ImportError:
+    vector_lake_core = None
+    HAVE_CORE = False
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-search")
@@ -943,30 +950,36 @@ def _search_scored_pages(
         # PPR parameters.  Non-seed nodes must still receive teleportation mass,
         # otherwise the walk collapses to "adjacent to a seed" after two steps.
         seed_keys = set(top_keys)
-        alpha = 0.85
-        restart_mass = (1 - alpha) / len(top_keys)
-        ppr_scores = {k: 1.0 / len(top_keys) for k in seed_keys}
-
-        for _ in range(2):
-            next_scores = {k: restart_mass if k in seed_keys else 0.0 for k in adj}
-            for node, current_score in ppr_scores.items():
-                neighbors = adj.get(node, [])
-                if neighbors:
-                    total_weight = sum(w for _, w in neighbors)
-                    if total_weight <= 0:
-                        continue
-                    for neighbor, w in neighbors:
-                        next_scores[neighbor] = next_scores.get(neighbor, 0.0) + alpha * current_score * (w / total_weight)
-            ppr_scores = next_scores
-
         existing_keys = {node["_key"] for _, node in scored}
         expansion_limit = 12 if intent == "entity" else 5
-        
-        sorted_expansions = sorted(
-            [(k, v) for k, v in ppr_scores.items() if k not in existing_keys], 
-            key=lambda x: x[1], 
-            reverse=True
-        )
+
+        if HAVE_CORE:
+            adj_dict = {node: [(neighbor, float(w)) for neighbor, w in neighbors] for node, neighbors in adj.items()}
+            sorted_ppr = vector_lake_core.fast_personalized_pagerank(adj_dict, list(seed_keys), 0.85, 2)
+            sorted_expansions = [(k, v) for k, v in sorted_ppr if k not in existing_keys]
+        else:
+            alpha = 0.85
+            restart_mass = (1 - alpha) / len(top_keys)
+            ppr_scores = {k: 1.0 / len(top_keys) for k in seed_keys}
+
+            for _ in range(2):
+                next_scores = {k: restart_mass if k in seed_keys else 0.0 for k in adj}
+                for node, current_score in ppr_scores.items():
+                    neighbors = adj.get(node, [])
+                    if neighbors:
+                        total_weight = sum(w for _, w in neighbors)
+                        if total_weight <= 0:
+                            continue
+                        for neighbor, w in neighbors:
+                            next_scores[neighbor] = next_scores.get(neighbor, 0.0) + alpha * current_score * (w / total_weight)
+                ppr_scores = next_scores
+
+            sorted_expansions = sorted(
+                [(k, v) for k, v in ppr_scores.items() if k not in existing_keys], 
+                key=lambda x: x[1], 
+                reverse=True
+            )
+
         expansion_keys = [key for key, _ in sorted_expansions[:expansion_limit]]
         expanded_nodes = catalog.nodes_by_key(expansion_keys)
         

@@ -3,7 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from vector_lake.wiki_utils import canonical_source_name, normalize_sources
+from vector_lake.wiki_utils import canonical_source_name, enforce_claim_dict, normalize_sources
 from vector_lake.node_vocabulary import is_generated_artifact
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 import logging
@@ -74,6 +74,13 @@ def claim_type_for_heading(kind: str, heading: str, text: str) -> str:
     return _claim_type_for_block(kind)
 
 
+#: Bookkeeping the maintenance tooling wrote *into* the ledger, prefixed with a date so it became
+#: a dated timeline entry: 5 live claims say nothing but ``Node auto-migrated to V11 schema``.  The
+#: temporal prefix is deliberately kept in a claim's text (see ``_parse_temporal``), so the check
+#: strips it and compares what is left.
+BOOKKEEPING_BODIES = ("node auto-migrated to v11 schema",)
+
+
 def _is_page_boilerplate(text) -> bool:
     """True for a block that only carries a template caption or a reader instruction.
 
@@ -84,11 +91,18 @@ def _is_page_boilerplate(text) -> bool:
     regenerating timeline-projection drift.  The caption is markup: no date and no
     proposition, yet it reached the timeline as an undated "event" that the projection then
     dated with its *ingestion* time.
+
+    ``BOOKKEEPING_BODIES`` is the same family found later: a migration left its own marker as a
+    dated ledger entry, which the current code would happily re-mint because the date prefix makes
+    it look like a real observation.
     """
     normalized = _collapse_text(text).lower()
     if not normalized:
         return False
     if SYSTEM_DIRECTIVE_MARKER.lower() in normalized:
+        return True
+    stripped = re.sub(r"^(?:\s*\[[^\]]*\]\s*)+", "", normalized).strip().strip(".!。")
+    if stripped in BOOKKEEPING_BODIES:
         return True
     return any(normalized.startswith(prefix) for prefix in TIMELINE_CAPTION_PREFIXES)
 
@@ -104,6 +118,24 @@ def _is_page_scope_disclaimer(text) -> bool:
 
 
 def _body_summary(body: str, limit: int = 320) -> str:
+    """The page's own first words, not its scaffolding.
+
+    The fallback used to be the first ``limit`` characters of the raw body, which on every page
+    starts with the template's headings and -- on 3 214 live pages -- the system directive.  The
+    resulting ``summary`` claim therefore carried markup and a reader instruction instead of
+    knowledge, its ``page-summary`` evidence recorded the directive as ``evidence_text``, and since
+    the summary is re-minted from the body on every extraction, re-extracting those pages could not
+    remove the row: a 200-page sample showed the marker surviving all 169 pages whose body held no
+    other offending block.  Skipping the scaffolding (the same rule the block loop uses) makes the
+    summary say something, and turns the old row into one the next extraction replaces.
+    """
+    for block in _iter_blocks(body):
+        text = block.get("text") or ""
+        if not text or _is_page_boilerplate(text) or _is_page_boilerplate(block.get("raw_text")):
+            continue
+        # Cleaned: this string becomes both a claim text and the ``page-summary`` evidence text, so
+        # raw markup and inline anchors must not travel into either.
+        return _clean_claim_text(text, limit=limit)
     return _collapse_text(body)[:limit]
 
 
@@ -199,7 +231,55 @@ def _validity_defaults(frontmatter: dict) -> dict:
     }
 
 
-def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
+def _link_target_resolver():
+    """The node index's ``resolve(name) -> page key | None``, or ``None`` if there is no index.
+
+    Deferred on purpose: the projection module reads the database at call time, and this module is
+    imported by the store that writes it, so the edge points up one scope rather than at load.
+    """
+    try:
+        from vector_lake.page_index_projection import link_target_resolver
+    except ImportError:  # pragma: no cover - the projection module is always present
+        return None
+    return link_target_resolver()
+
+
+def _source_key(value: str) -> str:
+    """The form in which two spellings of one source are compared.
+
+    ``sources`` keeps the extension (``normalize_raw_ref`` is what the store records) while
+    ``_parse_inline_sources`` strips ``.md``, so comparing the two raw made the multi-source gate
+    unsatisfiable: on a page declaring more than one source, no block could ever attach evidence,
+    whatever anchor it wrote.  Measured on the live corpus: of 400 pages declaring two or more
+    sources, exactly one carried any evidence, and its blocks were anchored to source *pages* (an
+    id the append branch invents) rather than to a declared file.  926 claims still sit behind
+    that gate.  One question, one comparison.
+    """
+    return str(value or "").strip().replace(".md", "")
+
+
+def extract_page_objects(
+    page_path: str,
+    frontmatter: dict,
+    body: str,
+    resolve_target=None,
+) -> dict:
+    """Entity, claim, evidence, source and edge records for one page.
+
+    ``resolve_target`` maps a link target to the page it names (``link_resolution`` is the owner
+    of that question; ``page_index_projection.link_target_resolver`` builds it from the index).
+    It is only applied to an edge's ``target_id`` -- the field that is a *key* -- and never to
+    ``links`` or ``triples``, which record what the page declared.  Without it the target is
+    stored as written, which is what every caller did until the claim graph was measured: 232 of
+    10 487 live ``claim_graph_edges`` rows pointed at a name no page answers, 230 of them at a
+    name the resolver could answer, because the indexer resolved and this extractor did not.
+
+    When it is omitted the index-backed resolver is used, so a caller that has nothing to pass
+    still gets one answer for the question instead of two.  A page with no index to resolve
+    against keeps the literal target, as before.
+    """
+    if resolve_target is None:
+        resolve_target = _link_target_resolver()
     now = _utc_now()
     page_name = os.path.basename(page_path)
     page_key = os.path.splitext(page_name)[0]
@@ -291,7 +371,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             triples.append({"predicate": predicate, "target": target})
             page_edges.append({
                 "source_id": page_key,
-                "target_id": target,
+                "target_id": (resolve_target(target) or target) if resolve_target else target,
                 "relation": predicate,
                 "weight": 1.0,
                 "updated_at": now,
@@ -371,7 +451,9 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         combined_sources = list(sources)
         combined_source_ids = list(source_ids)
         for isrc in inline_sources:
-            if isrc not in combined_sources:
+            # Compared as keys: an anchor that spells a declared source without its extension is
+            # that source, not a second one -- appending it would mint a second id for one file.
+            if _source_key(isrc) not in {_source_key(item) for item in combined_sources}:
                 combined_sources.append(isrc)
                 sid = _stable_id("source", isrc)
                 combined_source_ids.append(sid)
@@ -387,8 +469,12 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                     })
 
         evidence_ids = []
+        inline_source_keys = {_source_key(item) for item in inline_sources}
         for raw_ref, source_id in zip(combined_sources, combined_source_ids):
-            if len(sources) > 1 and page_type != "source" and raw_ref not in inline_sources:
+            # Why this gate exists: with several declared sources, a block that names none of them
+            # must not be attached to all of them.  It said that, and then asked the question in
+            # two different spellings.
+            if len(sources) > 1 and page_type != "source" and _source_key(raw_ref) not in inline_source_keys:
                 continue
             evidence_id = _stable_id("evidence", f"{page_key}:{raw_ref}:{block_text}")
             evidence_ids.append(evidence_id)
@@ -416,7 +502,6 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
 
         claim_id = frontmatter.get("claim_id") if block_index == 1 else None
         claim_id = claim_id or _stable_id("claim", f"{page_key}:{block_text}")
-        from vector_lake.wiki_utils import enforce_claim_dict
         claim_record = enforce_claim_dict({
             "claim_id": claim_id,
             "claim_text": block_text,

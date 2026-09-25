@@ -260,3 +260,47 @@ def test_a_stale_page_index_projection_is_reported_without_blocking(isolated_mem
     assert any("page_index_projection_behind" in item for item in health["degraded"])
     assert health["detail"]["page_index_projection"]["current"] is False
     assert health["detail"]["page_index_projection"]["index_stamp"]
+
+
+def test_deep_health_reports_an_evidence_pointer_on_a_missing_claim(isolated_memory):
+    """The two-month-silent surface: nothing read these pointers, so drift had to be counted."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (
+                "evidence_health",
+                json.dumps({
+                    "evidence_id": "evidence_health",
+                    "evidence_text": "text",
+                    "supports_claim_ids": ["claim_no_longer_here"],
+                    "contradicts_claim_ids": [],
+                }),
+                "2026-07-14T00:00:00+00:00",
+            ),
+        )
+
+    health = assess_runtime_health(deep_projection_checks=True)
+
+    assert health["hard_ok"] is True
+    assert health["detail"]["claim_pointer_drift"]["dead_pointers"] == 1
+    assert any("claim_pointer_drift" in item for item in health["degraded"])
+
+
+def test_deep_health_does_not_degrade_on_an_unresolved_edge_target(isolated_memory):
+    """An endpoint no page answers is what the edge writer keeps on purpose."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT OR REPLACE INTO claim_graph_edges "
+            "(source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("Concept_Alpha", "Nothing_Declares_This", "related_to", 1.0, "2026-07-14T00:00:00+00:00"),
+        )
+
+    health = assess_runtime_health(deep_projection_checks=True)
+
+    assert health["ok"] is True
+    assert health["detail"]["claim_pointer_drift"]["edge_rows"] == 1
+    assert not any("claim_pointer_drift" in item for item in health["degraded"])

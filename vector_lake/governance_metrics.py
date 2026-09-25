@@ -352,6 +352,11 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
 
     validity_state_counts = {}
     unsupported_claim_count = 0
+    #: Unsupported claims whose page's provenance is recorded as never having existed (the
+    #: acceptance ledger).  Reported apart from the open count: "no evidence attached" and "no
+    #: evidence can ever be attached, and that was decided" are different states, and only the
+    #: first one is work.
+    legacy_unsourced_claim_count = 0
     ambiguous_source_claim_count = 0
     unsourced_claim_count = 0
     conflicted_claim_count = 0
@@ -361,15 +366,23 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
     provisional_claim_count = 0
     high_centrality_low_confidence = 0
 
+    from vector_lake.provenance_legacy import accepted_pages, ledger_path
+
+    accepted_legacy_pages = accepted_pages()
     for claim in claims:
         state = claim.get("validity_state", "active")
         validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
         if state == "unsupported":
-            unsupported_claim_count += 1
-            if "ambiguous_source" in (claim.get("validity_reasons") or []):
-                ambiguous_source_claim_count += 1
+            # The two-way split stays a breakdown of the *open* count, so
+            # ``unsupported == unsourced + ambiguous_source`` keeps holding wherever it is read.
+            if str(claim.get("source_page") or "").replace(".md", "") in accepted_legacy_pages:
+                legacy_unsourced_claim_count += 1
             else:
-                unsourced_claim_count += 1
+                unsupported_claim_count += 1
+                if "ambiguous_source" in (claim.get("validity_reasons") or []):
+                    ambiguous_source_claim_count += 1
+                else:
+                    unsourced_claim_count += 1
         if state == "conflicted":
             conflicted_claim_count += 1
         if state in {"review-due", "needs-review", "expiring-soon"}:
@@ -396,8 +409,10 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         "expired_claim_count": expired_claim_count,
         "review_due_claim_count": review_due_claim_count,
         "unsupported_claim_count": unsupported_claim_count,
+        "legacy_unsourced_claim_count": legacy_unsourced_claim_count,
         "ambiguous_source_claim_count": ambiguous_source_claim_count,
         "unsourced_claim_count": unsourced_claim_count,
+        "legacy_accepted_page_count": len(accepted_legacy_pages),
         "conflicted_claim_count": conflicted_claim_count,
         "provisional_claim_count": provisional_claim_count,
         "pending_change_set_count": len(governance_store.pending_change_sets()),
@@ -410,5 +425,6 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         "conflicted_memory_count": memory_states.get("conflicted", 0),
         "memory_type_counts": memory_types,
         "validity_state_counts": validity_state_counts,
+        "legacy_acceptance_ledger": str(ledger_path()) if accepted_legacy_pages else "",
     }
 

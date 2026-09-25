@@ -47,6 +47,9 @@ def _format_combined_report(items: list[dict]) -> str:
         "merge": "[M]",
         "publish-candidate": "[P]",
         "community_naming": "[N]",
+        # The unsupported-claim cohorts arrive under this type; without an icon they read as the
+        # generic ``[*]`` and disappear among the suggestions they are not.
+        "evidence-gap": "[E]",
     }
     lines = [
         f"[REVIEW] {len(items)} Pending Governance Items",

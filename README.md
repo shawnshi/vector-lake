@@ -108,13 +108,104 @@ graph TD
 
 `title` / `aliases` 是**实体名**，参与链接解析（连 core 名回退也认它们）；`tags` 是**标签**，从不参与链接解析。两者刻意保持不相交：标签撞上任何实体名会被拒绝（`Tag Collision`），而 `aliases` 里以 `#` 开头的条目会被视为把标签塞进实体命名空间、写入即拒绝（改用 `tags:`）。
 
-## Quick Start
+## 🚀 安装与快速上手 (Installation & Quick Start)
+
+### 1. 运行环境前置要求 (Prerequisites)
+
+- **Python**: `>= 3.10`（推荐 3.11 ~ 3.13）。
+- **操作系统**: Windows (需支持 UTF-8)、macOS、Linux。
+- **大模型 API Key（可选）**: `GEMINI_API_KEY`（用于混合检索中的向量生成；若不配置，系统以纯词法 FTS5 + 图拓扑降级运行，不阻断核心读写）。
+
+### 2. 依赖安装 (Dependencies)
+
+```powershell
+# 1. 克隆仓库并进入根目录
+cd vector-lake
+
+# 2. 安装 Python 核心运行时依赖
+pip install -r requirements.txt
+
+# 3. (强烈推荐) 编译并安装 Rust 原生加速核心 (vector_lake_core)
+#    提供内存倒排解码、Markdown AST 解析与 PPR 图遍历的硬件级加速 (提升 50x)
+#    若跳过此步，系统会自动以纯 Python 模式运行，无破坏性影响
+python scripts/build_core.py
+```
+
+### 3. 配置与环境变量 (Configuration & Environment)
+
+```powershell
+# 从示例创建配置文件
+cp config.example.json config.json
+```
+
+`config.json` 核心字段说明：
+- `memory_dir`: 自定义 `MEMORY` 根目录路径（留空时默认查找环境约定的 `MEMORY/` 目录）；
+- `target_directories`: 外部额外 raw 文件扫描目录；
+- `supported_extensions`: 允许编译的原始资料后缀（默认 `[".md", ".txt"]`）。
+
+**关键环境变量推荐（可配置于 `.env` 或系统环境）：**
+
+| 环境变量 | 作用 | 推荐值 |
+|---|---|---|
+| `PYTHONUTF8` | 强制 Python 运行时使用 UTF-8 编码（Windows 强烈推荐） | `1` |
+| `GEMINI_API_KEY` | 向量嵌入模型 API Key（Gemini Embedding） | `AIzaSy...` |
+| `VECTOR_LAKE_MEMORY_DIR` | 显式指定 MEMORY 根路径（优先级高于 `config.json`） | 例如 `C:/Users/shich/MEMORY` |
+| `VECTOR_LAKE_RUNNER_SHADOW` | 设为 `1` 时摄取 Runner 仅模拟评估而不真实写页 | 默认 `0` |
+
+### 4. 验证安装 (Health Check)
+
+运行体检命令，确认环境与数据库状态健康：
+
+```powershell
+python cli.py doctor
+```
+
+若配置正确，输出中会呈现全项健康状态：
+- `[OK] Python: 3.13...`
+- `[OK] Tokenizer Backend: rjieba 0.2.1 (jieba-rs 0.9.x)`
+- `[OK] Native Acceleration: vector-lake-core v0.1.0 (Rust fast-core active)`（若已编译）
+- `[OK] MCP Server: Import OK, 46 tools exposed`
+- `[OK] Write Gate: clean`
+
+### 5. 宿主 Agent 接入 (MCP Client Configuration)
+
+Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 46 个认知与知识工具。
+
+**在客户端配置文件（如 `claude_desktop_config.json` 或 `.mcp.json`）中添加：**
+
+```json
+{
+  "mcpServers": {
+    "vector-lake-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "vector_lake.mcp_server"
+      ],
+      "cwd": "C:/path/to/vector-lake",
+      "env": {
+        "PYTHONPATH": ".",
+        "PYTHONUTF8": "1",
+        "GEMINI_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+### 6. 启动后台守护进程 (Starting Daemon)
+
+```powershell
+python watchdog_sync.py
+```
+
+> **运行机制提示**：守护进程会常驻监听文件变动、消费写入 outbox、自动看护摄取 Runner（`scripts/ingest_runner_service.py`）并执行定时增量维护。日常只读检索可不启动守护，但发生写入后**必须**由它消费 outbox 以防止队列积压。
+
+---
+
+## 核心机制与运行时防护 (Core Runtime & Defense Systems)
 
 > **运行前提**：Vector Lake 不是自包含的编译器。原始信源到 Wiki 页面的“编译”由 LLM 宿主（subagent）执行，`cli.py sync` 只负责生成任务包。因此实际运行需要：**① 单机 ② 常驻 `python watchdog_sync.py` ③ 具备 subagent 能力的宿主**。守护进程会**自动拉起并看护摄取 Runner**（`scripts/ingest_runner_service.py`，可用 `VECTOR_LAKE_RUNNER_AUTOSTART=0` 关闭），因此不再需要手工常驻第二个进程；只启动 MCP server 而不启动守护进程时，写入会在 5 分钟后进入 outbox 积压告警状态。
-
-1. **环境配置**：`config.json` 的 `target_directories` 留空即表示使用当前 `MEMORY/raw/`（多机可移植）；也可显式填写绝对路径。`supported_extensions` 配置允许扫描的后缀。非 embedding 文本推理不由插件直接调用外部 API；需要推理的后台任务会生成当前环境 subagent 任务包。`GEMINI_API_KEY` 只影响 embedding 与混合检索的向量分支。
-2. **生成编译任务**：执行 `python cli.py sync` 得到原始信源的 subagent 摄取任务包，由宿主执行并回填。也可由 `watchdog_sync.py` 在检测到 raw 变更时自动生成。
-3. **后台监听与自治管理**：运行 `python watchdog_sync.py` 启动守护进程（它会接管 outbox 消费、增量索引与定时 lint）。即使不使用增量监听，只要发生写入就需要它来消费 outbox。它搭载的核心基建与防御系统：
    - **双轨看门狗 (Two-Track Watchdog)**：除增量文件外还捕获 `on_deleted` / `on_moved`，因此重命名或删除页面不会在图谱里留下幽灵节点。
    - **写入健康门 (Write Health Gate)**：写入只在**硬故障**下被阻断（数据库不可用、存在 hard-failed 的 `mutation_outbox` 行）。outbox 积压超过 `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`、投影漂移、心跳过期、终态失败作业、时间线 parity 漂移都属于**可修复降级**，只记录告警并继续写入——阻断它们会同时阻断唯一的修复通道。需要严格模式的运维方可分别用 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING` / `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING` 把这些降级提升为阻断。
    - **I/O 批处理防抖 (I/O Debouncing)**：同批次修改合并为一次 `index.json` 写盘；`index.json` 不再保存完整正文（每个节点保留至多 320 字符的摘要，摘要与 `weighted_edges` 各占文件的一部分——具体比例取决于实例），投影写入使用短事务，全量重建不再冻结数据库。
@@ -221,7 +312,7 @@ MEMORY/
 | 治理与审查 | `review_governance_list` · `resolve_governance_item` · `get_governance_debt` · `trigger_audit_graph` · `merge_suggestions_vector_lake` · `check_duplicate_entity` · `bulk_reconciliation` · `review_strategic_purpose` |
 | 自愈与体检 | `lint_vector_lake` · `gc_vector_lake` · `doctor_vector_lake` · `trace_vector_lake` · `trigger_autonomous_research` |
 | 写入与结构 | `write_wiki_page` · `rename_entity` · `batch_replace_links` · `delete_source` · `propose_schema_mutation` |
-| 维护与投影 | `projection_report` · `canonical_backfill` · `projection_rebuild_index` · `embedding_backfill` · `wiki_restore` · `rebuild_timeline_events` · `memory_gram_index_status` · `rebuild_memory_gram_index` · `backup_retention_report` · `idempotency_index_status` · `repair_idempotency_keys` |
+| 维护与投影 | `projection_report` · `canonical_backfill` · `projection_rebuild_index` · `embedding_backfill` · `wiki_restore` · `rebuild_timeline_events` · `memory_gram_index_status` · `rebuild_memory_gram_index` · `backup_retention_report` · `idempotency_index_status` · `repair_idempotency_keys` · `claim_projection_drift_report` · `repair_claim_pointers` |
 | 可视化 | `visualize_vector_lake` |
 
 > 以下底层 CLI 命令仍然保留，供人类开发者日常手动调试与状态维护。
@@ -321,6 +412,21 @@ python cli.py backup-retention --keep 2 --max-bytes 6442450944 --apply
 python cli.py idempotency-status
 python cli.py repair-idempotency --table mutation_outbox
 python cli.py repair-idempotency --table mutation_outbox --apply
+python cli.py claim-pointer-report
+python cli.py claim-pointer-repair
+python cli.py claim-pointer-repair --apply --edges
+python cli.py claim-evidence-queue
+python cli.py claim-evidence-queue --group month --batch-pages 50
+python cli.py claim-evidence-queue --apply
+python cli.py provenance-backfill
+python cli.py provenance-backfill --limit 1 --apply
+python cli.py provenance-backfill --apply --batch 50
+python cli.py provenance-backfill --revert wiki/.meta/migrations/2026-09-24-provenance-backfill.rollback.jsonl --apply
+python cli.py provenance-accept
+python cli.py provenance-accept --apply
+python cli.py anchor-draft
+python cli.py anchor-backfill
+python cli.py anchor-backfill --only 1,2,5,9-14 --apply
 ```
 
 这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_topology.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影；`timeline-repair` 就地补齐 `timeline_events` 的 parity 漂移并重写 `event_date_source` 缺失的旧行（不重建整表）；`gram-index` 报告或重建运行态记忆检索用的精确 n-gram 倒排，`--if-due` 只在该索引确实落后时才重建（见下，`--compact` 已随增量机制一并删除）。
@@ -328,6 +434,49 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 `gram-index` 的重建节奏：基表只要落后就不再精确，而**不精确的基表会被读路径直接拒绝**（不是带着陈旧基表继续服务），所以搜索会退回精确扫描，凭 n-gram 倒排服务时才有快速路径。恢复精确只有重建一条路：重建现在**分批提交**——分批 staging、分批打包、最后用一个短事务发布，发布由内容指纹把关（重建期间被写过的文档保留其变更标记，不会被当作最新）。实测活库上一次重建约 150 s（空闲）到 570 s（边摄入边重建），**最长写锁持有约 2 s**，不再是整场重建期间拒绝所有写入。触发位置只有两处：守护进程的定时维护块（在 WAL checkpoint 之前）与 `gram-index --if-due --apply`；**后者需要守护进程在运行**才有自动节拍，否则只能由人按 `due=` 手工执行——`doctor` 的 `Watchdog Status` 是判断这一点的依据。阈值为 `REBUILD_AFTER_WRITES = 500`，按文档数计，而不是按事务或时长；选择它的依据不是「搜索省下的时间何时回本」，而是「重建能让写入停多久」——因此宁少勿多。`due=` 与 `of 500` 就是这个欠账的当前值，而不是故障。
 
 `backup-retention` 约束 `.meta/backups`（SQLite 副本目录，与 `MEMORY/backup/` 下的页面恢复点无关）：默认保留最新 3 份副本，其余受 12 GiB 预算约束，**最新一份无论是否超预算都不会被删**；`idempotency-status` 报告各幂等表当前达到的唯一性等级，`repair-idempotency` 清除冗余幂等键以便建成完整唯一索引——它两种模式下都不删除业务行。
+
+`claim-pointer-report` / `claim-pointer-repair` 管的是**指向 claim 的两张表**：`evidence.supports_claim_ids`（命名 claim id）与 `claim_graph_edges`（命名页面键）。claim 被增量路径之外的批量操作退掉时，这两处会留下死指针，而此前没有任何读者会发现——实测活库上 `evidence` 有 25 220 个指针指向已不存在的 claim（分布在 25 217 行，其中 25 214 个来自 2026-07-14 的一次批量事件，此后两个月数量未变）。`claim-pointer-repair` 只从 JSON 字段里摘掉死 id（不动正文、locator、source，也不改 `updated_at`：丢指针不是新证据，不该推新鲜度时钟），每个批次的删除项先落盘到 `wiki/.meta/migrations/2026-09-24-claim-pointer-prune.rollback.jsonl`；`--edges` 额外把 `claim_graph_edges` 中**目标**能被解析器回答的行改回页面键（`[[Concept_CoMET]]` → `Product_CoMET`），源不参与改写（源是边的出处页，用核名规则改写它等于把边挂到另一个页上），解析器回答不了的目标保持原样——保留原字面量是边写入器的既定行为，属链接质量信号而非漂移。
+
+`claim-evidence-queue` 把 lint 报出的**无出典声明债**（`claims.evidence_gap` 非空，实测 18 243 条 / 2 220 页）按**队列批次**派给治理面板：cohort 是 `(缺口形状, 页前缀或摄取月份)`，一个 item 覆盖一个批次（默认 100 页），边界由 `--batch-pages` 与 `--group` 调。缺口形状沿用提取器自己的记录而不是压平成一个数：整页**一支出典都没声明**是摄取合同问题，而**声明了多处、该段没说哪一处**是块自己的锚点问题——实测活库里恰好只声明一个 source 的页面从不产生缺口。每个 item 另外记录该批次里有多少条 claim 早于提取器归属字段（实测 98%），因为那是「能不能修」的前提。默认 dry-run，`--apply` 才入队；重复运行是幂等的（item id 由 `(state, group, cohort, batch)` 派生，已在队列里的批次跳过，页面集变化的批次报为 stale 而不是另开一条）。item 的 `search_queries` 故意留空：`research` 会把前 5 条 pending item 的查询当成检索指令，而出处不是外部检索能补的。
+
+`provenance-backfill` / `provenance-accept` 处理 lint 第 12 项那批无出处声明的存量的**可恢复部分与不可恢复部分**。
+实测：2 052 页里只有 6 页历史上真的写过 `raw/` 路径，2 001 页只写过占位符 `Source_Auto_Fixed`
+（2026-09-20 的一次批量重写把占位符清掉，正文一字未改），45 页没有任何写入历史——**出处是从未记录，不是被清空**。
+`provenance-backfill` 用两条**精确**规则把还能查到的补回来：`jobs.payload` 的 `{filepath, canonical_name}` 账本
+（142 页）与 `canonical_source_name` 在 raw 树上的唯一逆匹配（210 页），合计 352 页 / 4 631 条；写入走唯一的
+mutation 路径（每页的 schema 校验、`verify_asset`、canonical change set 不变），每页**先**把改前全文写进
+`wiki/.meta/migrations/<date>-provenance-backfill.rollback.jsonl` 再提交，`--revert` 可整批回放。多义（多个 raw 同名）
+与无匹配的页面**不猜**——给一个只会相似度匹配到的 raw 文件等于伪造出处。
+剩余 1 700 页 / 12 686 条的归宿是决策而不是修复，由 `provenance-accept` 落在
+`wiki/.meta/provenance_legacy_accepted.json`：记录页面清单、判据、证据与可再访候选，`compute_debt_metrics`
+据此把 `unsupported_claim_count`（开口债务）与 `legacy_unsourced_claim_count`（已决策的遗产债）分开，lint
+第 12 项把后者作为 census 显示而不再计入 FAIL。不写 1 700 页 frontmatter 是故意的：那是 1 700 次 canonical
+变更与重提取，对一个读者不据此行动的标签来说爆炸半径过大；账本是可读、可版本化、可回滚的文件，
+以后找到真出处时把页面从里面摘出去即可。
+
+`anchor-draft` / `anchor-backfill` 处理剩下的 **`ambiguous_source`**（页面声明了多处出处、而块没说用哪一处）。
+先用确定性规则起草：取块里在候选出处之间**只有部分出处有**的判别术语（CJK 2/3-gram 与拉丁数字 token），
+只有在某一处声明出处上覆盖 ≥0.75、该处独占术语 ≥2 个、领先第二名 ≥0.20、判别词总量 ≥4 时才提出归属，
+并附上**承载最多匹配词的那一行原文**与行号供人一眼复核；不满足就弃权并写明原因
+（`no_citable_basis` / `cannot_discriminate` / `no_readable_source` / `page_scaffolding`）。
+活库实测 926 条：提出 257、样板句 156、无法判别 280、出处全不在盘上 78。复核文件写在
+`wiki/.meta/anchor_review.md`（按批分页，删掉不认可的编号即可）。
+
+`anchor-backfill` 只写被确认的（`--only 1,2,5,9-14`），写入走唯一 mutation 路径，每页改前全文先落
+`wiki/.meta/migrations/<date>-anchor-backfill.rollback.jsonl`。三处值得记下的实测细节：
+
+- 锚点**不带空格**地追加。`_clean_claim_text` 先折叠空白再剔除 `(Source: …)`，所以
+  `…职责 (Source: …)` 清完留下一个尾随空格——那是另一个 claim 文本、另一个 `claim_id`（活库首个金丝雀就把
+  3 条 claim 铸了新 id、旧 id 变成死指针）；贴紧追加则清理后与原文本逐字节相同，现有 claim 原地拿到
+  `inline_sources`。
+- **出处路径自带括号时必须跳过**：剔除正则非贪婪到第一个 `)`，`…重构 (2026)_final.md` 会被切半，残渣 `.md]])`
+  进入存库文本并重铸 id（实测 4 页 / 16 块）。
+- 定位块所在行时**只走正文、跳过纯标题行**：前一次尝试把锚点加到了 `### 物理机制 (Mechanism)` 标题和一行
+  frontmatter 上，被写入门以 schema/YAML 错误拒绝（未造成破坏）——门起效了，但 applier 不该去试。
+
+活库执行：926 条里 240 条写入（2 条无法唯一定位、3 条行内已有截断片段、12 条出处含括号），
+**240/240 全部挂上 evidence**，`ambiguous_source` **930 → 690**（清 240；基线从 926 漂到 930 是期间摄取又写了 4 条），
+**claims 总数不变、逐页 claim-id 集合变更 0 页**，timeline parity 仍 0/0/0。
 
 ## Config
 
@@ -442,6 +591,25 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 待 `rjieba` 发布基于 0.11 的版本后，只需同步 `requirements.txt` / `requirements.lock.txt` 的版本号与 `JIEBA_RS_PINNED`。
 
+#### 原生性能加速 (Rust Native Acceleration)
+
+为了消除纯 Python 在密集循环（倒排解码、Markdown AST 遍历、图随机游走）上的局部性能悬崖，项目提供了可选的 Rust 原生加速核心 **`vector_lake_core`**（源码位于 `crates/vector_lake_core`，遵循 `cp38-abi3` 标准）：
+
+| 模块 | 核心加速路径 | 机制与收益 |
+|---|---|---|
+| **`fast_gram_index`** | `vector_lake/memory_gram_index.py` | 纯 C/Rust 级别的小端紧凑 `uint32` delta postings 解包、跳过脏页与权重累加，避免 Python 字典遍历与位移开销，使海量运行态记忆检索进入毫秒级 |
+| **`fast_markdown`** | `vector_lake/wiki_utils.py` | 基于 `pulldown-cmark` Pull Parser 事件流的高速 Markdown Frontmatter 分割、段落/列表项切分与 Wikilinks 提取，替代正则与重型 Python AST |
+| **`fast_graph_fusion`** | `vector_lake/tool_search.py` | 多轮迭代的带重启 Personalized PageRank (PPR) 随机游走扩散与 RRF (Reciprocal Rank Fusion) 多路召回融合排序 |
+
+* **双模平滑降级（Graceful Fallback）**：`vector_lake_core` 采用非破坏性双模设计。若已编译安装，系统无缝启用硬件加速；若当前环境未安装，代码通过 `try: import vector_lake_core ... except ImportError:` **自动回退为纯 Python 实现**，现有接口、打分精度与 110+ 测试套件 100% 保持幂等。
+* **状态可观测性**：`python cli.py doctor` 自动诊断原生加速状态：
+  * 已激活：`[OK] Native Acceleration: vector-lake-core v0.1.0 (Rust fast-core active)`
+  * 未安装：`[OK] Native Acceleration: pure-python (optional vector-lake-core not installed)`
+* **本地构建与更新**：
+  ```powershell
+  python scripts/build_core.py
+  ```
+
 **已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。回退后端移除后这一点不再需要权衡：`add_word()` 一律返回 False，词表注册无法生效。
 
 **实测收益与语义差异**：`rjieba` 相对它所取代的纯 Python 实现快 7–15×（单页 4.39 ms → 0.39 ms），词元一致性的差异只在拉丁/数字边界（如 `utf-8` vs `utf`+`-`+`8`），中文词本身几乎完全一致。旧的对比数据与逐项测量保留在 `CHANGELOG.md`。
@@ -525,6 +693,8 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `schema.md` / `SCHEMA_CATEGORIES.md` | Wiki 与运行态记忆契约、受控分类表 |
 | `skills/` | 面向宿主的技能定义（每个能力一份 `SKILL.md`） |
 | `templates/` | 摄取 / 查询提示词模板与拓扑可视化 HTML |
+| `crates/vector_lake_core/` | Rust 原生加速核心源码（PyO3、pulldown-cmark、rayon、abi3 规范） |
+| `scripts/build_core.py` | 原生加速扩展的一键跨平台编译与就地安装脚本 |
 | `scripts/` | 独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验），以及宿主侧摄取 Runner：`ingest_runner.py` + 常驻监督器 `ingest_runner_service.py` + 模型接缝 `ingest_model_pi_subagents.py` |
 | `tests/` | pytest 回归套件 |
 

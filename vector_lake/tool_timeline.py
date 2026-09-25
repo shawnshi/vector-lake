@@ -96,6 +96,7 @@ def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> d
     stable_raw = "\0".join([str(row["claim_id"]), str(event_date or ""), str(description)])
     return {
         "id": hashlib.sha256(stable_raw.encode("utf-8")).hexdigest()[:24],
+        "claim_id": str(row["claim_id"]),
         "event_date": str(event_date) if event_date else None,
         "event_date_source": event_date_source(event_date),
         "action": str(
@@ -182,7 +183,18 @@ def invalidate_timeline_parity_cache() -> None:
 
 
 def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: list[dict]) -> dict:
-    """Apply a claim-scoped Timeline projection delta inside the caller's transaction."""
+    """Apply a claim-scoped Timeline projection delta inside the caller's transaction.
+
+    Rows are deleted by ``claim_id``, not by the event id.  The event id hashes the claim's
+    *content* (its id, its event date, its text), so it only names the row a rewrite is about
+    to remove as long as the stored claim still says exactly what it said when the row was
+    written -- and that is what failed in September: rows were minted in parity, the claims
+    were then retired by a bulk pass that recomputed their dates, and the delete kept
+    recomputing a hash that no longer matched any row.  90 rows survived their claims that
+    way.  ``claim_id`` is the input a rewrite cannot move, so it is what the delete keys on
+    now; the recomputed-id delete stays for rows written before the column existed (they
+    carry NULL there and their hash is the only evidence left of what they were).
+    """
     conn = get_connection()
     old_events = [
         _event_from_claim_row(row)
@@ -190,6 +202,12 @@ def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: 
         if json.loads(row["data_json"]).get("claim_type") == "timeline-event"
     ]
     old_event_ids = [event["id"] for event in old_events]
+    old_claim_ids = sorted({event["claim_id"] for event in old_events})
+    if old_claim_ids:
+        conn.executemany(
+            "DELETE FROM timeline_events WHERE claim_id = ?",
+            [(claim_id,) for claim_id in old_claim_ids],
+        )
     if old_event_ids:
         conn.executemany("DELETE FROM timeline_events WHERE id = ?", [(event_id,) for event_id in old_event_ids])
 
@@ -213,10 +231,10 @@ def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: 
     if new_events:
         conn.executemany(
             "INSERT OR REPLACE INTO timeline_events "
-            "(id, event_date, event_date_source, action, sentiment, description, entity_id, entity_title, "
-            "source_file, extracted_at) "
-            "VALUES (:id, :event_date, :event_date_source, :action, :sentiment, :description, :entity_id, "
-            ":entity_title, :source_file, :extracted_at)",
+            "(id, claim_id, event_date, event_date_source, action, sentiment, description, entity_id, "
+            "entity_title, source_file, extracted_at) "
+            "VALUES (:id, :claim_id, :event_date, :event_date_source, :action, :sentiment, :description, "
+            ":entity_id, :entity_title, :source_file, :extracted_at)",
             new_events,
         )
     invalidate_timeline_parity_cache()
@@ -278,10 +296,10 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
         conn.execute("DELETE FROM timeline_events")
         conn.executemany(
             "INSERT OR REPLACE INTO timeline_events "
-            "(id, event_date, event_date_source, action, sentiment, description, entity_id, entity_title, "
-            "source_file, extracted_at) "
-            "VALUES (:id, :event_date, :event_date_source, :action, :sentiment, :description, :entity_id, "
-            ":entity_title, :source_file, :extracted_at)",
+            "(id, claim_id, event_date, event_date_source, action, sentiment, description, entity_id, "
+            "entity_title, source_file, extracted_at) "
+            "VALUES (:id, :claim_id, :event_date, :event_date_source, :action, :sentiment, :description, "
+            ":entity_id, :entity_title, :source_file, :extracted_at)",
             events,
         )
     invalidate_timeline_parity_cache()
@@ -327,19 +345,42 @@ def repair_timeline_projection(dry_run: bool = True) -> str:
         event = _event_from_claim_row(row, entity_titles=entity_titles)
         expected[event["id"]] = event
     actual = {
-        str(row["id"]): row["event_date_source"]
-        for row in conn.execute("SELECT id, event_date_source FROM timeline_events")
+        str(row["id"]): {"claim_id": row["claim_id"], "event_date_source": row["event_date_source"]}
+        for row in conn.execute("SELECT id, claim_id, event_date_source FROM timeline_events")
     }
-    orphan_ids = sorted(set(actual) - set(expected))
+    canonical_claim_ids = {str(row["claim_id"]) for row in claim_rows}
+    # Attribution first, hash second.  A row that names a claim canonical no longer holds is
+    # an orphan whatever its hash says -- that is the September case, where 90 rows were minted
+    # from claims a later bulk pass retired, and the recomputed hash they were deleted by no
+    # longer named them.  A row that predates ``claim_id`` names nothing, so its hash is the
+    # only evidence left and stays the test for those.  A row naming a claim that *is*
+    # canonical but hashing to a different id is the remnant of an identity that moved (the
+    # claim's date or text changed out of band): it is deleted here and re-inserted below.
+    orphan_ids = sorted(
+        event_id
+        for event_id, row in actual.items()
+        if (
+            str(row["claim_id"]) not in canonical_claim_ids
+            if row["claim_id"] is not None
+            else event_id not in expected
+        )
+        or (row["claim_id"] is not None and str(row["claim_id"]) in canonical_claim_ids and event_id not in expected)
+    )
     missing_ids = sorted(set(expected) - set(actual))
+    # "Older than the current writer's rules" is exactly "cannot say which claim it came from":
+    # both the 2026-09 date columns and the claim id are written together, so a NULL in either
+    # means the row needs converging.  The three legacy columns plus ``claim_id`` are rewritten
+    # in place.
     stale_ids = sorted(
-        event_id for event_id, source in actual.items() if event_id in expected and source is None
+        event_id
+        for event_id, row in actual.items()
+        if event_id in expected and (row["claim_id"] is None or row["event_date_source"] is None)
     )
     if dry_run:
         return (
             "[DRY RUN] Would delete "
             f"{len(orphan_ids)} orphan row(s), insert {len(missing_ids)} missing row(s) and "
-            f"rewrite {len(stale_ids)} row(s) written before the event_date_source column."
+            f"rewrite {len(stale_ids)} row(s) written before the claim_id/event_date_source columns."
         )
 
     from vector_lake.db_store import transaction
@@ -353,22 +394,23 @@ def repair_timeline_projection(dry_run: bool = True) -> str:
         if to_insert:
             conn.executemany(
                 "INSERT OR REPLACE INTO timeline_events "
-                "(id, event_date, event_date_source, action, sentiment, description, entity_id, "
+                "(id, claim_id, event_date, event_date_source, action, sentiment, description, entity_id, "
                 "entity_title, source_file, extracted_at) "
-                "VALUES (:id, :event_date, :event_date_source, :action, :sentiment, :description, "
+                "VALUES (:id, :claim_id, :event_date, :event_date_source, :action, :sentiment, :description, "
                 ":entity_id, :entity_title, :source_file, :extracted_at)",
                 [expected[i] for i in to_insert],
             )
         if stale_ids:
-            # Deliberately not a re-insert: the row is right except for the three columns the
+            # Deliberately not a re-insert: the row is right except for the columns the
             # writer's rules changed, and rewriting the whole row would discard
             # ``extracted_at`` -- the only field recording when this row was first projected.
             conn.executemany(
-                "UPDATE timeline_events SET event_date = :event_date, "
+                "UPDATE timeline_events SET claim_id = :claim_id, event_date = :event_date, "
                 "event_date_source = :event_date_source, action = :action WHERE id = :id",
                 [
                     {
                         "id": event_id,
+                        "claim_id": expected[event_id]["claim_id"],
                         "event_date": expected[event_id]["event_date"],
                         "event_date_source": expected[event_id]["event_date_source"],
                         "action": expected[event_id]["action"],
