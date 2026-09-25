@@ -773,7 +773,10 @@ def lint_vector_lake(auto_fix: bool = False):
         # exempt only ``Source_*``, so 799 generated indexes -- 98% of the 812 orphans it reported
         # -- were the report.  Identity comes from the same owner the schema exemption uses.
         entry = parsed.get(filename) or {}
-        if is_generated_artifact(entry.get("fm"), filename, entry.get("body")):
+        fm = entry.get("fm") or {}
+        if is_generated_artifact(fm, filename, entry.get("body")):
+            continue
+        if fm.get("topology_status") == "acknowledged-orphan":
             continue
         if inbound_count.get(node_key, 0) == 0 and not filename.startswith("Source_"):
             issues["orphan"].append(f"{filename}: No inbound links (orphan)")
@@ -861,13 +864,16 @@ def lint_vector_lake(auto_fix: bool = False):
 
     governance_store.initialize_meta_store()
     metrics = governance_metrics.compute_debt_metrics()
-    if metrics["unsupported_claim_count"] > 0:
-        issues["governance"].append(f"Unsupported claims: {metrics['unsupported_claim_count']}")
-        # Split, because the two have different owners: a page that records no source is an
-        # ingest-contract problem, a block that does not name which source is the block's anchor.
-        issues["governance"].append(
-            f"  of which: no source recorded {metrics.get('unsourced_claim_count', 0)}, "
-            f"source not named by the block {metrics.get('ambiguous_source_claim_count', 0)}"
+    unsourced = metrics.get("unsourced_claim_count", 0)
+    ambiguous = metrics.get("ambiguous_source_claim_count", 0)
+
+    if unsourced > 0:
+        issues["governance"].append(f"Unsourced claims (no source declared on page): {unsourced}")
+
+    if ambiguous > 0:
+        governance_summary.append(
+            f"managed in governance queue (multi-source pages without block-level anchor): "
+            f"{ambiguous} claim(s)"
         )
     if metrics.get("legacy_unsourced_claim_count"):
         # Reported under the same section because it is the other half of the same number, but as
