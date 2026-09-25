@@ -2052,11 +2052,26 @@ def search_index_keys() -> set[str]:
     }
 
 
-def upsert_search_index(node_key: str, title: str, summary: str, text: str, content_hash: str | None = None):
+def upsert_search_index(
+    node_key: str,
+    title: str,
+    summary: str,
+    text: str,
+    content_hash: str | None = None,
+    replace_existing: bool | None = None,
+):
     """Write one pre-tokenized node into the FTS projection.
 
     Callers must pass text that is already tokenized; re-tokenizing here doubled
     the jieba cost of every index rebuild.
+
+    ``replace_existing`` is the difference between a 4-second and a 6-minute rebuild, and it is the
+    caller's knowledge, not this function's: ``False`` means "this key is known to have no row yet"
+    (a caller that just read the FTS key set knows this), so the delete is skipped.  Measured
+    2026-09-25 on the live lake: a cold rebuild inserted 7 039 missing rows in **367 s = 52.1 ms per
+    row**, which is exactly the cost of the ``DELETE ... WHERE node_key = ?`` fallback running on
+    rows that do not exist -- an FTS5 table cannot serve a lookup on a column, so each delete scans
+    the whole virtual index.  ``None`` keeps the previous behaviour for callers that cannot say.
     """
     conn = get_connection()
     with transaction():
@@ -2064,17 +2079,20 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str, cont
         # must go through the rowid: ``WHERE node_key = ?`` scans the whole virtual table (52.4 ms
         # per row measured, against 0.33 ms by rowid).  The node_key form is kept as well so a row
         # whose position was never recorded is still removed.
-        rowid = _search_index_rowid(conn, node_key)
-        if rowid is not None:
-            # Verified by node_key as well: a rowid is a position, and a position can be reassigned
-            # if the index is ever rebuilt, so deleting on it alone could remove another page's row.
-            # The pair is still a point delete -- the row is located by rowid and only its node_key
-            # column is checked -- where the node_key alone is a full scan of the virtual table.
-            conn.execute(
-                "DELETE FROM wiki_search_index WHERE rowid = ? AND node_key = ?", (rowid, node_key)
-            )
-        else:
-            conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        if replace_existing is not False:
+            rowid = _search_index_rowid(conn, node_key)
+            if rowid is not None:
+                # Verified by node_key as well: a rowid is a position, and a position can be
+                # reassigned if the index is ever rebuilt, so deleting on it alone could remove
+                # another page's row.  The pair is still a point delete -- the row is located by
+                # rowid and only its node_key column is checked -- where the node_key alone is a
+                # full scan of the virtual table.
+                conn.execute(
+                    "DELETE FROM wiki_search_index WHERE rowid = ? AND node_key = ?",
+                    (rowid, node_key),
+                )
+            else:
+                conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         cursor = conn.execute("""
             INSERT INTO wiki_search_index (node_key, title, summary, text)
             VALUES (?, ?, ?, ?)
