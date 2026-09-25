@@ -51,19 +51,20 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
         {"filename": old_name, "is_delete": True},
         {"filename": normalized_new_name, "content": new_content},
     ]
+    seen_mutation_files = {old_name, normalized_new_name}
     updated_files = 0
-    for root, _, files in os.walk(wiki_dir):
-        for filename in files:
-            if not filename.endswith(".md") or filename in {"index.md", "log.md", "overview.md"}:
-                continue
-            path = Path(root) / filename
-            if path in {old_path, new_path}:
-                continue
-            content = path.read_text(encoding="utf-8")
-            replaced = replace_links(content)
-            if replaced != content:
-                mutations.append({"filename": filename, "content": replaced})
-                updated_files += 1
+    for path in sorted(wiki_dir.glob("*.md")):
+        filename = path.name
+        if filename in {"index.md", "log.md", "overview.md"}:
+            continue
+        if path in {old_path, new_path} or filename in seen_mutation_files:
+            continue
+        content = path.read_text(encoding="utf-8")
+        replaced = replace_links(content)
+        if replaced != content:
+            mutations.append({"filename": filename, "content": replaced})
+            seen_mutation_files.add(filename)
+            updated_files += 1
 
     if dry_run:
         return (
