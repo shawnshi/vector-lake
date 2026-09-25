@@ -1,5 +1,23 @@
 # Unreleased
 
+## 核心版本 0.1.0 → 0.2.0：让“部署的是哪个构建”在 `doctor` 里可见
+
+动机不是体面：`0.1.0` 同时描述了**两个语义不同的构建**（parity 前 / parity 后），而 `doctor` 只打印 `version()`，
+所以上一节那个“旧块提取器差点直接上线”的盲区，在监控面上完全看不出来。`blocks_contract()` 是机器之间的门闩，
+版本号才是给人看的那个信号。
+
+- `crates/vector_lake_core/{Cargo.toml,pyproject.toml}` → `0.2.0`（`Cargo.lock` 随之更新）；
+- README 两处 `doctor` 示例同步改为 `vector-lake-core v0.2.0`。
+
+**顺手修了打包脚本的两处错标**（`scratch/package_core_wheel.py`，不随仓提交）：它原来从**已安装**的 wheel 读版本号，
+于是在旧 wheel 仍在时打新 build，产物会被命名成旧版本；且 METADATA/WHEEL 是从已安装的 dist-info 拷的，
+会让一个 0.2.0 的 wheel 写着 `Version: 0.1.0` 并以 0.1.0 安装。现在版本号取自 `pyproject.toml`，元数据自己生成。
+
+部署按同一套：disable → 结束守护进程树与 MCP 服务 → `pip install --force-reinstall` → enable + start。
+验证：`version()` 与 dist-info 均为 **0.2.0**、`blocks_contract()` 仍为 `claim-blocks-parity-2026-09-25`、
+**`doctor` 输出 `[OK] Native Acceleration: vector-lake-core v0.2.0 (Rust fast-core active)`**、
+守护进程心跳 7.3 s / 5 线程、catch-up 行正常，且一次工具调用拉起了新的 `vector_lake.mcp_server`。
+
 ## 换核心的窗口里抓到一个真缺陷：`hasattr` 当门闩，让旧核心的块提取器直接上了线
 
 部署时对照才发现：**已安装的 wheel 是 parity 之前的构建**（没有 `cut`），但它**同样导出**

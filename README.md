@@ -168,7 +168,7 @@ python cli.py doctor
 若配置正确，输出中会呈现全项健康状态：
 - `[OK] Python: 3.13...`
 - `[OK] Tokenizer Backend: rjieba 0.2.1 (jieba-rs 0.9.x)`
-- `[OK] Native Acceleration: vector-lake-core v0.1.0 (Rust fast-core active)`（若已编译）
+- `[OK] Native Acceleration: vector-lake-core v0.2.0 (Rust fast-core active)`（若已编译）
 - `[OK] MCP Server: Import OK, 46 tools exposed`
 - `[OK] Write Gate: clean`
 
@@ -640,7 +640,7 @@ cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决�
 
 * **双模平滑降级（Graceful Fallback）**：`vector_lake_core` 采用非破坏性双模设计。若已编译安装，系统无缝启用硬件加速；若当前环境未安装，代码通过 `try: import vector_lake_core ... except ImportError:` 自动回退。**例外：同池重排没有 Python 回退**——缺核心时它降级为“保持上游顺序”并记 WARNING（见上一节），因为一个只在弱主机上生效的第二套 BM25 打分本身就是隐患。
 * **状态可观测性**：`python cli.py doctor` 自动诊断原生加速状态：
-  * 已激活：`[OK] Native Acceleration: vector-lake-core v0.1.0 (Rust fast-core active)`
+  * 已激活：`[OK] Native Acceleration: vector-lake-core v0.2.0 (Rust fast-core active)`
   * 未安装：`[OK] Native Acceleration: pure-python (optional vector-lake-core not installed)`
 * **本地构建与更新**（2026-09-25 在这台主机上实测过，与说明书不同）：
   ```powershell
