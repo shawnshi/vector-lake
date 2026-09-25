@@ -668,7 +668,7 @@ cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决�
 
 **纯 Python `jieba` 回退已于 2026-09-18 移除**：abi3 wheel 覆盖本项目支持的全部平台，而第二套分词与 `rjieba` 的切分不同——这正是搜索索引内容哈希要防的事（`indexer._node_content_digest` 把后端身份纳入 key）。因此**没有 rjieba 的平台会变为 `unavailable`**：CJK 预分词被跳过、CJK 查询命中下降，`doctor` 与 `backend_name()` 会报出而不是掩盖；装回 rjieba 后下一次 `projection-rebuild-index --apply` 会按新身份重新分词。
 
-全量重建的剩余瓶颈已不在分词：warm 重建的约 50% 耗时是 `index.json` / `claim_topology.json` 的 `json.dump` 序列化。
+全量重建的剩余瓶颈不在分词，也不在序列化：**2026-09-25 py-spy 实测（2 遍、31 110 样本）87.2% 自耗在 FTS5 写入**（`upsert_search_index`），而 `json.dump` 只有 **0.2%**、`json.raw_decode` 2.0%、`tokenizer.cut`（jieba）0.7% —— 本节此前写的“warm 重建约 50% 是 `json.dump`”已被该测量推翻。同一轮把 FTS 写入的两个分支都修了（两者同一机制：**FTS5 服务不了列查找**，`WHERE node_key = ?` 会全扫整个虚拟索引）：行已存在时走 `fts_rowid` 记录的位置（同时校验 `node_key`，因位置在索引重建后可能被重号）**52.4 → 0.22 ms/行**；行不存在时由调用方声明 `replace_existing=False` 而**不做删除**（键集刚读过，知道没有行）**52.1 → 8.9 ms/行**。冷重建实测 **367 s**（7 039 缺失行），按此推 **~63 s**（该外推尚未再跑一次全量重写验证）。
 
 ## Module Map
 
@@ -765,7 +765,7 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 本次会话实测结果（2026-09-25 下午）：模型缝失败证据、守护进程监听换 `watchfiles`、tantivy 后端（开关默认关）、
 `author_page_keys` 取数与缓存键、gram 重建门改成按检索次数摊销、claim 块提取换 Rust。
 
-- `python -m pytest -p no:cacheprovider -q` → **1613 passed**（新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、rerank 契约 16 等；
+- `python -m pytest -p no:cacheprovider -q` → **1655 passed**（本会话新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、投影注册表 19、outbox 保留/台账 10、rerank 契约 16 等；
   同时把 `tests/test_rerank_bm25s.py` 更名为 `test_rerank_candidates.py`）。
 - `python cli.py gram-index --apply` → 340 482 gram / 14 473 499 posting / 69 929 文档，phase `stage=58.0s, pack=16.5s, publish=2.0s`（比旧注释里的 ~430 s 快得多，语料也更小）；
   重建后 `dirty=0`、`gram_index_usable()=True`，可用性检查 15.8 ms/次 → 0.1 ms/次。
@@ -774,6 +774,9 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 - **判定集评测**（`benchmarks/search_replay.py` + 规则卡 `search-eval-rule/1.2`，第三批 300 查询、`--vectors snapshot`）：
   fts5 vs tantivy 主指标 nDCG@5 0.8350 → 0.8198（差值 −0.0152，CI [−0.028, −0.002]）→ **RULE NOT MET，默认保持 fts5**。
   评测同时暴露出两个真缺陷并已修：`VECTOR_LAKE_FTS` 在真实检索路径（`tool_search._get_fts_search_results`）上是无效的；harness 的 config 指纹里没有词法后端。
+- **lint 堵点拆出两层**：`_find_page_file` 逐候选做 `Path.resolve()`（未命中与命中同价）→ 改一次目录清单；以及 `alias_registry` 只有主键索引而查询过滤 `value`（12 005 行全扫，**4.386 ms/次 × 2 805 次 = 63.5% 墙钟**）→ 加 `idx_alias_registry_value`。语句侧 4.386 → **0.012 ms**，**lint 墙钟 35.0 s → 7.2 s**（同机同语料）。
+- **记忆检索的成本拆分**（健康索引态，18 次调用）：**89% 在 SQL**（gram postings 325.9 ms、document frequencies 34.4 ms），Python 打分循环只有 **0.5 ms**、载荷解码 1.4 ms —— 那个模块的成本不是 Python。
+- **状态（写本文件当时）**：**FTS 投影完好**（7 139 行、键集与 `index.json` 节点集逐项相等、`fts_rowid` 全部已回填）；**向量投影回填中**（一次 profile 探针误删 7 039 行派生投影，已恢复 FTS，向量由 catch-up 每轮 +200 自愈），`python cli.py projections` 会直接给出这个判断。
 - Windows 工具链：默认 `stable-x86_64-pc-windows-gnu` 在本机**能编不能链**（缺 `-lgcc/-lgcc_eh`），构建核心须显式用 msvc；`maturin build` 的打包步因拉不到 MSVC CRT 清单而失败。
 
 上午实测结果（2026-09-25 上午，同样是当日完成的改动）：本轮只改三处判定——合并的落盘与可回放性（`governance_service`）、claim 提取的占位符/运行态过滤（`claim_extractor`）、Synthesis 骨架的文档与门禁对齐（`schema_validator` + `tool_lint`）。
