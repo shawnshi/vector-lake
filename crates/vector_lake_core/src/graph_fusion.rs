@@ -33,14 +33,18 @@ pub fn fast_personalized_pagerank(
             next_scores.insert(k.clone(), initial);
         }
 
-        for (node, current_score) in &ppr_scores {
+        let mut sorted_nodes: Vec<String> = ppr_scores.keys().cloned().collect();
+        sorted_nodes.sort();
+
+        for node in &sorted_nodes {
+            let current_score = ppr_scores[node];
             if let Some(neighbors) = adj.get(node) {
                 let total_weight: f64 = neighbors.iter().map(|(_, w)| *w).sum();
                 if total_weight <= 0.0 {
                     continue;
                 }
                 for (neighbor, w) in neighbors {
-                    let mass = alpha_val * (*current_score) * (w / total_weight);
+                    let mass = alpha_val * current_score * (w / total_weight);
                     *next_scores.entry(neighbor.clone()).or_insert(0.0) += mass;
                 }
             }
@@ -49,7 +53,11 @@ pub fn fast_personalized_pagerank(
     }
 
     let mut result: Vec<(String, f64)> = ppr_scores.into_iter().collect();
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     result
 }
 
@@ -71,6 +79,10 @@ pub fn fast_reciprocal_rank_fusion(
     }
 
     let mut out: Vec<(String, f64)> = scores.into_iter().collect();
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     out
 }

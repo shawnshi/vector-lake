@@ -168,7 +168,7 @@ python cli.py doctor
 若配置正确，输出中会呈现全项健康状态：
 - `[OK] Python: 3.13...`
 - `[OK] Tokenizer Backend: rjieba 0.2.1 (jieba-rs 0.9.x)`
-- `[OK] Native Acceleration: vector-lake-core v0.2.0 (Rust fast-core active)`（若已编译）
+- `[OK] Native Acceleration: vector-lake-core v0.2.1 (Rust fast-core active)`（若已编译）
 - `[OK] MCP Server: Import OK, 46 tools exposed`
 - `[OK] Write Gate: clean`
 
@@ -649,7 +649,7 @@ cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决�
 
 * **双模平滑降级（Graceful Fallback）**：`vector_lake_core` 采用非破坏性双模设计。若已编译安装，系统无缝启用硬件加速；若当前环境未安装，代码通过 `try: import vector_lake_core ... except ImportError:` 自动回退。**例外：同池重排没有 Python 回退**——缺核心时它降级为“保持上游顺序”并记 WARNING（见上一节），因为一个只在弱主机上生效的第二套 BM25 打分本身就是隐患。
 * **状态可观测性**：`python cli.py doctor` 自动诊断原生加速状态：
-  * 已激活：`[OK] Native Acceleration: vector-lake-core v0.2.0 (Rust fast-core active)`
+  * 已激活：`[OK] Native Acceleration: vector-lake-core v0.2.1 (Rust fast-core active)`
   * 未安装：`[OK] Native Acceleration: pure-python (optional vector-lake-core not installed)`
 * **本地构建与更新**（每次升级**不需停服**，这是 2026-09-25 改成的方式）：
   ```powershell
@@ -765,7 +765,7 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 本次会话实测结果（2026-09-25 下午）：模型缝失败证据、守护进程监听换 `watchfiles`、tantivy 后端（开关默认关）、
 `author_page_keys` 取数与缓存键、gram 重建门改成按检索次数摊销、claim 块提取换 Rust。
 
-- `python -m pytest -p no:cacheprovider -q` → **1655 passed**（本会话新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、投影注册表 19、outbox 保留/台账 10、rerank 契约 16 等；
+- `python -m pytest -p no:cacheprovider -q` → **1661 passed**（本会话新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、投影注册表 19、outbox 保留/台账 10、FTS 保留词转义 6、rerank 契约 16 等；
   同时把 `tests/test_rerank_bm25s.py` 更名为 `test_rerank_candidates.py`）。
 - `python cli.py gram-index --apply` → 340 482 gram / 14 473 499 posting / 69 929 文档，phase `stage=58.0s, pack=16.5s, publish=2.0s`（比旧注释里的 ~430 s 快得多，语料也更小）；
   重建后 `dirty=0`、`gram_index_usable()=True`，可用性检查 15.8 ms/次 → 0.1 ms/次。

@@ -315,6 +315,7 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
         return {}, f"vec_embeddings query failed: {type(e).__name__}: {e}"
 
 _LAST_FTS_ERROR = threading.local()
+_LAST_MEMORY_VIEWS = threading.local()
 
 
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
@@ -373,12 +374,18 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
                 if key in metadata
             ]
 
+        clean_toks = [t.replace('"', '') for t in query_tok.split()]
+        query_esc = " ".join(f'"{t}"' for t in clean_toks if t.strip())
+        if not query_esc:
+            _LAST_FTS_ERROR.msg = None
+            return []
+
         cur = conn.execute("""
             SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
             FROM wiki_search_index 
             WHERE wiki_search_index MATCH ? 
             ORDER BY rank LIMIT ?
-        """, (query_tok, limit))
+        """, (query_esc, limit))
         _LAST_FTS_ERROR.msg = None
         return [dict(row) for row in cur.fetchall()]
     except Exception as e:
@@ -536,7 +543,14 @@ def format_operational_memory_results(
 
 
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
-    memories, historical = governance_store.search_memory_packet_views(query)
+    cached_query = getattr(_LAST_MEMORY_VIEWS, "query", None)
+    if cached_query == query and hasattr(_LAST_MEMORY_VIEWS, "views"):
+        memories, historical = _LAST_MEMORY_VIEWS.views
+    else:
+        memories, historical = governance_store.search_memory_packet_views(query)
+        _LAST_MEMORY_VIEWS.query = query
+        _LAST_MEMORY_VIEWS.views = (memories, historical)
+
     stale_or_conflicted = [
         item for item in historical
         if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
@@ -1081,8 +1095,7 @@ def _search_scored_pages(
         expansion_limit = 12 if intent == "entity" else 5
 
         if HAVE_CORE:
-            adj_dict = {node: [(neighbor, float(w)) for neighbor, w in neighbors] for node, neighbors in adj.items()}
-            sorted_ppr = vector_lake_core.fast_personalized_pagerank(adj_dict, list(seed_keys), 0.85, 2)
+            sorted_ppr = vector_lake_core.fast_personalized_pagerank(adj, list(seed_keys), 0.85, 2)
             sorted_expansions = [(k, v) for k, v in sorted_ppr if k not in existing_keys]
         else:
             alpha = 0.85

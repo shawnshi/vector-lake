@@ -176,10 +176,19 @@ def _timeline_claims_fingerprint(conn=None) -> str:
     return f"{get_db_path()}|{count}:{highest}|{projected}:{lowest_id}:{highest_id}"
 
 
+def _timeline_parity_disk_path():
+    from vector_lake.wiki_utils import get_runtime_tmp_dir
+    return get_runtime_tmp_dir() / "timeline_parity_state.json"
+
+
 def invalidate_timeline_parity_cache() -> None:
     """Drop the memoised parity proof after this process rewrites the projection."""
     _PARITY_CACHE["fingerprint"] = None
     _PARITY_CACHE["result"] = None
+    try:
+        _timeline_parity_disk_path().unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: list[dict]) -> dict:
@@ -251,6 +260,19 @@ def timeline_projection_parity() -> dict:
     fingerprint = _timeline_claims_fingerprint(conn)
     if _PARITY_CACHE["fingerprint"] == fingerprint and _PARITY_CACHE["result"] is not None:
         return dict(_PARITY_CACHE["result"])
+
+    disk_path = _timeline_parity_disk_path()
+    if disk_path.exists():
+        try:
+            with open(disk_path, "r", encoding="utf-8") as handle:
+                disk_record = json.load(handle)
+            if disk_record.get("fingerprint") == fingerprint and "result" in disk_record:
+                _PARITY_CACHE["fingerprint"] = fingerprint
+                _PARITY_CACHE["result"] = dict(disk_record["result"])
+                return dict(_PARITY_CACHE["result"])
+        except Exception:
+            pass
+
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
         "WHERE f_claim_type = 'timeline-event'"
@@ -265,6 +287,12 @@ def timeline_projection_parity() -> dict:
     }
     _PARITY_CACHE["fingerprint"] = fingerprint
     _PARITY_CACHE["result"] = dict(result)
+    try:
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(disk_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"fingerprint": fingerprint, "result": result}, handle)
+    except Exception:
+        pass
     return result
 
 
@@ -466,8 +494,14 @@ def search_timeline_events(entity_name: str = None, action: str = None, limit: i
             query += " AND (entity_id LIKE ? OR entity_title LIKE ? OR description LIKE ?)"
             params.extend([f"%{entity_name}%", f"%{entity_name}%", f"%{entity_name}%"])
         if action:
-            query += " AND action LIKE ?"
-            params.append(f"%{action}%")
+            action_clean = action.strip()
+            if any(ch in action_clean for ch in "%*?"):
+                query += " AND action LIKE ?"
+                params.append(f"%{action_clean.replace('*', '%')}%")
+            else:
+                # Use exact match with COLLATE NOCASE so SQLite uses idx_timeline_action_date_id
+                query += " AND action = ? COLLATE NOCASE"
+                params.append(action_clean)
         # An unknown date is NULL, and SQLite orders NULLs last for DESC -- which is exactly
         # the contract, and the reason this stays a plain order by one column: adding
         # ``(event_date IS NULL)`` ahead of it to say the same thing replaces an index-ordered

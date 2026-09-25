@@ -1,5 +1,18 @@
 # Unreleased
 
+## 检索、推理与时间线（search / query / timeline）P0-P2 稳定性与性能深度优化
+
+针对三模块深度审计中暴露的稳定性和性能瓶颈，分步落地 6 项优化并全部通过验证：
+
+- **P0-1 (FTS5 词法转义)**：`_get_fts_search_results` 在分词后对每个有效 Token 去除内部双引号并做字面量包裹 `"{tok}"`。彻底消除 `NOT`、`AND`、`OR`、`NEAR` 等布尔保留字及标点符号引发的 FTS5 `OperationalError` 语法崩溃降级；配套新增 6 组保留字单元测试。
+- **P0-2 (PPR 图游走去冗余)**：移除 `_search_scored_pages` 中 PPR 外部多余的 `adj_dict = {node: [...] for node, neighbors in adj.items()}` 浅拷贝推导式，直接向 Rust 核心透传已缓存的 `adj` 字典。单次图游走扩展耗时立即节省 **14.3 ms**（降幅 ~33%）。
+- **P0-3 (Context 装配内存视图复用)**：`build_memory_packet` 通过线程局部缓存 `_LAST_MEMORY_VIEWS` 暂存当次查询的 `(memories, historical)` 结构化检索结果。`assemble_context` 在无告警需要从 100k 突发上限收缩至 60k 名义预算时，直接复用已拉取的数据做内存排版，**避免重复执行全套 Gram 索引与 SQLite 过滤，实测为安静查询节省 ~1.4 s**。
+- **P1-1 (Rust PPR 确定性定序)**：`crates/vector_lake_core` 在两轮 PPR 累加时先对待遍历节点排序，并在浮点同分时引入 `then_with(|| a.0.cmp(&b.0))` 字典序二次定序，消除 Rust `HashMap` 迭代随机性引起的浮点微差与排序抖动。原生核心无缝升级至 `v0.2.1`。
+- **P1-2 (Timeline Parity 校验落盘记忆化)**：`timeline_projection_parity` 在内存缓存未命中时先核对落盘的 `timeline_parity_state.json`。若 DB 索引指纹（`COUNT(*)` + `MAX(rowid)`）一致则直接信任，冷启动避免全量扫描 7 421 条 Claim 并解析 JSON 哈希。新进程冷启动耗时从 **195 ms 降至 8.6 ms**。
+- **P1-3 / P2-1 (Timeline Action 复合索引激活)**：`search_timeline_events` 在 `action` 参数无通配符时优先走 `= ? COLLATE NOCASE`，激活 `idx_timeline_action_date_id` 复合索引，避免全表 7.4k 行回表扫描。
+- **P2-2 (MCP 文档对齐)**：更新 `finalize_query_synthesis` 的 Docstring，明确其职责为“校验页面规范性与死链建桩”，声明“入库与向量化由后台 Watchdog 异步完成”，纠正历史文档虚标。
+
+
 ## FTS 重建：两个真原因找齐，367 s → 预期 ~63 s；同时更正我上一条里那个“无法解释的 20×”
 
 上一条我写“端到端没变快、20× 差距无法解释”。**错了：没有未知机制，是我跨越了两个分支在比。**

@@ -317,7 +317,9 @@ def query_logic_lake(query_str: str, dry_run: bool = False) -> str:
 
 @mcp.tool()
 def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
-    """Finalize the logic lake query by indexing the new pages and syncing to the governance store.
+    """Finalize the logic lake query by verifying proposed pages against schema gates and creating stubs for broken links.
+
+    Durable ingestion and embedding of the accepted pages are handled asynchronously by the background watcher.
     
     Args:
         files_written_str: Comma-separated list of filenames (e.g. 'Synthesis_Topic.md') that were written by the subagent.

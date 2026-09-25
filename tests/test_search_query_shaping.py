@@ -77,3 +77,14 @@ def test_the_public_wrapper_hands_out_a_copy(isolated_memory):
     result.append("mutated")
 
     assert tool_search._expand_query_locally("大模型 落地") == baseline
+
+
+@pytest.mark.parametrize("reserved_query", ["NOT", "AND", "OR", "NEAR(a, b)", "test NOT", '"quoted"'])
+def test_fts_query_escaping_reserved_words(isolated_memory, reserved_query):
+    """FTS5 reserved words and punctuation do not crash with syntax errors."""
+    from vector_lake import db_store
+    db_store.init_db()
+    hits = tool_search._get_fts_search_results(reserved_query)
+    assert isinstance(hits, list)
+    assert getattr(tool_search._LAST_FTS_ERROR, "msg", None) is None
+
