@@ -1875,6 +1875,10 @@
         };
 
         document.getElementById('btn-color-comm').onclick = () => {
+            if (!graphHasCommunities()) {
+                showToast("当前图谱暂无有效社区聚类数据，请先运行 community_clustering_daemon.py");
+                return;
+            }
             currentColorMode = 'community';
             document.getElementById('btn-color-comm').classList.add('active');
             document.getElementById('btn-color-type').classList.remove('active');
