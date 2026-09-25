@@ -1,5 +1,27 @@
 # Unreleased
 
+## ①② 的结果：①拆出两处真正的成本（lint 35.0 s → 7.2 s），②按测量否掉并回退
+
+**① 消除 `realpath`：不是一个问题，是两个。**
+
+先改的是 `_find_page_file`：它对**每个候选**做 `(wiki_dir / name).resolve()` + `.exists()`，而**未命中的代价与命中相同**（`VALID_PREFIXES` 全部试过），叶帧全在 ntpath 的 `realpath`/`_getfinalpathname_nonstrict` 里。改成一次目录清单（`os.listdir`，根路径只 resolve 一次）后按名字查表：**lint 35.0 s → 19.6 s**。
+
+但改完后 `_registered_page_path` 仍要 4.432 ms/次——那就只能在它的 SQL 里，一看即中：`alias_registry` **12 005 行，只有主键 autoindex（key）**，而查询过滤 `value`（`select key ... where value = ?`）→ **全扫 4.386 ms/次**，2 805 次 × 4.4 ms = 12.4 s，占墙钟 **63.5%**。加 `idx_alias_registry_value` + 配套 stale 谓词（否则 `init_db` 在"schema 看似完整"时短路，DDL 永远到不了已有库——这个坑今天已经踩过一次）：
+
+| | 每查询 | 每调用 | lint 墙钟 |
+|---|---|---|---|
+| 原始 | 4.386 ms | 6.361 ms（含文件系统）| **35.0 s** |
+| ① 目录清单索引 | — | 4.432 ms | 19.6 s |
+| ① + alias 索引 | **0.012 ms** | **0.010 ms** | **7.2 s** |
+
+即 **4.9×**，也再次验证同一模式：**“Python 慢” 的表面上其实是文件系统调用与未索引 SQL**。
+
+**② FTS 写入批处理：测完否掉，已回退。** 假设是"每节点一次事务→每行一次 fsync"，于是把每 200 行合并进一个事务再测：**66.1 → 64.8 ms/行**（冷重建外推 472 s → 463 s）。假设错了，~2% 不值得留复杂度，所以回退（代码里留注释记录这次测量）。真实原因由 profile 指向：重建 **87% 的样本在 `upsert_search_index`**，而事务开销已排除，剩下的嫌疑是它前面那句 `DELETE FROM wiki_search_index WHERE node_key = ?`——**FTS5 无法服务列查找**，与今天那个 271 s anti-join 同一机制。结构性修法是**按 rowid 删**（`wiki_search_index_state` 已经按节点存了行级信息），那是 schema 变更，不是 Rust port。
+
+顺带把 `generate_index` 的 profile 也补上了（13 个模块逐个看的那张表里唯一两个“待测”的另一个）：**87.2% 自耗在 FTS5 INSERT**，`json.dump` **0.2%**、`json.raw_decode` 2.0%、`tokenizer.cut` 0.7%——**又一处旧结论被推翻**（CHANGELOG 里"暖重建 ~50% 是 json.dump"）。
+
+测试：1655 passed（① 的改动被 lint/governance 既有用例覆盖）。
+
 ## 生成式命令补位：七条投影各自有了修复入口，一条 `cli.py projections` 驱动八条
 
 之前 `fts_index` 与 `claim_index` 是“没有独立入口”、只能共用一次全量 `projection-rebuild`。两条都找到了现成机器，不需要新造机制：

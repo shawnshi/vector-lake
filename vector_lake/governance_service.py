@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,16 +19,40 @@ def _mark_resolved(item: dict, resolution: str) -> None:
     item["resolved_at"] = _utc_now()
 
 
-def _find_page_file(wiki_dir: Path, name):
-    """The page file a name refers to, tried under every valid prefix."""
+def _page_name_index(wiki_dir: Path) -> dict[str, Path]:
+    """``filename -> absolute path`` for the pages directly under ``wiki_dir``, one directory read.
+
+    ``_find_page_file`` used to ask the filesystem per candidate -- ``(wiki_dir / name).resolve()``
+    then ``.exists()`` -- and a *miss* costs exactly as much as a hit, so a lookup tries up to
+    ``len(VALID_PREFIXES) + 1`` realpath walks.  Measured 2026-09-25: 2 798 lookups cost **17.8 s,
+    51% of the lint wall**, with the leaf frames inside ntpath's ``realpath``/
+    ``_getfinalpathname_nonstrict``.  A listing answers the same question (does this exact filename
+    exist directly under this directory?) without touching the filesystem per candidate; the root is
+    resolved once so the returned paths stay canonical, as they were.
+    """
+    try:
+        root = Path(wiki_dir).resolve()
+        names = os.listdir(root)
+    except OSError:
+        return {}
+    return {name: root / name for name in names}
+
+
+def _find_page_file(wiki_dir: Path, name, index: dict[str, Path] | None = None):
+    """The page file a name refers to, tried under every valid prefix.
+
+    ``index`` lets a caller that resolves many names -- the lint walks a whole governance queue --
+    pay for the directory read once.  Omitting it is still correct, just slower.
+    """
     if not isinstance(name, str) or not name or "/" in name or "\\" in name:
         return None
+    files = _page_name_index(wiki_dir) if index is None else index
     for candidate_name in [
         *(f"{prefix}{name}.md" for prefix in VALID_PREFIXES),
         f"{name}.md",
     ]:
-        path = (wiki_dir / candidate_name).resolve()
-        if path.parent == wiki_dir and path.exists():
+        path = files.get(candidate_name)
+        if path is not None:
             return path
     return None
 
@@ -69,6 +94,7 @@ def unapplied_merge_items(queue: dict | None = None) -> list[str]:
     """
     queue = queue if queue is not None else governance_store.load_governance_queue()
     wiki_dir = get_wiki_dir().resolve()
+    page_index = _page_name_index(wiki_dir)
     outstanding: list[str] = []
     for item in queue.get("items", []):
         if item.get("type") != "merge" or item.get("status") != "resolved":
@@ -80,13 +106,15 @@ def unapplied_merge_items(queue: dict | None = None) -> list[str]:
         if item.get("resolution") != "merge" or item.get("merge_applied"):
             continue
         candidate = item.get("merge_candidate") or {}
-        left_path = _find_page_file(wiki_dir, candidate.get("left_name"))
-        right_path = _find_page_file(wiki_dir, candidate.get("right_name"))
+        left_path = _find_page_file(wiki_dir, candidate.get("left_name"), page_index)
+        right_path = _find_page_file(wiki_dir, candidate.get("right_name"), page_index)
         left_path = left_path or _registered_page_path(
-            wiki_dir, candidate.get("left_entity_id"), _find_page_file
+            wiki_dir, candidate.get("left_entity_id"),
+            lambda d, n: _find_page_file(d, n, page_index),
         )
         right_path = right_path or _registered_page_path(
-            wiki_dir, candidate.get("right_entity_id"), _find_page_file
+            wiki_dir, candidate.get("right_entity_id"),
+            lambda d, n: _find_page_file(d, n, page_index),
         )
         if left_path and right_path and left_path != right_path:
             outstanding.append(str(item.get("item_id") or ""))

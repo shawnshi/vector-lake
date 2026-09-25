@@ -227,19 +227,37 @@ def _sync_search_index(index_data: dict, bodies: dict, embeddings_map: dict) -> 
     for index, (node_key, node, digest) in enumerate(changed):
         if index and index % 500 == 0:
             log.info("Tokenized %s/%s changed nodes...", index, len(changed))
-        aliases = node.get("aliases") or []
-        aliases_str = " ".join(str(item) for item in aliases) if isinstance(aliases, list) else str(aliases)
-        text = f"{aliases_str} {bodies.get(node_key, '')}"
-        db_store.upsert_search_index(
-            node_key,
-            _tokenize_for_fts(node.get("title", "")),
-            _tokenize_for_fts(node.get("summary", "")),
-            _tokenize_for_fts(text),
-            content_hash=digest,
-        )
-        if node_key in embeddings_map:
-            db_store.upsert_embedding(node_key, embeddings_map[node_key])
+        _write_search_row(node_key, node, digest, bodies, embeddings_map)
     return stats
+
+
+def _write_search_row(node_key, node, digest, bodies, embeddings_map) -> None:
+    """Write one page into the FTS projection (one transaction, owned by ``upsert_search_index``).
+
+    **Batching these writes was tried and measured on 2026-09-25**: one transaction per 200 rows
+    instead of per row changed the cost from **66.1 ms to 64.8 ms per row** (~472 s to ~463 s for a
+    cold rebuild of 7 139 rows), i.e. commit overhead is not what makes this expensive, and the
+    batching was reverted rather than kept for 2%.
+
+    What the profile says instead: **87% of a rebuild's samples are inside
+    ``upsert_search_index``**, and with commits ruled out the remaining suspect is the
+    ``DELETE FROM wiki_search_index WHERE node_key = ?`` in front of the insert -- an FTS5 table
+    cannot serve a lookup on a *column*, which is the same mechanism that made the FTS coverage
+    anti-join take 271 s.  The structural fix is to delete by ``rowid`` (the state table already
+    keys the node) rather than by ``node_key``, and that is a schema change, not a port.
+    """
+    aliases = node.get("aliases") or []
+    aliases_str = " ".join(str(item) for item in aliases) if isinstance(aliases, list) else str(aliases)
+    text = f"{aliases_str} {bodies.get(node_key, '')}"
+    db_store.upsert_search_index(
+        node_key,
+        _tokenize_for_fts(node.get("title", "")),
+        _tokenize_for_fts(node.get("summary", "")),
+        _tokenize_for_fts(text),
+        content_hash=digest,
+    )
+    if node_key in embeddings_map:
+        db_store.upsert_embedding(node_key, embeddings_map[node_key])
 
 
 

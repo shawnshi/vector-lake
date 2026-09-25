@@ -1537,6 +1537,18 @@ def _jobs_ledger_index_is_stale(conn: sqlite3.Connection) -> bool:
     return not {"idx_jobs_updated_at"} <= _index_names(conn)
 
 
+def _alias_registry_value_index_is_stale(conn: sqlite3.Connection) -> bool:
+    """Whether ``alias_registry`` lacks an index on ``value``.
+
+    The table's only index was its primary-key autoindex on ``key``, while the lookup that matters
+    filters on ``value`` (``_registered_page_path``, the alias-registry fallback a merge resolution
+    needs).  On 12 005 rows that is a full scan per call -- measured 2026-09-25: **4.386 ms each**,
+    2 805 calls in one lint pass.  Same trap as the jobs index above: ``init_db`` short-circuits on a
+    complete schema, so the DDL only reaches an existing database if a predicate says it is missing.
+    """
+    return not {"idx_alias_registry_value"} <= _index_names(conn)
+
+
 def init_db():
     db_path = get_db_path()
     db_key = str(db_path.resolve())
@@ -1554,6 +1566,7 @@ def init_db():
             and not _claims_format_is_stale(get_connection())
             and not _timeline_format_is_stale(get_connection())
             and not _jobs_ledger_index_is_stale(get_connection())
+            and not _alias_registry_value_index_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1928,6 +1941,12 @@ def _init_db_once(db_key: str):
         # The index makes both halves an index-only lookup, so the facet can cheaply notice a
         # ledger change instead of being recomputed on every query.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at)")
+
+        # Alias lookups filter on ``value``; without this the 12k-row registry is a full scan per
+        # call (4.386 ms measured, 2 805 calls in one lint pass).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alias_registry_value ON alias_registry(value)"
+        )
         
         # Add expression-based indexes for performance
         try:
