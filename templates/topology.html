@@ -609,8 +609,8 @@
 
         <div class="filter-block">
             <div class="filter-block-title">
-                <span>本体类型过滤</span>
-                <span style="cursor: pointer; color: var(--primary);" onclick="toggleAllTypes()">全选/反选</span>
+                <span id="filter-block-heading">本体类型过滤</span>
+                <span style="cursor: pointer; color: var(--primary);" onclick="toggleAllFilters()">全选/反选</span>
             </div>
             <div class="filter-list" id="type-filter-list"></div>
         </div>
@@ -744,6 +744,7 @@
         let onlyRisk = false;
         let onlyOrphans = false;
         const activeTypes = new Set();
+        const activeCommunities = new Set();
 
         const graphs = {
             // pageGraph/claimGraph are the only node/edge carriers; the tool no
@@ -825,6 +826,8 @@
             const srcGraph = graphs[currentGraphKey];
             activeTypes.clear();
             srcGraph.nodes.forEach(n => activeTypes.add(n.raw_type || n.group || 'Unknown'));
+            activeCommunities.clear();
+            srcGraph.nodes.forEach(n => activeCommunities.add(n.community || 'unassigned'));
 
             // Build neighbors
             neighborsMap = {};
@@ -1042,8 +1045,13 @@
         }
 
         function isNodeVisible(n) {
-            const type = n.raw_type || n.group || 'Unknown';
-            if (!activeTypes.has(type)) return false;
+            if (currentColorMode === 'community' && activeCommunities.size > 0) {
+                const cid = n.community || 'unassigned';
+                if (!activeCommunities.has(cid)) return false;
+            } else {
+                const type = n.raw_type || n.group || 'Unknown';
+                if (!activeTypes.has(type)) return false;
+            }
             if (onlyRisk && !isRiskyNode(n)) return false;
             if (onlyOrphans && (n.backbone_degree || 0) > 0) return false;
             return true;
@@ -1082,8 +1090,8 @@
                 } else if (focus) {
                     // 聚焦时背景非关联边大幅消退，避免视觉干扰
                     ctx.strokeStyle = '#1E293B';
-                    ctx.lineWidth = 0.4 * camera.zoom;
-                    ctx.globalAlpha = 0.02;
+                    ctx.lineWidth = 0.5 * camera.zoom;
+                    ctx.globalAlpha = 0.05;
                 } else {
                     ctx.strokeStyle = '#475569';
                     ctx.lineWidth = Math.min(2.5, 0.7 + (l.weight / 15)) * Math.max(0.4, camera.zoom);
@@ -1126,7 +1134,7 @@
 
                 // Alpha modulation: 背景节点微弱星尘化，聚焦核心星座化
                 if (focus && !isTarget && !isNeighbor) {
-                    ctx.globalAlpha = 0.04;
+                    ctx.globalAlpha = 0.14;
                 } else {
                     ctx.globalAlpha = 1.0;
                 }
@@ -1262,6 +1270,7 @@
         // 2D Canvas Interactions (Pan, Zoom, Pick)
         // ==========================================
         canvas.addEventListener('mousedown', (e) => {
+            if (cameraAnimId) { cancelAnimationFrame(cameraAnimId); cameraAnimId = null; }
             isDragging = true;
             hasMoved = false;
             dragStart = { x: e.clientX, y: e.clientY };
@@ -1391,48 +1400,115 @@
             document.getElementById('count-orphans').textContent = orphanCount;
         }
 
-        function renderTypeFilters() {
+        function renderFilterPanel() {
+            const heading = document.getElementById('filter-block-heading');
             const container = document.getElementById('type-filter-list');
             container.innerHTML = '';
             const g = graphs[currentGraphKey];
 
-            const typeCounts = {};
-            g.nodes.forEach(n => {
-                const t = n.raw_type || n.group || 'Unknown';
-                typeCounts[t] = (typeCounts[t] || 0) + 1;
-            });
-
-            Object.keys(typeCounts).sort().forEach(type => {
-                const row = document.createElement('label');
-                row.className = 'filter-item';
-                const color = PALETTE[type] || PALETTE.Unknown;
-                const checked = activeTypes.has(type) ? 'checked' : '';
-                row.innerHTML = `
-                    <span class="filter-label-group">
-                        <input type="checkbox" value="${type}" ${checked}>
-                        <span class="color-dot" style="background: ${color}"></span>
-                        <span>${type}</span>
-                    </span>
-                    <span class="filter-count">${typeCounts[type]}</span>
-                `;
-                row.querySelector('input').addEventListener('change', (e) => {
-                    if (e.target.checked) activeTypes.add(type);
-                    else activeTypes.delete(type);
-                    reheatSimulation();
+            if (currentColorMode === 'community') {
+                if (heading) heading.textContent = '社区聚类过滤 (Top 社群)';
+                const commCounts = {};
+                g.nodes.forEach(n => {
+                    const cid = n.community || 'unassigned';
+                    commCounts[cid] = (commCounts[cid] || 0) + 1;
                 });
-                container.appendChild(row);
-            });
+
+                const sortedCids = Object.keys(commCounts).sort((a, b) => commCounts[b] - commCounts[a]);
+                const topCids = sortedCids.slice(0, 15);
+                const commLabels = (rawData.pageGraph && rawData.pageGraph.community_labels) || {};
+
+                topCids.forEach(cid => {
+                    const row = document.createElement('label');
+                    row.className = 'filter-item';
+                    const color = cid === 'unassigned' ? COMMUNITY_UNASSIGNED_COLOR : COMMUNITY_COLORS[communityColorIndex(cid)];
+                    const checked = activeCommunities.has(cid) ? 'checked' : '';
+                    let labelText = cid === 'unassigned' ? '未分配社群' : (commLabels[cid] || `社群 #${cid}`);
+                    if (labelText.length > 18) labelText = labelText.substring(0, 18) + '...';
+
+                    row.innerHTML = `
+                        <span class="filter-label-group" title="${commLabels[cid] || cid}">
+                            <input type="checkbox" value="${cid}" ${checked}>
+                            <span class="color-dot" style="background: ${color}"></span>
+                            <span>${labelText}</span>
+                        </span>
+                        <span class="filter-count">${commCounts[cid]}</span>
+                    `;
+                    row.querySelector('input').addEventListener('change', (e) => {
+                        if (e.target.checked) activeCommunities.add(cid);
+                        else activeCommunities.delete(cid);
+                        reheatSimulation();
+                    });
+                    container.appendChild(row);
+                });
+
+                if (sortedCids.length > 15) {
+                    const otherCount = sortedCids.slice(15).reduce((sum, c) => sum + commCounts[c], 0);
+                    const tip = document.createElement('div');
+                    tip.style.fontSize = '0.75rem';
+                    tip.style.color = 'var(--text-muted)';
+                    tip.style.padding = '4px 6px';
+                    tip.textContent = `其余 ${sortedCids.length - 15} 个细分社群包含 ${otherCount} 个节点`;
+                    container.appendChild(tip);
+                }
+            } else {
+                if (heading) heading.textContent = '本体类型过滤';
+                const typeCounts = {};
+                g.nodes.forEach(n => {
+                    const t = n.raw_type || n.group || 'Unknown';
+                    typeCounts[t] = (typeCounts[t] || 0) + 1;
+                });
+
+                Object.keys(typeCounts).sort().forEach(type => {
+                    const row = document.createElement('label');
+                    row.className = 'filter-item';
+                    const color = PALETTE[type] || PALETTE.Unknown;
+                    const checked = activeTypes.has(type) ? 'checked' : '';
+                    row.innerHTML = `
+                        <span class="filter-label-group">
+                            <input type="checkbox" value="${type}" ${checked}>
+                            <span class="color-dot" style="background: ${color}"></span>
+                            <span>${type}</span>
+                        </span>
+                        <span class="filter-count">${typeCounts[type]}</span>
+                    `;
+                    row.querySelector('input').addEventListener('change', (e) => {
+                        if (e.target.checked) activeTypes.add(type);
+                        else activeTypes.delete(type);
+                        reheatSimulation();
+                    });
+                    container.appendChild(row);
+                });
+            }
+        }
+
+        function toggleAllFilters() {
+            const g = graphs[currentGraphKey];
+            if (currentColorMode === 'community') {
+                const allComms = Array.from(new Set(g.nodes.map(n => n.community || 'unassigned')));
+                if (activeCommunities.size === allComms.length) {
+                    activeCommunities.clear();
+                } else {
+                    allComms.forEach(c => activeCommunities.add(c));
+                }
+            } else {
+                const allTypes = Array.from(new Set(g.nodes.map(n => n.raw_type || n.group || 'Unknown')));
+                if (activeTypes.size === allTypes.length) {
+                    activeTypes.clear();
+                } else {
+                    allTypes.forEach(t => activeTypes.add(t));
+                }
+            }
+            renderFilterPanel();
+            reheatSimulation();
+        }
+
+        function renderTypeFilters() {
+            renderFilterPanel();
         }
 
         function toggleAllTypes() {
-            const allTypes = Array.from(new Set(graphs[currentGraphKey].nodes.map(n => n.raw_type || n.group || 'Unknown')));
-            if (activeTypes.size === allTypes.length) {
-                activeTypes.clear();
-            } else {
-                allTypes.forEach(t => activeTypes.add(t));
-            }
-            renderTypeFilters();
-            reheatSimulation();
+            toggleAllFilters();
         }
 
         function applyFilters() {
@@ -1630,6 +1706,39 @@
             return safe;
         }
 
+        let cameraAnimId = null;
+        function flyTo2D(targetX, targetY, targetZoom = null, duration = 480) {
+            if (cameraAnimId) { cancelAnimationFrame(cameraAnimId); cameraAnimId = null; }
+            const startX = camera.x;
+            const startY = camera.y;
+            const startZoom = camera.zoom;
+            const endZoom = targetZoom !== null ? targetZoom : Math.max(camera.zoom, 1.4);
+            const startTime = performance.now();
+
+            function easeInOutCubic(t) {
+                return t < 0.5 ? 4 * t * t * t : (t - 1) * (2 * t - 2) * (2 * t - 2) + 1;
+            }
+
+            function step(now) {
+                const elapsed = now - startTime;
+                const progress = Math.min(1, elapsed / duration);
+                const ease = easeInOutCubic(progress);
+
+                camera.x = startX + (targetX - startX) * ease;
+                camera.y = startY + (targetY - startY) * ease;
+                camera.zoom = startZoom + (endZoom - startZoom) * ease;
+
+                requestRender();
+
+                if (progress < 1) {
+                    cameraAnimId = requestAnimationFrame(step);
+                } else {
+                    cameraAnimId = null;
+                }
+            }
+            cameraAnimId = requestAnimationFrame(step);
+        }
+
         // ==========================================
         // Knowledge Inspector Details & Governance
         // ==========================================
@@ -1642,15 +1751,13 @@
             const inspector = document.getElementById('left-inspector');
             inspector.classList.add('visible');
 
-            // Pan camera to center on target in 2D
+            // Pan camera smoothly to center on target in 2D
             if (currentDimension === '2d') {
                 const targetSimNode = simNodes.find(n => n.id === nodeId);
                 if (targetSimNode) {
-                    camera.x = targetSimNode.x;
-                    camera.y = targetSimNode.y;
-                    if (camera.zoom < 1.2) camera.zoom = 1.5;
+                    const targetZ = camera.zoom < 1.2 ? 1.5 : camera.zoom;
+                    flyTo2D(targetSimNode.x, targetSimNode.y, targetZ, 450);
                 }
-                requestRender();
             } else if (Graph3DInstance) {
                 Graph3DInstance.cameraPosition(
                     { x: node.x * 1.5, y: node.y * 1.5, z: 200 },
@@ -1871,6 +1978,7 @@
             currentColorMode = 'type';
             document.getElementById('btn-color-type').classList.add('active');
             document.getElementById('btn-color-comm').classList.remove('active');
+            renderFilterPanel();
             requestRender();
         };
 
@@ -1882,6 +1990,7 @@
             currentColorMode = 'community';
             document.getElementById('btn-color-comm').classList.add('active');
             document.getElementById('btn-color-type').classList.remove('active');
+            renderFilterPanel();
             requestRender();
         };
 
