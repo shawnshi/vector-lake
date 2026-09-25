@@ -108,6 +108,21 @@ pub fn fast_count_list_items(body: &str, section_marker: &str) -> usize {
     count
 }
 
+/// The block-extraction contract this build implements: `kind`/`heading`/`raw_text` byte-identical
+/// to `claim_extractor._iter_blocks` (mistune) on well-formed bodies, with the carve-outs recorded
+/// in that module.  Callers **must** check this before using `fast_extract_blocks`.
+///
+/// Why a marker instead of a bare `hasattr`: the pre-2026-09-25 build exported
+/// `fast_extract_blocks` too, with different semantics (280-character cleaning, nested list items
+/// emitted, headings inside lists moving `current_heading`, code blocks appended).  A presence check
+/// therefore accepts a build that silently changes the claim corpus -- measured live on
+/// 2026-09-25, when the installed wheel was still that older build while the Python side had already
+/// been switched to prefer the Rust path.
+#[pyfunction]
+pub fn blocks_contract() -> &'static str {
+    "claim-blocks-parity-2026-09-25"
+}
+
 /// Extract the blocks claim extraction consumes: top-level paragraphs and the items of top-level
 /// lists, each with the text mistune's `extract_text` would have produced.
 ///

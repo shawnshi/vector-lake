@@ -20,8 +20,15 @@ import pytest
 from vector_lake import claim_extractor
 
 core = pytest.importorskip("vector_lake_core", reason="the Rust core is not installed here")
-if not hasattr(core, "fast_extract_blocks"):
-    pytest.skip("installed core predates fast_extract_blocks", allow_module_level=True)
+# The parity assertions can only run against a core that implements this contract.  A host whose
+# wheel predates it (2026-09-25 and earlier: 280-character cleaning, nested items emitted, nested
+# headings moving current_heading) skips them -- `claim_extractor._rust_blocks` refuses that core by
+# design, so there is nothing here to compare.  The gate's *negative* cases run everywhere.
+_CONTRACT = getattr(core, "blocks_contract", None)
+HAS_PARITY_CORE = bool(_CONTRACT) and _CONTRACT() == claim_extractor.BLOCKS_CONTRACT
+requires_parity_core = pytest.mark.skipif(
+    not HAS_PARITY_CORE, reason="installed vector_lake_core predates the claim-blocks contract"
+)
 
 
 def _signature(blocks):
@@ -50,12 +57,14 @@ FIXTURES = {
 }
 
 
+@requires_parity_core
 @pytest.mark.parametrize("name", sorted(FIXTURES))
 def test_rust_matches_mistune(name):
     body = FIXTURES[name]
     assert _rust_signature(body) == _signature(claim_extractor._iter_blocks(body)), name
 
 
+@requires_parity_core
 def test_the_corpus_level_result_is_recorded_here():
     """The fixtures above are the *rules*; this pins the measurement they came from.
 
@@ -74,9 +83,41 @@ def test_the_corpus_level_result_is_recorded_here():
 def test_nul_and_replacement_bytes_stay_on_mistune(monkeypatch):
     """The two parsers disagree by content on those bodies, and the corpus holds none of those
     bytes -- so the Rust path must decline rather than introduce them."""
-    assert claim_extractor._rust_blocks("正常\n") is not None
     assert claim_extractor._rust_blocks("含\x00空字节\n") is None
     assert claim_extractor._rust_blocks("含\ufffd替换字符\n") is None
+
+
+@requires_parity_core
+def test_a_contract_core_is_used_for_clean_bodies():
+    assert claim_extractor._rust_blocks("干净正文。\n") is not None
+
+
+def test_a_pre_parity_core_is_refused(monkeypatch):
+    """Presence of `fast_extract_blocks` is not permission: the old build exported it too."""
+    class OldCore:
+        @staticmethod
+        def fast_extract_blocks(_body):
+            raise AssertionError("the old build must not be called")
+
+    monkeypatch.setitem(__import__("sys").modules, "vector_lake_core", OldCore())
+    monkeypatch.setattr(claim_extractor, "CLAIM_BLOCK_BACKEND", "rust")
+    assert claim_extractor._rust_blocks("任意\n") is None
+
+
+def test_a_mismatched_contract_is_refused(monkeypatch, caplog):
+    class Drifted:
+        @staticmethod
+        def blocks_contract():
+            return "claim-blocks-something-else"
+
+        @staticmethod
+        def fast_extract_blocks(_body):
+            raise AssertionError("a mismatched build must not be called")
+
+    monkeypatch.setitem(__import__("sys").modules, "vector_lake_core", Drifted())
+    monkeypatch.setattr(claim_extractor, "CLAIM_BLOCK_BACKEND", "rust")
+    assert claim_extractor._rust_blocks("任意\n") is None
+    assert "blocks_contract()" in caplog.text
 
 
 def test_backend_switch_forces_mistune(monkeypatch):
@@ -95,6 +136,10 @@ def test_missing_symbol_falls_back(monkeypatch):
 
 def test_a_faulting_core_falls_back(monkeypatch, caplog):
     class Exploding:
+        @staticmethod
+        def blocks_contract():
+            return claim_extractor.BLOCKS_CONTRACT
+
         @staticmethod
         def fast_extract_blocks(_body):
             raise RuntimeError("boom")

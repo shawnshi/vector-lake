@@ -1,5 +1,32 @@
 # Unreleased
 
+## 换核心的窗口里抓到一个真缺陷：`hasattr` 当门闩，让旧核心的块提取器直接上了线
+
+部署时对照才发现：**已安装的 wheel 是 parity 之前的构建**（没有 `cut`），但它**同样导出**
+`fast_extract_blocks` —— 而我提交的 `_rust_blocks` 只检查 `hasattr`，于是那条“prefer Rust”的路径
+把它当合格品收下了。后果具体而明确：旧构建的块提取语义不同（280 字截断而非 360、嵌套列表项逐项各发一条、
+列表/引用块里的标题会改写 `current_heading`、代码块内容被当正文追加），也就是说**claim 语料在那几分钟里
+跑的是错的语义**。这也解释了为何 parity 测试当时“看起来通过”——它们测的是新构建，跑的是旧构建。
+
+修法（两侧）：
+
+- 核心新增 `blocks_contract() -> "claim-blocks-parity-2026-09-25"` 并导出，注释写明为何需要标记而不是 `hasattr`；
+- `_rust_blocks` 改为**要求该标记逐字相等**，不等则记 WARNING 并回退 mistune（其余回退条件不变）；
+- 测试重排：parity 断言在“无此契约的核心”上**skip 而不是 fail**（那台主机上没有可比对象），
+  而门闩的负向用例（NUL 体、开关、缺符号、契约不匹配、抛错）在**所有**主机上跑。
+
+**部署（本次同时完成）**：停任务并先 **disable**（否则每 5 分钟的重复触发器会在换文件的瞬间重新拉起进程、把旧 pyd 又锁上）→ 结束守护进程树 →
+手工组装 wheel（maturin 的打包步仍拉不到 MSVC CRT 清单）→ `pip install --force-reinstall` → 重新 enable + start。
+停机窗口里 **0 在途工作**（0 非终态 job / 0 in-flight 标记 / 0 待处理 outbox），所以没有损失。
+
+验证：已安装 `vector_lake_core.pyd` 的 sha256 变更、`blocks_contract()` 返回预期值、
+**`tests/test_claim_blocks_parity.py` 22 项全跑全过（不再 skip）**、守护进程心跳正常且 catch-up 行已带
+新的 `gram=` 段（证明确实跑的新代码）、日志出现 watchfiles 的 `1 change detected`、
+且一次工具调用拉起了**新的** `vector_lake.mcp_server`（pid 42348，创建于 19:15:45，即安装之后）。
+
+一个外部事实（非本次改动引入）：远端 `lan-mcp-1441`（`http://172.16.7.94:1441/mcp`）返回 **HTTP 502**（5.0 s），
+是那个网关自己的上游问题，本机无法重启它。
+
 ## 更正：scheduled-lint 并沒有“没触发”；而且它确实限制了降级窗口——重建门改为按检索次数摊销，挂进 15 分钟的 catch-up
 
 **先更正我自己的判断。** 前两节我把“自 14:37 后未再触发 gram 重建”当成运维异常，错了：

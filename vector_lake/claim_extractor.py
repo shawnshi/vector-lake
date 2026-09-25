@@ -18,12 +18,22 @@ def _utc_now() -> str:
 CLAIM_BLOCK_BACKEND = os.environ.get("VECTOR_LAKE_CLAIM_BLOCKS", "rust").strip().lower()
 
 
+#: The value of ``vector_lake_core.blocks_contract()`` this module's Rust path requires.
+BLOCKS_CONTRACT = "claim-blocks-parity-2026-09-25"
+
+
 def _rust_blocks(body: str):
     """``[(kind, heading, raw_text)]`` from the Rust core, or ``None`` to fall back to mistune.
 
     Returns ``None`` -- never raises -- for every reason the old path should be used: the backend
     switch, a body with the bytes the two parsers disagree on, or a missing/short core.  A block
     extractor must not turn an optional accelerator into a failure mode.
+
+    The capability check is on ``blocks_contract()``, not on ``hasattr(fast_extract_blocks)``: the
+    pre-2026-09-25 build exported that name with different semantics (280-character cleaning, nested
+    items emitted, nested headings moving ``current_heading``), so a presence check would accept a
+    build that silently changes the claim corpus.  That is not hypothetical -- it was the live state
+    on 2026-09-25 until the wheel was replaced.
     """
     if CLAIM_BLOCK_BACKEND != "rust":
         return None
@@ -33,7 +43,13 @@ def _rust_blocks(body: str):
         import vector_lake_core
     except ImportError:
         return None
-    if not hasattr(vector_lake_core, "fast_extract_blocks"):
+    if getattr(vector_lake_core, "blocks_contract", None) is None:
+        return None
+    if vector_lake_core.blocks_contract() != BLOCKS_CONTRACT:
+        log.warning(
+            "vector_lake_core.blocks_contract() is %r, expected %r; using mistune.",
+            vector_lake_core.blocks_contract(), BLOCKS_CONTRACT,
+        )
         return None
     try:
         return [

@@ -28,6 +28,7 @@ fn vector_lake_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<markdown::MarkdownBlock>()?;
     m.add_function(wrap_pyfunction!(markdown::fast_split_frontmatter, m)?)?;
     m.add_function(wrap_pyfunction!(markdown::fast_count_list_items, m)?)?;
+    m.add_function(wrap_pyfunction!(markdown::blocks_contract, m)?)?;
     m.add_function(wrap_pyfunction!(markdown::fast_extract_blocks, m)?)?;
     m.add_function(wrap_pyfunction!(markdown::fast_extract_wikilinks, m)?)?;
 
