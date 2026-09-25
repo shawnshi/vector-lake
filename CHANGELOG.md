@@ -1,5 +1,44 @@
 # Unreleased
 
+## 合并只落在状态字段上：`1 028` 条「未落盘」里只有 23 条是真的，而被删的键没有回到别名表
+
+`gov_bb04b7a3e920`（`Synthesis_WiNEX-Concurrency` <> `Synthesis_WiNEX_Concurrency_Model`）在 2026-06-24 被置为
+`resolved/merge`，三个月后两个页面、两个实体、两个索引节点全部健在：登记里的 `right_name` 用的是下划线，
+文件用的是连字符，`find_md_file` 找不到，合并分支什么都没做——而没有任何读者会追问。
+
+第一版探测器沿用了这个盲点：按 `type=merge & status=resolved` 计数得到 **1 028** 条「未落盘合并」，其中
+**1 000 条早已是 `resolution=skip`**（六月那批把近邻判成「不合并」并写了 skip）。读数必须包含 `resolution`
+与 `merge_applied`：修正后真数是 **23 条**，逐对读正文后处置为 5 组同文重复 + 16 对同概念异名 + 7 对判定
+不同概念，计数归 0。
+
+代码侧三处判定（均为「让状态与事实对齐」）：
+
+- `resolve_governance_item` 对 merge **fail-closed**：类型/ID 不匹配不再落到 `_mark_resolved`；声明的名字与
+  文件名不一致时回退查别名注册表（`_`/`-` 之争的真实成因）；落盘时写 `merge_applied`/`applied_at`；
+  `unapplied_merge_items()` + lint 报出「已 resolved 但两页俱在」的条数。
+- `claim_extractor` 不再把整块占位符（`待补充`/`TBD`/`TODO`）与运行态叙述（`operational memory packet` 之类）
+  挖成 claim：`待补充` 曾是一个 Active claim，某次查询 packet 的 `[superseded]` 告警清单曾是两条。
+- `Synthesis_` 骨架：门禁本来就只检查「存在」，而 `schema.md` 写的是「MUST begin with」。改为文档与实现一致，
+  位置由 lint 报（15 页仍在文末）。
+
+本轮我自己引入并修掉的两个缺陷，留档：一次分量方向判错（幸存者规则只查「有没有 `## 1. 编译事实`」，于是把
+标题其实是「智能爆炸依赖图谱」、正文为空的页留了下来，删掉了有内容的那一页——被删页的最后字节还在
+`mutation_outbox.payload_text` 里，按原字节恢复，规则补上「标题与页键一致 + 骨架非空」）；一次批量把
+`merge_applied` 盖到 1 078 条旧记录上（全部回退，再按实际应用的 17 条重写）。
+
+**被删的键必须回到别名表**：批量删除的 48 页只写了 SQLite `alias_registry`，而 `link_resolution` 只认文件名、
+标题与 frontmatter `aliases`——lint 的断链因此涨到 370，目标正是刚删掉的那些键。按
+`semantic_merge._union_frontmatter` 的既有规则（被消费页的键与标题并入幸存页 `aliases`）补 43 个幸存页、
+48 个键后回到 **85**，被删键作为目标的一条不剩（残量是既存的 `raw/` 路径类）。
+
+语料侧同批发现：177 页正文里重复了一份自己的 frontmatter（提取器会把那几行 YAML 读成 claim，已修 174，
+剩下 3 页被前置的命名/身份缺陷挡住——`Concept_DRG-3.0` 与一个 `Source_` 页连字符/点号不合规、一页提取不出
+实体，写路径直接拒绝）；90 页 `## 1. 编译事实` 区域没有任何正文（只登记，不编造内容）；13 个 `auto-stub`
+是真实缺口标记，没有任何一个存在同规范名或近似伙伴，因此一个都没删。
+
+回归：`python -m pytest -p no:cacheprovider -q` → **1554 passed**（新增 9 个用例）；`cli.py doctor` 写入门 clean、
+向量与 gram 索引无积压；`projection-report` 三侧 0 差异。
+
 ## 指向 claim 的三处投影：一个哈希不够用了（`timeline_events` 的 93 行孤儿）
 
 `timeline_events` 的行是按**内容寻址**的：`id = sha256(claim_id, event_date, text)`。这让“被带外改写的行”

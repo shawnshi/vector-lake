@@ -229,6 +229,67 @@ A compiled sentence.
         self.assertIn("本页只记录证据中明确出现的定义、机制、适用范围或限制。", texts)
 
 
+class TestPlaceholderAndRunNarrationBlocks(unittest.TestCase):
+    """A placeholder or a run's own packet state is not knowledge.
+
+    The synthesis skeleton asks a page to declare its sections before the analysis exists, so
+    ``待补充`` is legitimate page text; mined as a claim it became an *Active* assertion
+    (``claim_e09b8236...``), and two further claims recorded a query packet's ``[superseded]``
+    warning list whose ids were gone from ``operational_memory`` by the time anyone read them.
+    """
+
+    def _frontmatter(self):
+        return {
+            "title": "Test Concept",
+            "type": "concept",
+            "id": "concept_placeholder",
+            "domain": "General",
+            "status": "Active",
+            "epistemic-status": "seed",
+            "categories": ["System_Architecture"],
+            "updated": "2026-09-25T00:00:00+00:00",
+            "sources": [],
+        }
+
+    def _texts(self, body: str):
+        result = extract_page_objects("Concept_Placeholder.md", self._frontmatter(), body)
+        return [claim.get("claim_text", "") for claim in result["claims"]]
+
+    @staticmethod
+    def _body(middle: str) -> str:
+        """A valid dual-schema body, so extraction cannot pass by silently skipping the page."""
+        return (
+            "## 1. 编译事实\n\n"
+            f"{middle}\n\n"
+            "---\n\n"
+            "## 2. 证据时间线\n"
+        )
+
+    def test_placeholder_blocks_are_not_claims(self):
+        from vector_lake.claim_extractor import _iter_blocks
+
+        for placeholder in ("待补充", "TBD", "TODO", "待核实"):
+            body = self._body(f"- {placeholder}")
+            # The block exists and only the filter keeps it out of the claim index.
+            self.assertTrue(
+                any(placeholder in block["text"] for block in _iter_blocks(body)),
+                body,
+            )
+            self.assertNotIn(placeholder, self._texts(body), body)
+
+    def test_run_packet_narration_is_not_a_claim(self):
+        body = self._body(
+            "The operational memory packet lists two `[superseded]` warnings: decision_x, task_state_y."
+        )
+        self.assertFalse([t for t in self._texts(body) if "packet" in t.lower()])
+
+    def test_a_real_claim_next_to_a_placeholder_survives(self):
+        body = self._body("该页记录可核验事实。\n\n- 待补充")
+        texts = self._texts(body)
+        self.assertIn("该页记录可核验事实。", texts)
+        self.assertNotIn("待补充", texts)
+
+
 def _timeline_frontmatter(page_id: str) -> dict:
     return {
         "title": "Anchor Test",

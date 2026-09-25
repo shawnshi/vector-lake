@@ -28,6 +28,7 @@ from vector_lake.schema_validator import (
     category_shape_violation,
     is_registered_domain,
     missing_required_fields,
+    synthesis_skeleton_order_report,
     validate_schema,
     SchemaViolationException,
 )
@@ -578,6 +579,14 @@ def lint_vector_lake(auto_fix: bool = False):
         except SchemaViolationException as e:
             issues["schema"].append(f"{filename}: {str(e)}")
 
+        # The synthesis skeleton rule is enforced as *presence*; where it sits is reported, so a
+        # page whose required sections are buried at the bottom cannot read as compliant with the
+        # documented rule (which asks the document to open with them).
+        if filename.startswith("Synthesis_"):
+            skeleton_report = synthesis_skeleton_order_report(data["body"])
+            if skeleton_report:
+                issues["schema"].append(f"{filename}: {skeleton_report}")
+
     # The census line is what makes the field readable at a glance: how many pages put a number
     # into their compiled truth, and how many of them said what supports it.
     if metric_tiers:
@@ -874,6 +883,21 @@ def lint_vector_lake(auto_fix: bool = False):
         issues["governance"].append(f"Stale claims: {metrics['stale_claim_count']}")
     if metrics["pending_change_set_count"] > 0:
         issues["governance"].append(f"Pending change sets: {metrics['pending_change_set_count']}")
+
+    # A merge is durable when the consumed page is gone. An item that says ``resolved`` while both
+    # of its pages are still on disk is a resolution that did not change the graph: the WiNEX pair
+    # sat that way from 2026-06-24 to 2026-09-25 because every reader trusted the status field.
+    # Only items that claim a merge count, so the line is a to-do list rather than a census of
+    # every merge-typed record the queue has ever held.
+    from vector_lake.governance_service import unapplied_merge_items
+
+    outstanding_merges = unapplied_merge_items()
+    if outstanding_merges:
+        issues["governance"].append(
+            "Resolved merge items whose two pages are both still live (unapplied merge or a "
+            f"resolution that predates merge application): {len(outstanding_merges)} -- "
+            f"{', '.join(outstanding_merges[:10])}"
+        )
 
     # 17. Source Path Resolution -- reported, and deliberately without a repair branch.
     #

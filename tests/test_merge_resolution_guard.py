@@ -216,3 +216,83 @@ def test_failure_inside_the_commit_callback_leaves_no_trace(isolated_memory, mon
     assert (wiki / "Product_Alpha.md").read_text(encoding="utf-8") == before
     assert (wiki / "Product_Beta.md").exists()
     assert _queue_item()["status"] == "pending"
+
+
+def _rewrite_item(**changes):
+    queue = governance_store.load_governance_queue()
+    for item in queue["items"]:
+        if item.get("item_id") == ITEM_ID:
+            item.update(changes)
+    governance_store.save_governance_queue(queue)
+
+
+def test_declared_name_that_matches_no_file_falls_back_to_the_registry(isolated_memory):
+    """The WiNEX shape: the item records ``Synthesis_WiNEX_Concurrency_Model`` while the file is
+    ``Synthesis_WiNEX-Concurrency-Model.md``.  The registry already answers that name, so the pair
+    is resolvable -- searching only the declared spelling made a live pair look unresolvable."""
+    wiki = _seed()
+    governance_store.upsert_alias("Product_Beta", RIGHT_ID)
+    _rewrite_item(
+        merge_candidate={
+            "left_entity_id": LEFT_ID,
+            "left_name": "Product_Alpha",
+            "right_entity_id": RIGHT_ID,
+            "right_name": "Product_Beta__underscore_spelling",
+        }
+    )
+
+    item = governance_service.resolve_governance_item(
+        ITEM_ID, "merge", change_manifest={"allow_ambiguous_names": True}
+    )
+
+    assert item["status"] == "resolved"
+    assert not (wiki / "Product_Beta.md").exists()
+    assert governance_store.get_alias(RIGHT_ID) == LEFT_ID
+
+
+def test_merge_without_entity_ids_fails_closed(isolated_memory):
+    """A merge may only be recorded as resolved once it has been applied."""
+    wiki = _seed()
+    _rewrite_item(merge_candidate={})
+
+    with pytest.raises(RuntimeError, match="both entity ids"):
+        governance_service.resolve_governance_item(ITEM_ID, "merge")
+
+    assert (wiki / "Product_Beta.md").exists()
+    assert _queue_item()["status"] == "pending"
+
+
+def test_merge_resolution_refuses_a_non_merge_item(isolated_memory):
+    wiki = _seed()
+    _rewrite_item(type="suggestion")
+
+    with pytest.raises(RuntimeError, match="merge governance item"):
+        governance_service.resolve_governance_item(ITEM_ID, "merge")
+
+    assert (wiki / "Product_Beta.md").exists()
+    assert _queue_item()["status"] == "pending"
+
+
+def test_unapplied_merge_items_ignores_items_that_do_not_claim_a_merge(isolated_memory):
+    """Counting by status alone reported ~1,000 already-triaged neighbours as outstanding."""
+    _seed()
+    _rewrite_item(status="resolved", resolution="skip")
+    assert governance_service.unapplied_merge_items() == []
+
+    _rewrite_item(status="resolved", resolution="merge", merge_applied=True)
+    assert governance_service.unapplied_merge_items() == []
+
+
+def test_unapplied_merge_items_reports_a_resolved_pair_that_is_still_live(isolated_memory):
+    """The detection the WiNEX pair went without from 2026-06-24 to 2026-09-25."""
+    _seed()
+    _rewrite_item(status="resolved", resolution="merge")
+
+    assert governance_service.unapplied_merge_items() == [ITEM_ID]
+
+    governance_service.resolve_governance_item(
+        ITEM_ID, "merge", change_manifest={"allow_ambiguous_names": True}
+    )
+
+    assert governance_service.unapplied_merge_items() == []
+    assert _queue_item()["status"] == "resolved"

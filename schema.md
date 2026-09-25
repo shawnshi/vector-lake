@@ -148,11 +148,15 @@ three headings the corpus already uses most. It is not enforced, because enforci
 require rewriting 1 798 existing pages; new sources should follow it, and the retrieval layer can
 depend on those three names existing.
 
-For Synthesis_*.md: MUST instantiate a lightweight semantic skeleton before free-form analysis. The document MUST begin with:
+For Synthesis_*.md: MUST instantiate a lightweight semantic skeleton. The document MUST contain:
 ## 核心合成论点 (Core Synthesized Claims) (No-Pronoun Constraint enforced).
 ## 支撑拓扑 (Supporting Topology) (Listing critical [predicate:: [[Target]]] vectors driving the synthesis).
-Free-form markdown analysis follows. This is the one section rule the schema gate enforces
-(`schema_validator.validate_schema`), and all 22 live synthesis pages satisfy it.
+Free-form markdown analysis follows. What `schema_validator.validate_schema` enforces is that these
+two sections are *present*. Opening the document with them is the recommended shape, not an enforced
+one: enforcing the order would reject the legacy synthesis pages that carry the skeleton last, so
+`lint` reports the position instead (`synthesis_skeleton_order_report`) and the difference between the
+documented rule and the enforced rule stays visible. All 22 live synthesis pages satisfy the rule
+that is actually enforced.
 
 C. Generated Artifacts (Not Authored)
 Target Files: `System_Community_*.md` (the clustering daemon's community indexes).

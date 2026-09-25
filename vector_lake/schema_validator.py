@@ -62,6 +62,31 @@ VALID_CATEGORIES = {
 VALID_STATUS = {"Active", "Draft", "Superseded", "Deprecated", "Archived", "Contested"}
 VALID_EPISTEMIC_STATUS = {"seed", "sprouting", "evergreen"}
 
+#: The two sections ``schema.md`` requires of a ``Synthesis_`` page.  The gate enforces that they
+#: are present; enforcing that they *open* the document would reject every legacy synthesis page
+#: that put them last, so the order is reported by lint instead (``synthesis_skeleton_order_report``).
+#: Two live pages showed the divergence is real: both carried the headings at the end of the body
+#: and passed the gate while ``schema.md`` claimed the document "MUST begin with" them.
+SYNTHESIS_SKELETON_HEADINGS = (
+    "## 核心合成论点 (Core Synthesized Claims)",
+    "## 支撑拓扑 (Supporting Topology)",
+)
+
+
+def synthesis_skeleton_order_report(body: str) -> str | None:
+    """Non-blocking report when a synthesis page's required skeleton is not its opening sections."""
+    headings = [
+        line.strip() for line in (body or "").splitlines() if line.startswith("## ")
+    ]
+    if len(headings) < 2:
+        return "synthesis page has fewer than two H2 sections"
+    if tuple(headings[:2]) == SYNTHESIS_SKELETON_HEADINGS:
+        return None
+    return (
+        "synthesis skeleton is present but not the opening sections "
+        f"(first H2: {headings[0][:48]!r})"
+    )
+
 # ``SCHEMA_CATEGORIES.md`` scopes the category ontology to "entities, concepts, and
 # synthesis logic nodes".  Derived system artifacts (the clustering daemon's
 # ``System_Community_*`` indexes) are none of those, and the daemon marks them with
@@ -445,7 +470,7 @@ def validate_schema(
     if prefix in {"Source", "System"}:
         pass
     elif prefix == "Synthesis":
-        if "## 核心合成论点 (Core Synthesized Claims)" not in body or "## 支撑拓扑 (Supporting Topology)" not in body:
+        if any(heading not in body for heading in SYNTHESIS_SKELETON_HEADINGS):
             raise SchemaViolationException("Schema Violation: Synthesis files must contain '## 核心合成论点 (Core Synthesized Claims)' and '## 支撑拓扑 (Supporting Topology)'.")
     # 3.2 Dual-Schema Entities
     else:

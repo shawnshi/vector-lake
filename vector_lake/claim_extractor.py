@@ -81,6 +81,47 @@ def claim_type_for_heading(kind: str, heading: str, text: str) -> str:
 BOOKKEEPING_BODIES = ("node auto-migrated to v11 schema",)
 
 
+#: Whole-block placeholders.  The synthesis skeleton asks a page to declare its sections before the
+#: analysis exists, so an unfinished page legitimately says ``待补充``; mined as a claim that becomes
+#: an *Active* assertion, which is how ``待补充`` reached the live claim index as ``claim_e09b8236...``.
+PLACEHOLDER_BODIES = (
+    "待补充",
+    "待补齐",
+    "待定",
+    "待确认",
+    "待核实",
+    "tbd",
+    "todo",
+    "to be added",
+    "n/a",
+)
+
+#: Query/run narration.  A page may describe the run it was written from, but that state belongs to
+#: the run: two live claims recorded a *packet's* ``[superseded]`` warning list, and by the time
+#: anyone read them the ids they named were gone from ``operational_memory``.
+RUN_NARRATION_MARKERS = (
+    "operational memory packet",
+    "operational-memory packet",
+    "query packet",
+    "runtime packet",
+    "运行记忆 packet",
+    "运行记忆packet",
+    "查询 packet",
+)
+
+
+def _is_run_state_or_placeholder(text) -> bool:
+    """True for a block that carries no proposition: a placeholder or run narration."""
+    normalized = _collapse_text(text).lower()
+    if not normalized:
+        return False
+    stripped = re.sub(r"^(?:\s*\[[^\]]*\]\s*)+", "", normalized).strip()
+    stripped = stripped.strip(".!。:：")
+    if stripped in PLACEHOLDER_BODIES:
+        return True
+    return any(marker in normalized for marker in RUN_NARRATION_MARKERS)
+
+
 def _is_page_boilerplate(text) -> bool:
     """True for a block that only carries a template caption or a reader instruction.
 
@@ -131,7 +172,12 @@ def _body_summary(body: str, limit: int = 320) -> str:
     """
     for block in _iter_blocks(body):
         text = block.get("text") or ""
-        if not text or _is_page_boilerplate(text) or _is_page_boilerplate(block.get("raw_text")):
+        if (
+            not text
+            or _is_page_boilerplate(text)
+            or _is_page_boilerplate(block.get("raw_text"))
+            or _is_run_state_or_placeholder(text)
+        ):
             continue
         # Cleaned: this string becomes both a claim text and the ``page-summary`` evidence text, so
         # raw markup and inline anchors must not travel into either.
@@ -434,6 +480,10 @@ def extract_page_objects(
 
     for block_index, block in enumerate(blocks, start=1):
         if _is_page_boilerplate(block["text"]) or _is_page_boilerplate(block.get("raw_text")):
+            continue
+        if _is_run_state_or_placeholder(block["text"]):
+            # A placeholder or a run's own packet state is not knowledge: it must not reach the
+            # claim or timeline projection, where it would be re-minted as an Active assertion.
             continue
         block_temporal = _parse_temporal(block["text"])
         final_temporal = block_temporal or validity_defaults.get("temporal_anchor")

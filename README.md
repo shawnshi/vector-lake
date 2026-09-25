@@ -103,6 +103,7 @@ graph TD
 
 - **适用类型**：`Source_`, `Synthesis_`
 - **结构要求**：自由格式，不切割“事实 / 时间线”，用于单篇文献精读、书籍伴读笔记与横向战略研报。
+- **`Synthesis_` 的骨架（只强制存在，不强制位置）**：必须含 `## 核心合成论点 (Core Synthesized Claims)` 与 `## 支撑拓扑 (Supporting Topology)` 两节（`schema_validator.SYNTHESIS_SKELETON_HEADINGS`）。门禁检查的是**存在**：把骨架放在文末仍是合法页面，因为按位置强制会一次性拒绝存量页面；位置由 lint 报告（`synthesis_skeleton_order_report`），于是文档与实现的差异只会出现在报告里，而不是被写成一条并未实现的保护。
 
 #### 两个命名空间不要混（实体名 vs 标签）
 
@@ -152,6 +153,7 @@ cp config.example.json config.json
 | `VECTOR_LAKE_MEMORY_DIR` | 显式指定 MEMORY 根路径（优先级高于 `config.json`） | 例如 `C:/Users/shich/MEMORY` |
 | `VECTOR_LAKE_RUNNER_SHADOW` | 设为 `1` 时摄取 Runner 仅模拟评估而不真实写页 | 默认 `0` |
 | `VECTOR_LAKE_RUNNER_CONCURRENCY` | 摄取 Runner 并发模型调用线程数（批量摄取加速） | 推荐 `3` ~ `5` |
+| `VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE` | 设为 `1` 时 shadow 轮不释放已认领的任务包（保留租约供人工检查；默认释放以便下一轮重试） | 默认 `0` |
 | `VECTOR_LAKE_QUERY_CONTEXT_TTL` | Query 上下文临时文件的过期秒数 | 默认 `7200` (2小时) |
 | `VECTOR_LAKE_VECTOR_SIM_SCALE` | Sum 混合检索模式下向量相似度权重乘数 | 默认 `15.0` |
 
@@ -220,6 +222,7 @@ python watchdog_sync.py
    - **定时确定性维护 (Scheduled Deterministic Maintenance)**：每天 10:00 与 23:00 刷新脏图拓扑、执行只读 lint、在索引落后时重建 gram 倒排、做 SQLite WAL checkpoint 并执行备份保留；重建与 checkpoint 都在 lint 的失败范围之外，lint 自身失败也会被有界重试而不是无限重跑。另有一条独立节拍的兜底扫描（`VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`，默认 900 秒）负责把未入队的 raw 源重新入队、作废陈旧任务、释放失去 job 的在途标记，并按批次重建缺失或**输入已变**的向量。研究、去重、聚类等独立脚本不会被该循环隐式启动。
    - **向量投影存于 SQLite (vec_embeddings)**：向量由 `sqlite-vec` 存放于 `vector_lake.db` 的 `vec_embeddings` 表，不再依赖模型侧的 JSON 载荷；语义去重守护进程只读该表，读取失败时退回**词法/拓扑去重**（不是旧缓存）。向量的**存在不等于有效**：页面被绕过增量索引的路径改写、或全量重建改动了别名与摘要时，旧向量不会被删除，只会默默继续用已经不存在的正文答题。因此每个节点在写入向量的同时记录其嵌入输入的摘要（`vec_embedding_inputs`），周期兜底每轮全量比对（实测 7175 节点 0.41 秒），把缺失、输入已变、以及未打标的节点一并按批重建；需要一次性全量重建时用显式 `embedding-backfill`。
    - **本体免疫型排重 (Ontology-Immune Deduplication)**：去重守护进程豁免 `Source_*` 等时序不可变信源，避免“相似度过高即合并”把不同日期的研报强行合流。
+   - **合并的可回放性 (Merge Durability)**：`resolution=merge` 只能在合并**已落盘**时写下。类型/ID 不匹配不再静默落到 `_mark_resolved`（fail-closed），声明的名字与文件名不一致（`_`/`-`）时回退查别名注册表，落盘时同写 `merge_applied`/`applied_at`；`lint` 按 `unapplied_merge_items()` 报出“已 resolved 但两页俱在”的条数——只看 `type`/`status` 会把早先已判定为 `skip` 的近邻算成待办。**被消费页的键与标题必须进入幸存页的 `aliases`**（`semantic_merge._union_frontmatter` 的既有规则）：链接解析只认文件名、标题与 frontmatter `aliases`，不读 SQLite 别名表。
    - **统一 SQLite 数据底座 (Unified SQLite Engine)**：实体、断言、证据、信源、图拓扑、变更集、治理队列与运行态记忆统一落在 SQLite，启用 WAL。
    - **差分垃圾回收机制 (Diff-based GC)**：Markdown 层面重命名 / 删除或断言被移除时，同步层按页面增量清理对应的实体、断言与证据，不再只增不减。
    - **夜间拾荒者集群 (Janitor Swarm)**：语义去重的**分片准备器**。`python scripts/launch_janitor_swarm.py` 读取治理队列中的 pending merge 项，按 `SHARD_SIZE` 切分为子代理任务包并写出 `janitor_manifest.json`。**它不会自行合并或启动任何外部进程**；实际合并由宿主子代理调用 `resolve_governance_item` 或 `bulk_reconciliation` 完成。
@@ -441,6 +444,8 @@ python cli.py anchor-backfill --only 1,2,5,9-14 --apply
 `claim-pointer-report` / `claim-pointer-repair` 管的是**指向 claim 的两张表**：`evidence.supports_claim_ids`（命名 claim id）与 `claim_graph_edges`（命名页面键）。claim 被增量路径之外的批量操作退掉时，这两处会留下死指针，而此前没有任何读者会发现——实测活库上 `evidence` 有 25 220 个指针指向已不存在的 claim（分布在 25 217 行，其中 25 214 个来自 2026-07-14 的一次批量事件，此后两个月数量未变）。`claim-pointer-repair` 只从 JSON 字段里摘掉死 id（不动正文、locator、source，也不改 `updated_at`：丢指针不是新证据，不该推新鲜度时钟），每个批次的删除项先落盘到 `wiki/.meta/migrations/2026-09-24-claim-pointer-prune.rollback.jsonl`；`--edges` 额外把 `claim_graph_edges` 中**目标**能被解析器回答的行改回页面键（`[[Concept_CoMET]]` → `Product_CoMET`），源不参与改写（源是边的出处页，用核名规则改写它等于把边挂到另一个页上），解析器回答不了的目标保持原样——保留原字面量是边写入器的既定行为，属链接质量信号而非漂移。
 
 `claim-evidence-queue` 把 lint 报出的**无出典声明债**（`claims.evidence_gap` 非空，实测 18 243 条 / 2 220 页）按**队列批次**派给治理面板：cohort 是 `(缺口形状, 页前缀或摄取月份)`，一个 item 覆盖一个批次（默认 100 页），边界由 `--batch-pages` 与 `--group` 调。缺口形状沿用提取器自己的记录而不是压平成一个数：整页**一支出典都没声明**是摄取合同问题，而**声明了多处、该段没说哪一处**是块自己的锚点问题——实测活库里恰好只声明一个 source 的页面从不产生缺口。每个 item 另外记录该批次里有多少条 claim 早于提取器归属字段（实测 98%），因为那是「能不能修」的前提。默认 dry-run，`--apply` 才入队；重复运行是幂等的（item id 由 `(state, group, cohort, batch)` 派生，已在队列里的批次跳过，页面集变化的批次报为 stale 而不是另开一条）。item 的 `search_queries` 故意留空：`research` 会把前 5 条 pending item 的查询当成检索指令，而出处不是外部检索能补的。
+
+两类块**不再成为 claim**：整块占位符（`待补充`、`TBD`、`TODO`、`待核实` 等）与运行态叙述（`operational memory packet`、`runtime packet` 之类）。它们此前会以 Active 断言进入 claim 索引（`待补充` 本身就是一个 claim_id），而它们记的不是知识，是模板骨架和某次运行的短期状态；过滤位于 `claim_extractor._is_run_state_or_placeholder`，与 `_is_page_boilerplate` 同级。存量由重提取替换：页面文本不变、claims 重算，不另建流水线。
 
 `provenance-backfill` / `provenance-accept` 处理 lint 第 12 项那批无出处声明的存量的**可恢复部分与不可恢复部分**。
 实测：2 052 页里只有 6 页历史上真的写过 `raw/` 路径，2 001 页只写过占位符 `Source_Auto_Fixed`
@@ -714,7 +719,15 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-本轮实测结果（2026-09-24）：
+本轮实测结果（2026-09-25）：本轮只改三处判定——合并的落盘与可回放性（`governance_service`）、claim 提取的占位符/运行态过滤（`claim_extractor`）、Synthesis 骨架的文档与门禁对齐（`schema_validator` + `tool_lint`）。
+
+- `python -m pytest -p no:cacheprovider -q` → **1554 passed**（新增 9 个用例：合并 fail-closed、注册表名字回退、未落盘合并检测、占位符与运行态叙述过滤、骨架顺序与 lint 报告）。
+- `python cli.py doctor` → `Write Gate: clean`、`Page Edge Projection` 与已发布边一致、`Vector Projection` 无 missing/stale/unstamped、`Memory Gram Index` `usable=True` 且 `queued=0`。
+- `python cli.py projection-report` → Wiki / canonical / index 三侧逐项 0 差异。
+- `python cli.py lint` → 17 节中 11 节 PASS；已知 FAIL 为 7 Broken Links（85）、8 Orphan（10）、9 Name Collisions（22）、12 Governance Debt（2）、14 Strict Schema Verification（17）、17 Source Path Resolution（1154）。`unapplied_merge_items()` 为 **0**（本轮的合并全部落盘）；骨架顺序报告列出 15 页仍把骨架放在文末——那是报告该说的话，不是失败。
+- 本轮合并删除的 48 页，其被消费键已补回幸存页 `aliases`：lint 的断链 **370 → 85**，被删键作为目标的一条不剩（可见的 10 条全部是既存的 `raw/` 路径类；其余 75 条被 lint 输出截断，未单独分类）。
+
+上一轮实测结果（2026-09-24）：
 
 - `python -m pytest -p no:cacheprovider -q` → **1476 passed**。
 - `python cli.py lint` → 16 节中 13 节 PASS；已知 FAIL 为 8 Orphan（10）、9 Name Collisions（22）、12 Governance Debt（18,243 条无来源声明）。
