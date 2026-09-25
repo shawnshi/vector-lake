@@ -19,8 +19,17 @@ def test_query_and_timeline_mcp_tools_are_registered():
 
 
 def test_query_and_timeline_codex_skills_are_packaged():
-    assert (ROOT / "skills" / "query" / "SKILL.md").is_file()
-    assert (ROOT / "skills" / "timeline" / "SKILL.md").is_file()
+    assert (ROOT / "skills" / "vector-lake-query" / "SKILL.md").is_file()
+    assert (ROOT / "skills" / "vector-lake-timeline" / "SKILL.md").is_file()
+
+
+def test_all_packaged_skills_use_vector_lake_prefix():
+    """All skills exposed by Vector Lake must be namespaced with vector-lake-* to avoid global collisions."""
+    skills_dir = ROOT / "skills"
+    assert skills_dir.is_dir()
+    for child in skills_dir.iterdir():
+        if child.is_dir() and (child / "SKILL.md").is_file():
+            assert child.name.startswith("vector-lake-"), f"Skill {child.name} lacks vector-lake-* prefix"
 
 
 def test_the_mcp_query_tool_forwards_the_documented_dry_run_switch(monkeypatch):

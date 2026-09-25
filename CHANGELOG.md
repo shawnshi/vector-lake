@@ -1,5 +1,19 @@
 # Unreleased
 
+## 技能体系重构与命名空间统一（Skills Refactoring & `vector-lake-*` Unification）
+
+针对项目 Skills 原先使用纯通用英语名词（`search`, `lint`, `doctor`, `review` 等）引发的全局环境命名空间污染与误触发风险，完成全量体系重构：
+
+- **全量统一命名空间**：19 个原有 Skills 目录及 Frontmatter 中的 `name:` 字段全部重命名为 `vector-lake-*`（如 `vector-lake-search`, `vector-lake-query`, `vector-lake-timeline`, `vector-lake-lint`, `vector-lake-watchdog` 等），彻底规避与其他项目或全局工具产生命名冲突。
+- **新增核心技能 `vector-lake-projections`**：建立针对全部 8 个派生投影（`memory_gram`, `vectors`, `page_projection`, `fts_index`, `tantivy_mirror`, `claim_index`, `timeline_events`, `governance_queue`）的健康评估与一致性自愈指南。
+- **现代化技能工作流优化**：
+  - `vector-lake-sync`：剔除废弃的 `sync_vector_lake` legacy alias 调用指导，更新为现代异步批量流程（`prepare_ingest_batch` + `claim_ingest_tasks` + `finalize_ingest`）；
+  - `vector-lake-search`：增加 `domain`, `cluster`, `include_history` 等高级过滤参数使用指南；
+  - `vector-lake-memory-update` 与 `vector-lake-resolve`：增加纯文本 `content` 与 JSON 字符串 `manifest_json` 直接传参说明，消除强制物理落盘开销；
+  - `vector-lake-debt`：修正跨技能引用为 `vector-lake-memory-update`。
+- **工程门禁守卫**：在 `tests/test_command_surface.py` 中新增 `test_all_packaged_skills_use_vector_lake_prefix` 契约断言，确保后续新增技能必须继承 `vector-lake-*` 前缀。全库测试增至 **1667 passed**。
+
+
 ## MCP 工具表面优化（vector-lake-mcp surface refinement）
 
 针对 MCP 接口审计中暴露的工具超载、参数阉割与写盘摩擦问题，完成 5 项优化重构并全部通过验证：
