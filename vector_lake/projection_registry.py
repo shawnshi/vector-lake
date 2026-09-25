@@ -40,10 +40,18 @@ class Projection:
     cost: str
     #: ``() -> (state, detail)`` with state in {HEALTHY, DEGRADED}.
     health: Callable[[], tuple[str, str]]
-    #: ``() -> str``.  Idempotent and safe to call when nothing is due.
-    repair: Callable[[], str]
+    #: ``() -> str``.  Idempotent and safe to call when nothing is due.  ``None`` means there is no
+    #: routine automatic repair and ``manual_entry`` names what a human runs instead -- an entry with
+    #: no repair is a statement about the system, not a hole to be filled with a guess.
+    repair: Callable[[], str] | None
     #: Which reader degrades when this is unhealthy, so the impact is not a guess.
     degrades: str
+    #: What to run when ``repair`` is ``None``.
+    manual_entry: str = ""
+
+    @property
+    def repairable(self) -> bool:
+        return self.repair is not None
 
 
 def _gram_health() -> tuple[str, str]:
@@ -62,6 +70,12 @@ def _gram_repair() -> str:
     from vector_lake import memory_gram_index
 
     return memory_gram_index.maybe_rebuild_memory_gram_index()
+
+
+def _tantivy_repair() -> str:
+    from vector_lake import tantivy_index
+
+    return f"rebuilt {tantivy_index.rebuild_from_sqlite()} document(s) from the FTS5 table"
 
 
 def _vector_health() -> tuple[str, str]:
@@ -94,6 +108,121 @@ def _vector_repair() -> str:
     )
 
 
+def _counts(conn) -> dict:
+    """Every signal the count-based pilots need, each one measured cheap (total ~60 ms).
+
+    **What is deliberately not here:** comparing ``wiki_search_index``'s row keys against
+    ``page_index_nodes`` as an anti-join.  Measured 2026-09-25 on the live lake: it did not finish in
+    90 s, against 46 ms for ``COUNT(*) FROM wiki_search_index`` -- an FTS5 table cannot serve
+    ``node_key = ?``, so each of the 7 139 probes scans it.  That anti-join is what made the first
+    version of this function take **271 s**, which is not a health probe, it is an outage; FTS
+    coverage is therefore reported as a *count shortfall*, and naming the specific pages is left to
+    the rebuild path.  The other two anti-joins (claims/claim_index 35 ms, timeline/claims 10 ms) and
+    the unstamped-vector one (16 ms) are indexed and kept.
+    """
+    row = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM page_index_nodes) AS nodes,"
+        " (SELECT COUNT(*) FROM page_index_edges) AS edges,"
+        " (SELECT COUNT(*) FROM wiki_search_index) AS fts_rows,"
+        " (SELECT COUNT(*) FROM claims) AS claims,"
+        " (SELECT COUNT(*) FROM claim_index) AS claim_index_rows,"
+        " (SELECT COUNT(*) FROM timeline_events) AS timeline_events,"
+        " (SELECT COUNT(*) FROM claims c WHERE NOT EXISTS ("
+        "     SELECT 1 FROM claim_index i WHERE i.claim_id = c.claim_id)) AS claims_unindexed,"
+        " (SELECT COUNT(*) FROM timeline_events e WHERE e.claim_id IS NOT NULL AND NOT EXISTS ("
+        "     SELECT 1 FROM claims c WHERE c.claim_id = e.claim_id)) AS timeline_orphans,"
+        " (SELECT COUNT(*) FROM governance_queue) AS governance_items,"
+        " (SELECT COUNT(*) FROM mutation_outbox WHERE status IN ('pending','processing','retrying'))"
+        " AS outbox_lag"
+    ).fetchone()
+    return {key: int(row[key]) for key in row.keys()}
+
+
+def _page_projection_health() -> tuple[str, str]:
+    from vector_lake import db_store
+
+    counts = _counts(db_store.get_connection())
+    if counts["outbox_lag"]:
+        return DEGRADED, (
+            f"{counts['outbox_lag']} durable mutation(s) not yet materialised "
+            f"(index.json holds {counts['nodes']} node(s), {counts['edges']} edge(s))"
+        )
+    return HEALTHY, f"index.json current: {counts['nodes']} node(s), {counts['edges']} edge(s)"
+
+
+def _page_projection_repair() -> str:
+    from vector_lake.watchdog_app import process_mutation_outbox_batch
+
+    stats = process_mutation_outbox_batch(limit=200)
+    return f"drained outbox: {stats}"
+
+
+def _fts_health() -> tuple[str, str]:
+    from vector_lake import db_store
+
+    counts = _counts(db_store.get_connection())
+    if counts["fts_rows"] < counts["nodes"]:
+        return DEGRADED, (
+            f"{counts['nodes'] - counts['fts_rows']} row(s) short of {counts['nodes']} page(s) "
+            "(the lexical half of hybrid retrieval cannot see them)"
+        )
+    return HEALTHY, f"{counts['fts_rows']}/{counts['nodes']} page(s) indexed"
+
+
+def _tantivy_health() -> tuple[str, str]:
+    from vector_lake import db_store, tantivy_index
+
+    if not tantivy_index.enabled():
+        return HEALTHY, "not in use (VECTOR_LAKE_FTS=fts5)"
+    counts = _counts(db_store.get_connection())
+    stats = tantivy_index.stats()
+    if not stats["exists"]:
+        return DEGRADED, "enabled but no index directory exists"
+    if stats["docs"] < counts["fts_rows"]:
+        return DEGRADED, f"{stats['docs']} document(s) vs {counts['fts_rows']} FTS row(s) -- mirror behind"
+    return HEALTHY, f"{stats['docs']} document(s), mirror current"
+
+
+def _claim_index_health() -> tuple[str, str]:
+    from vector_lake import db_store
+
+    counts = _counts(db_store.get_connection())
+    if counts["claims_unindexed"] or counts["claim_index_rows"] < counts["claims"]:
+        short = max(counts["claims_unindexed"], counts["claims"] - counts["claim_index_rows"])
+        return DEGRADED, (
+            f"{short} of {counts['claims']} claim(s) not in claim_index "
+            "(claim search cannot find them)"
+        )
+    return HEALTHY, f"{counts['claims']} claim(s) indexed"
+
+
+def _timeline_health() -> tuple[str, str]:
+    from vector_lake import db_store
+
+    counts = _counts(db_store.get_connection())
+    if counts["timeline_orphans"]:
+        return DEGRADED, (
+            f"{counts['timeline_orphans']} timeline event(s) name a claim that no longer exists "
+            f"(of {counts['timeline_events']} event(s))"
+        )
+    return HEALTHY, f"{counts['timeline_events']} event(s) over {counts['claims']} claim(s)"
+
+
+def _timeline_repair() -> str:
+    from vector_lake import tool_timeline
+
+    return tool_timeline.rebuild_timeline_events_from_claims(dry_run=False)
+
+
+def _governance_health() -> tuple[str, str]:
+    from vector_lake import db_store
+
+    counts = _counts(db_store.get_connection())
+    return HEALTHY, (
+        f"{counts['governance_items']} item(s) queued for a human; state lives inside item data_json"
+    )
+
+
 PILOTS: tuple[Projection, ...] = (
     Projection(
         name="memory_gram",
@@ -110,6 +239,57 @@ PILOTS: tuple[Projection, ...] = (
         health=_vector_health,
         repair=_vector_repair,
         degrades="the vector half of hybrid retrieval for the pages that are missing one",
+    ),
+    Projection(
+        name="page_projection",
+        authority="SQLite canonical state (page_index_nodes / mutation_outbox)",
+        cost="one 200-row drain per reconcile (seconds); a full rebuild is `cli.py projection-rebuild`",
+        health=_page_projection_health,
+        repair=_page_projection_repair,
+        degrades="readers fall back to the raw index.json for anything the outbox has not materialised",
+    ),
+    Projection(
+        name="fts_index",
+        authority="page_index_nodes",
+        cost="no routine repair: a missing row is rebuilt by `cli.py projection-rebuild --apply`",
+        health=_fts_health,
+        repair=None,
+        degrades="the lexical half of hybrid retrieval for the pages that have no row",
+        manual_entry="python cli.py projection-rebuild --apply",
+    ),
+    Projection(
+        name="tantivy_mirror",
+        authority="wiki_search_index (the FTS5 projection stays authoritative)",
+        cost="~8 s to rebuild from the FTS5 table alone (measured 2026-09-25: 7 139 documents)",
+        health=_tantivy_health,
+        repair=_tantivy_repair,
+        degrades="nothing while VECTOR_LAKE_FTS=fts5; otherwise the lexical half",
+    ),
+    Projection(
+        name="claim_index",
+        authority="claims",
+        cost="no routine repair: rows are written by the extractor's finalize path",
+        health=_claim_index_health,
+        repair=None,
+        degrades="claim search for the unindexed claims",
+        manual_entry="re-extract the affected pages (`cli.py ingest-tasks`) -- there is no rebuild entry point",
+    ),
+    Projection(
+        name="timeline_events",
+        authority="claims",
+        cost="rebuild from claims, bounded by `limit`",
+        health=_timeline_health,
+        repair=_timeline_repair,
+        degrades="timeline queries that point at removed claims",
+    ),
+    Projection(
+        name="governance_queue",
+        authority="(a human queue, not derived from the corpus)",
+        cost="no automatic repair by design: resolving an item is a judgement, not a rebuild",
+        health=_governance_health,
+        repair=None,
+        degrades="nothing mechanically; unresolved items are knowledge debt",
+        manual_entry="`cli.py debt` to inspect, `cli.py resolve` / the review skills to close items",
     ),
 )
 
@@ -132,6 +312,8 @@ def status() -> dict[str, dict]:
             "authority": projection.authority,
             "cost": projection.cost,
             "degrades": projection.degrades,
+            "repairable": projection.repairable,
+            "manual_entry": projection.manual_entry,
         }
     return report
 
@@ -140,7 +322,8 @@ def reconcile(only: str | None = None, dry_run: bool = False) -> dict[str, dict]
     """Repair every unhealthy projection (or one named one), containing each failure.
 
     Containment is the point: one projection failing to repair must not stop the others, which is
-    what the ad-hoc halves in ``periodic_catch_up`` each had to implement separately.
+    what the ad-hoc halves in ``periodic_catch_up`` each had to implement separately.  A projection
+    with ``repair is None`` is reported as ``manual`` with its entry point -- never silently skipped.
     """
     results: dict[str, dict] = {}
     for projection in registry():
@@ -149,6 +332,12 @@ def reconcile(only: str | None = None, dry_run: bool = False) -> dict[str, dict]
         state, detail = projection.health()
         if state == HEALTHY:
             results[projection.name] = {"action": "none", "state": state, "detail": detail}
+            continue
+        if projection.repair is None:
+            results[projection.name] = {
+                "action": "manual", "state": state, "detail": detail,
+                "entry": projection.manual_entry or "(no entry point recorded)",
+            }
             continue
         if dry_run:
             results[projection.name] = {"action": "would-repair", "state": state, "detail": detail}

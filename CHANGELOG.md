@@ -1,5 +1,28 @@
 # Unreleased
 
+## 投影注册表迁到全 8 条；过程中撞到一个 271 秒的「健康检查」
+
+把剩下六条也迁进注册表，每条都接**已有的**信号与修复入口，不自造语义：
+
+| 投影 | 健康信号 | 修复 |
+|---|---|---|
+| `page_projection` | outbox 滞后行数 + 节点/边计数 | 冲一批 200 行 outbox（routine）；全量重建仍是 `cli.py projection-rebuild` |
+| `fts_index` | 行数缺口（`fts_rows` vs `pages`）| **无自动修复** → `cli.py projection-rebuild --apply` |
+| `tantivy_mirror` | `stats()['docs']` vs FTS 行数（未启用时报 not in use）| `rebuild_from_sqlite()`（实测 ~8 s）|
+| `claim_index` | `claim_index` 行数缺口 + 已索引的 anti-join（35 ms）| **无自动修复** → 重抽页面（无重建入口，已声明）|
+| `timeline_events` | 孤儿事件（claim_id 已不在 claims，anti-join 10 ms）| `rebuild_timeline_events_from_claims` |
+| `governance_queue` | 排队条目数（状态在 `data_json` 里，不能靠列查）| **无自动修复**：清一条是判断，不是重建 → `cli.py debt` / resolve |
+
+新增不变式（测试钉住）：**`repair is None` 的投影必须给出 `manual_entry`** —— “没有自动修复”是对系统的陈述，不是可以拿猜测填上的洞。注册表测试 9 → 16 项。
+
+**撞到的东西比迁移本身重要**：我第一版给 FTS 覆盖率用的是 anti-join
+`page_index_nodes NOT EXISTS wiki_search_index`，实测 **271 秒**——而它确实是问题源头（另外两个 anti-join 只要 10 ms / 35 ms）：
+FTS5 表**无法服务 `node_key = ?`**，所以那 7 139 次探测每次都全扫一遍。七个信号的逐个计时：普通 COUNT 0.1–46 ms、向量未盖章 anti-join 16 ms、FTS anti-join >90 s（未跑完）。
+现在 FTS 覆盖率用**行数缺口**表达（46 + 0.3 ms），“具体是哪几页”留给重建路径；整表 `status()` 从 271 s/次 → **646 ms**（八条全查）。
+
+这条更正也适用于我自己：会话中段我在同一个库上跑过那三个 anti-join，把输出读成了“瞬间返回”，因为工具调用在它那个很宽的 timeout 里完成了——实际花了约 5 分钟。
+**在 timeout 内返回不等于快**；要计时，不要凭印象。
+
 ## P0–P3：可归因、可回收、不停服、投影健康成状态；本地嵌入模型本轮**不做**
 
 按前面的架构审查分四批落地。每批都带验收证据，下面按批记。

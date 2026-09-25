@@ -15,11 +15,107 @@ from vector_lake import db_store, periodic_catch_up, projection_registry
 def test_every_projection_declares_its_contract():
     pilots = projection_registry.registry()
 
-    assert {p.name for p in pilots} == {"memory_gram", "vectors"}
+    assert {p.name for p in pilots} == {
+        "memory_gram", "vectors", "page_projection", "fts_index",
+        "tantivy_mirror", "claim_index", "timeline_events", "governance_queue",
+    }
     for projection in pilots:
         assert projection.authority, f"{projection.name} must name what it derives from"
         assert projection.cost, f"{projection.name} must state what a repair costs"
         assert projection.degrades, f"{projection.name} must state what degrades"
+        if projection.repair is None:
+            assert projection.manual_entry, (
+                f"{projection.name} has no automatic repair, so it must say what a human runs"
+            )
+
+
+def test_a_projection_without_a_repair_is_reported_as_manual(monkeypatch):
+    """No routine repair is a statement about the system, not a hole to fill with a guess."""
+    monkeypatch.setattr(
+        projection_registry,
+        "PILOTS",
+        (
+            projection_registry.Projection(
+                "human", "a", "c",
+                lambda: (projection_registry.DEGRADED, "7 item(s) queued"),
+                None, "knowledge debt", "python cli.py debt",
+            ),
+        ),
+    )
+
+    result = projection_registry.reconcile()["human"]
+
+    assert result["action"] == "manual"
+    assert result["entry"] == "python cli.py debt"
+
+
+def _with_counts(monkeypatch, **overrides):
+    """Craft a counts dict, so the verdict logic is tested without building every schema."""
+    base = {
+        "nodes": 100, "edges": 200, "fts_rows": 100, "claims": 50, "claim_index_rows": 50,
+        "timeline_events": 10, "claims_unindexed": 0, "timeline_orphans": 0,
+        "governance_items": 3, "outbox_lag": 0,
+    }
+    base.update(overrides)
+    monkeypatch.setattr(projection_registry, "_counts", lambda conn=None: base)
+    return base
+
+
+def test_fts_health_reports_a_count_shortfall(monkeypatch):
+    _with_counts(monkeypatch, fts_rows=97)
+
+    state, detail = projection_registry._fts_health()
+
+    assert state == projection_registry.DEGRADED
+    assert "3 row(s) short of 100 page(s)" in detail
+
+
+def test_page_projection_health_reports_outbox_lag(monkeypatch):
+    _with_counts(monkeypatch, outbox_lag=4)
+
+    state, detail = projection_registry._page_projection_health()
+
+    assert state == projection_registry.DEGRADED
+    assert "4 durable mutation(s) not yet materialised" in detail
+
+
+def test_claim_index_health_reports_a_shortfall(monkeypatch):
+    _with_counts(monkeypatch, claim_index_rows=48)
+
+    state, detail = projection_registry._claim_index_health()
+
+    assert state == projection_registry.DEGRADED
+    assert "2 of 50 claim(s)" in detail
+
+
+def test_timeline_health_reports_orphans(monkeypatch):
+    _with_counts(monkeypatch, timeline_orphans=3)
+
+    state, detail = projection_registry._timeline_health()
+
+    assert state == projection_registry.DEGRADED
+    assert "3 timeline event(s)" in detail
+
+
+def test_tantivy_mirror_is_healthy_when_not_in_use(monkeypatch):
+    from vector_lake import tantivy_index
+
+    monkeypatch.delenv("VECTOR_LAKE_FTS", raising=False)
+    monkeypatch.setattr(tantivy_index, "enabled", lambda: False)
+
+    state, detail = projection_registry._tantivy_health()
+
+    assert state == projection_registry.HEALTHY
+    assert "not in use" in detail
+
+
+def test_governance_is_reported_as_a_human_queue(monkeypatch):
+    _with_counts(monkeypatch, governance_items=14545)
+
+    state, detail = projection_registry._governance_health()
+
+    assert state == projection_registry.HEALTHY
+    assert "14545 item(s)" in detail and "human" in detail
 
 
 def test_gram_health_reports_the_degradation_with_counts(monkeypatch):
