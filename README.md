@@ -765,7 +765,7 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 本次会话实测结果（2026-09-25 下午）：模型缝失败证据、守护进程监听换 `watchfiles`、tantivy 后端（开关默认关）、
 `author_page_keys` 取数与缓存键、gram 重建门改成按检索次数摊销、claim 块提取换 Rust。
 
-- `python -m pytest -p no:cacheprovider -q` → **1661 passed**（本会话新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、投影注册表 19、outbox 保留/台账 10、FTS 保留词转义 6、rerank 契约 16 等；
+- `python -m pytest -p no:cacheprovider -q` → **1666 passed**（本会话新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、投影注册表 19、outbox 保留/台账 10、FTS 保留词转义 6、MCP 接口优化 4、rerank 契约 16 等；
   同时把 `tests/test_rerank_bm25s.py` 更名为 `test_rerank_candidates.py`）。
 - `python cli.py gram-index --apply` → 340 482 gram / 14 473 499 posting / 69 929 文档，phase `stage=58.0s, pack=16.5s, publish=2.0s`（比旧注释里的 ~430 s 快得多，语料也更小）；
   重建后 `dirty=0`、`gram_index_usable()=True`，可用性检查 15.8 ms/次 → 0.1 ms/次。

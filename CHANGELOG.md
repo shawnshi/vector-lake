@@ -1,5 +1,20 @@
 # Unreleased
 
+## MCP 工具表面优化（vector-lake-mcp surface refinement）
+
+针对 MCP 接口审计中暴露的工具超载、参数阉割与写盘摩擦问题，完成 5 项优化重构并全部通过验证：
+
+- **新增 `inspect_projections`**：将分散的投影检查整合为一个标准 MCP 工具，单次调用返回全部 8 个派生投影（memory_gram, vectors, page_projection, fts_index, tantivy_mirror, claim_index, timeline_events, governance_queue）的健康、权威与降级状态。
+- **补全 `search_vector_lake` 过滤参数**：在 MCP 工具签名中显式补充 `domain`, `cluster`, `include_history`, `as_xml` 等高级过滤参数并透传至底层引擎，避免大模型只能通过 prompt 拼接无效文本约束。
+- **`update_operational_memory` 支持直接文本输入**：新增 `content: str = ""` 参数，智能体保存偏好或决策无需强制在沙箱物理落盘 `payload_file`，消除写盘摩擦并保留文件模式兼容。
+- **`resolve_governance_item` 支持直接 JSON 输入**：新增 `manifest_json: str = ""` 参数，避免审查闭环时强制创建 `scratch/*.json` 临时文件的额外 I/O。
+- **文档契约明确与内部工具标记**：
+  - `write_wiki_page` 明确标注为单页原子修改，`finalize_query_synthesis` 标注为推理完成后的合流与建桩闭环；
+  - 底层重型/全量重建工具标注 `[MAINTENANCE / REPAIR / DISASTER RECOVERY]`，引导优先使用宿主 CLI；
+  - 调度器内部队列处理工具标注 `[SCHEDULER / INTERNAL]`，降低 LLM 误触概率。
+- 配套新增 `tests/test_mcp_surface_improvements.py` 4 项专项测试，总测试增至 **1666 passed**。
+
+
 ## 检索、推理与时间线（search / query / timeline）P0-P2 稳定性与性能深度优化
 
 针对三模块深度审计中暴露的稳定性和性能瓶颈，分步落地 6 项优化并全部通过验证：

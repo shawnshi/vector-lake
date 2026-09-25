@@ -92,7 +92,7 @@ def search_timeline(entity_name: str = "", action: str = "", limit: int = 10) ->
 
 @mcp.tool()
 def rebuild_timeline_events(dry_run: bool = True, limit: int = 0) -> str:
-    """Rebuild the timeline_events projection from timeline-event claims."""
+    """[MAINTENANCE / REPAIR] Rebuild the timeline_events projection from timeline-event claims. Prefer CLI 'cli.py projections --reconcile --only timeline_events'."""
     return tools.rebuild_timeline_events_from_claims(
         dry_run=dry_run,
         limit=limit if limit and limit > 0 else None,
@@ -110,7 +110,7 @@ def memory_gram_index_status() -> str:
 
 @mcp.tool()
 def rebuild_memory_gram_index(dry_run: bool = True) -> str:
-    """Bulk-rebuild the operational-memory n-gram index (minutes on a large corpus)."""
+    """[MAINTENANCE / HEAVY] Bulk-rebuild the operational-memory n-gram index (minutes on a large corpus). Prefer CLI 'cli.py gram-index --apply' or background daemon."""
     return tools.rebuild_memory_gram_index(dry_run=dry_run)
 
 @mcp.tool()
@@ -143,7 +143,7 @@ def idempotency_index_status() -> str:
 
 @mcp.tool()
 def repair_idempotency_keys(table: str = "mutation_outbox", dry_run: bool = True) -> str:
-    """Clear the redundant idempotency keys so the full unique index can be created.
+    """[MAINTENANCE / REPAIR] Clear redundant idempotency keys so the full unique index can be created. Prefer CLI 'cli.py repair-idempotency'.
 
     Use this after ``idempotency_index_status`` reports ``active`` or ``absent``.
     Only the duplicate *key* is cleared: the row, its status, timestamps, error text
@@ -157,23 +157,41 @@ def repair_idempotency_keys(table: str = "mutation_outbox", dry_run: bool = True
     return tools.repair_idempotency_keys(table=table, dry_run=dry_run)
 
 @mcp.tool()
+def inspect_projections() -> str:
+    """Report health, authorities, and degradation status of all derived projections.
+
+    Covers memory_gram, vectors, page_projection, fts_index, tantivy_mirror,
+    claim_index, timeline_events, and governance_queue in one unified call.
+    """
+    from vector_lake import projection_registry
+
+    lines = []
+    for name, entry in projection_registry.status().items():
+        kind = "auto" if entry["repairable"] else "manual"
+        line = f"[{entry['state'].upper():8s}] {name:18s} [{kind:6s}] {entry['detail']} (authority: {entry['authority']})"
+        if entry["state"] != "healthy" and entry.get("degrades"):
+            line += f" -> degrades: {entry['degrades']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+@mcp.tool()
 def projection_report(limit: int = 20) -> str:
     """Report drift between Wiki pages, SQLite canonical entities, and index.json."""
     return tools.projection_diff_report(limit=limit)
 
 @mcp.tool()
 def canonical_backfill(dry_run: bool = True, limit: int = 50) -> str:
-    """Backfill missing SQLite canonical rows from existing Wiki pages."""
+    """[MAINTENANCE / DISASTER RECOVERY] Backfill missing SQLite canonical rows from existing Wiki pages. Prefer CLI 'cli.py canonical-backfill'."""
     return tools.canonical_backfill_missing_wiki(dry_run=dry_run, limit=limit)
 
 @mcp.tool()
 def projection_rebuild_index(dry_run: bool = True) -> str:
-    """Rebuild index.json, FTS, embeddings, and claim_topology from SQLite canonical state."""
+    """[MAINTENANCE / DISASTER RECOVERY] Rebuild index.json, FTS, embeddings, and claim_topology from SQLite canonical state. Prefer CLI 'cli.py projection-rebuild-index'."""
     return tools.rebuild_index_projection(dry_run=dry_run)
 
 @mcp.tool()
 def embedding_backfill(dry_run: bool = True, limit: int = 0, include_existing: bool = False) -> str:
-    """Backfill missing vector embeddings under RPM/TPM rate limits."""
+    """[MAINTENANCE / HEAVY] Backfill missing vector embeddings under RPM/TPM rate limits. Prefer CLI 'cli.py embedding-backfill'."""
     return tools.embedding_backfill_projection(
         dry_run=dry_run,
         limit=limit if limit and limit > 0 else None,
@@ -182,19 +200,39 @@ def embedding_backfill(dry_run: bool = True, limit: int = 0, include_existing: b
 
 @mcp.tool()
 def wiki_restore(dry_run: bool = True, limit: int = 10) -> str:
-    """Restore missing Wiki Markdown pages from canonical metadata."""
+    """[MAINTENANCE / DISASTER RECOVERY] Restore missing Wiki Markdown pages from canonical metadata. Prefer CLI 'cli.py wiki-restore'."""
     return tools.restore_missing_wiki_from_canonical(dry_run=dry_run, limit=limit)
 
 @mcp.tool()
-def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
+def search_vector_lake(
+    query: str,
+    top_k: int = 5,
+    mode: str = "page",
+    domain: str = "",
+    cluster: str = "",
+    include_history: bool = False,
+    as_xml: bool = False,
+) -> str:
     """Search the Vector Lake index.
     
     Args:
         query: The semantic query string.
-        top_k: Number of results to return.
-        mode: Search mode, can be 'page', 'memory', or 'claim'.
+        top_k: Number of results to return (default 5).
+        mode: Search mode: 'page' (hybrid lexical + vector + PPR), 'memory' (operational memory), or 'claim' (facts).
+        domain: Optional filter by domain (e.g. 'HIT', 'Clinical', 'General').
+        cluster: Optional filter by topic cluster.
+        include_history: If True, includes historical/decayed nodes or expired memories.
+        as_xml: If True, returns structured XML evidence nodes instead of Markdown.
     """
-    return tools.search_vector_lake(query, top_k, mode=mode)
+    return tools.search_vector_lake(
+        query,
+        top_k,
+        as_xml=as_xml,
+        domain=domain if domain else None,
+        cluster=cluster if cluster else None,
+        include_history=include_history,
+        mode=mode,
+    )
 
 def _payload_path_allowed(abs_path) -> bool:
     """Sandbox predicate for agent payload files.
@@ -240,18 +278,24 @@ def _read_payload(payload_file: str) -> str:
         return f.read()
 
 @mcp.tool()
-def update_operational_memory(memory_type: str, payload_file: str) -> str:
+def update_operational_memory(memory_type: str, payload_file: str = "", content: str = "") -> str:
     """Safely persist an operational memory (preference, decision, fact, task_state) without corrupting the graph.
     
     Args:
         memory_type: Type of memory ('preference', 'decision', 'fact', 'task_state').
-        payload_file: Absolute path to a temporary file containing the text content of the memory.
+        payload_file: Absolute path to a temporary file containing the text content of the memory (optional if content is provided).
+        content: Direct text content of the memory to persist (optional if payload_file is provided).
     """
-    try:
-        content = _read_payload(payload_file)
-    except Exception as e:
-        return str(e)
-    return tool_memory.update_operational_memory(memory_type, content)
+    if not content and not payload_file:
+        return "Error: Either 'content' or 'payload_file' must be provided."
+    if content:
+        text_content = content
+    else:
+        try:
+            text_content = _read_payload(payload_file)
+        except Exception as e:
+            return str(e)
+    return tool_memory.update_operational_memory(memory_type, text_content)
 
 @mcp.tool()
 def sync_vector_lake() -> str:
@@ -333,17 +377,28 @@ def review_governance_list() -> str:
     return tools.review_vector_lake(action="list")
 
 @mcp.tool()
-def resolve_governance_item(item_id: str, resolution: str, payload_file: str = None) -> str:
+def resolve_governance_item(
+    item_id: str,
+    resolution: str,
+    payload_file: str = "",
+    manifest_json: str = "",
+) -> str:
     """Resolve a governance item.
 
     Args:
         item_id: The ID or index of the item.
         resolution: Resolution action: 'skip', 'create', 'merge', 'acknowledge'.
         payload_file: Optional absolute path to a temporary JSON file containing the expected outcome manifest (e.g. {"allow_cycles": false}).
+        manifest_json: Optional direct JSON string of the manifest, avoiding scratch file creation.
     """
     import json
     manifest = None
-    if payload_file:
+    if manifest_json:
+        try:
+            manifest = json.loads(manifest_json)
+        except json.JSONDecodeError as e:
+            return f"[JSON Error] Failed to parse manifest_json: {e}. Please fix the JSON and retry."
+    elif payload_file:
         try:
             manifest_str = _read_payload(payload_file)
             if manifest_str.strip():
@@ -464,31 +519,31 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
 
 @mcp.tool()
 def list_terminal_failed_ingest_jobs() -> str:
-    """List ingest jobs that spent their attempt budget, with the source each names."""
+    """[SCHEDULER / INTERNAL] List ingest jobs that spent their attempt budget, with the source each names."""
     return tools.list_terminal_failed_ingest_jobs()
 
 
 @mcp.tool()
 def close_terminal_failed_ingest_jobs(source_ingested_only: bool = True) -> str:
-    """Mark terminal-failed jobs superseded once their source has been ingested."""
+    """[SCHEDULER / INTERNAL] Mark terminal-failed jobs superseded once their source has been ingested."""
     return tools.close_terminal_failed_ingest_jobs(source_ingested_only=source_ingested_only)
 
 
 @mcp.tool()
 def list_abandoned_ingest_sources() -> str:
-    """List raw sources withheld from dispatch after repeated deterministic failures."""
+    """[SCHEDULER / INTERNAL] List raw sources withheld from dispatch after repeated deterministic failures."""
     return tools.list_abandoned_ingest_sources()
 
 
 @mcp.tool()
 def clear_abandoned_ingest_sources(filepath: str = "") -> str:
-    """Allow abandoned ingest source(s) to be dispatched again (empty filepath = all)."""
+    """[SCHEDULER / INTERNAL] Allow abandoned ingest source(s) to be dispatched again (empty filepath = all)."""
     return tools.clear_abandoned_ingest_sources(filepath or None)
 
 
 @mcp.tool()
 def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
-    """Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
+    """[SCHEDULER / INTERNAL] Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
     return tools.expire_ingest_tasks(max_age_seconds=max_age_seconds)
 
 @mcp.tool()
@@ -551,7 +606,10 @@ def visualize_vector_lake(output_dir: str = None) -> str:
 
 @mcp.tool()
 def write_wiki_page(filename: str, payload_file: str) -> str:
-    """Write or update a Vector Lake wiki page safely.
+    """Write or update a single Vector Lake wiki page safely (atomic mutation for manual or ad-hoc page updates).
+
+    Runs schema validation and the mutation coordinator. For bulk synthesis output resulting from
+    query_logic_lake reasoning, write files in scratch/ and use finalize_query_synthesis instead.
     
     Args:
         filename: The filename (e.g. 'Concept_Example.md').
