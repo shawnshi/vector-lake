@@ -56,9 +56,17 @@ VALID_BACKENDS = ("rjieba",)
 #
 # Recorded because the crate version is NOT discoverable at runtime: rjieba
 # exposes no __version__, and its Cargo.toml pins `jieba-rs = "0.9.0"` (verified
-# from the rjieba 0.2.1 sdist).  jieba-rs 0.11.0 was published 2026-09-16 before
-# any binding followed, so the crate in force is behind the requested version.
-# Update this constant when a binding for a newer crate is released.
+# from the rjieba 0.2.1 sdist).  Update this constant when the ACTIVE backend's crate moves.
+#
+# 2026-09-25: the pin is no longer stuck on upstream's release schedule --
+# `crates/vector_lake_core` now depends on `jieba-rs = "0.11"` itself and exposes
+# `cut` / `cut_joined` with rjieba's call shape, so this constant still describes
+# the backend that is in force (rjieba) but 0.11 is buildable in-tree.  Measured
+# parity over 250 pages / 500 strings: the CJK token stream is identical
+# (500/500, 0 differing positions), while punctuation/ASCII runs change
+# (`Concept_1 - 0` -> `Concept_1-0`).  Switching the backend is therefore a
+# punctuation-level change that still rebuilds every lexical index (this module's
+# version is part of the FTS cache key) and still needs the eval gate.
 JIEBA_RS_PINNED = "0.9.x"
 RJIEBA_TESTED_VERSION = "0.2.1"
 

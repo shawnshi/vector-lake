@@ -34,7 +34,7 @@ def _specifier(name: str) -> str | None:
 @pytest.mark.parametrize(
     "name",
     ["filelock", "python-dotenv", "igraph", "leidenalg", "PyYAML",
-     "watchdog", "google-genai", "fastmcp", "sqlite-vec", "mistune", "bm25s"],
+     "watchfiles", "google-genai", "fastmcp", "sqlite-vec", "tantivy", "mistune"],
 )
 def test_required_dependency_is_declared(name):
     assert _specifier(name) is not None, f"{name} missing from requirements.txt"
@@ -67,7 +67,7 @@ def test_python_louvain_is_removed_everywhere():
         ("PyYAML", "6.0.1"),
         ("google-genai", "2.0.0"),
         ("sqlite-vec", "0.1.3"),
-        ("bm25s", "0.2.0"),
+        ("tantivy", "0.26"),
     ],
 )
 def test_declared_floor_matches_the_requested_minimum(name, minimum):
@@ -105,6 +105,44 @@ def test_mistune_floor_is_above_the_broken_3_0_0():
     assert ">=3.0.1" in line.replace(" ", ""), (
         "mistune 3.0.0 breaks create_markdown(renderer='ast'); the floor must be 3.0.1"
     )
+
+
+def test_watchdog_is_gone_and_watchfiles_is_imported():
+    """The filesystem watcher moved to the Rust ``notify`` crate on 2026-09-25.
+
+    Same ritual as the jieba/networkx removal: the pin is gone *and* the tree is checked, so a
+    stale ``watchdog`` pin or import cannot quietly come back.  The handlers' event surface is
+    a local shim now, which is why the check is on the import, not on the handler shape.
+    """
+    assert _specifier("watchdog") is None, "watchdog is no longer the watcher"
+    pinned = [
+        line.strip()
+        for line in LOCK.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not [line for line in pinned if line.startswith("watchdog==")]
+    source = (ROOT / "vector_lake" / "watchdog_app.py").read_text(encoding="utf-8")
+    assert "from watchfiles import" in source
+    assert "import watchdog" not in source and "from watchdog" not in source
+
+
+def test_bm25s_is_gone_and_the_rerank_is_mandatory_rust():
+    """The pool reranker moved into the Rust core on 2026-09-25.
+
+    Same ritual as the jieba/networkx/watchdog removals: the pin is gone *and* the tree is checked,
+    so a stale ``bm25s`` pin or import cannot come back silently.  The behaviour without the core is
+    pinned in ``tests/test_rerank_candidates.py`` (fail open, upstream order, WARNING logged).
+    """
+    assert _specifier("bm25s") is None, "the pool rerank no longer has a Python engine"
+    pinned = [
+        line.strip()
+        for line in LOCK.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not [line for line in pinned if line.startswith("bm25s==")]
+    source = (ROOT / "vector_lake" / "tool_search.py").read_text(encoding="utf-8")
+    assert "fast_bm25_rerank" in source
+    assert "import bm25s" not in source and "bm25s." not in source
 
 
 def test_every_required_package_is_pinned_in_the_lock():

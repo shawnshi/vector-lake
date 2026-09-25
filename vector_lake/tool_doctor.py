@@ -78,13 +78,13 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
         "google.genai": "google-genai",
         "filelock": "filelock",
         "yaml": "PyYAML",
-        "watchdog": "watchdog",
+        "watchfiles": "watchfiles",
         "igraph": "igraph",
         "leidenalg": "leidenalg",
-        "bm25s": "bm25s",
         "dotenv": "python-dotenv",
         "fastmcp": "fastmcp",
         "sqlite_vec": "sqlite-vec",
+        "tantivy": "tantivy",
         "mistune": "mistune"
     }
     for module_name, package_name in dependencies.items():

@@ -1523,6 +1523,19 @@ def _page_index_state_format_is_stale(conn: sqlite3.Connection) -> bool:
     return "edge_digest" not in _table_columns(conn, "page_index_state")
 
 
+def _jobs_ledger_index_is_stale(conn: sqlite3.Connection) -> bool:
+    """Whether the jobs table lacks ``idx_jobs_updated_at``.
+
+    Same reason :func:`_om_probability_format_is_stale` exists: ``CREATE INDEX`` lives inside
+    ``_init_db_once``, and ``init_db()`` short-circuits whenever the schema already looks complete,
+    so a new index added there would only ever reach databases created after the change.  On this
+    host that was measurable -- the index was created by hand at 151 ms and the author facet's
+    invalidation read went from 146 ms to 0.2 ms, while a fresh ``init_db()`` kept skipping it.
+    Requiring the index here makes the DDL run exactly once on an existing database.
+    """
+    return not {"idx_jobs_updated_at"} <= _index_names(conn)
+
+
 def init_db():
     db_path = get_db_path()
     db_key = str(db_path.resolve())
@@ -1539,6 +1552,7 @@ def init_db():
             and not _om_probability_format_is_stale(get_connection())
             and not _claims_format_is_stale(get_connection())
             and not _timeline_format_is_stale(get_connection())
+            and not _jobs_ledger_index_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1906,6 +1920,13 @@ def _init_db_once(db_key: str):
         # hold duplicate keys, and failing here would make init_db() - and
         # therefore every command in a fresh process - unusable.
         _ensure_idempotency_index(conn, "jobs", "idx_jobs_idempotency")
+
+        # The author facet invalidates on ``(COUNT(*), MAX(updated_at))`` of this table, and
+        # without an index that key read is a full scan that has to walk every row -- measured
+        # 259 ms on 2026-09-25 against 3.8k rows whose payloads hold ~157 MB of ingest prompts.
+        # The index makes both halves an index-only lookup, so the facet can cheaply notice a
+        # ledger change instead of being recomputed on every query.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at)")
         
         # Add expression-based indexes for performance
         try:
@@ -1929,9 +1950,38 @@ def _init_db_once(db_key: str):
 
 
 
+def _tantivy():
+    """The optional tantivy mirror for the FTS projection, or ``None`` when it is off.
+
+    Switch-gated by ``VECTOR_LAKE_FTS`` (default ``fts5``).  Every mirror call is wrapped by the
+    caller so an auxiliary index can never lose a page write; the FTS5 tables stay authoritative
+    and ``tantivy_index.rebuild_from_sqlite`` can rebuild the mirror from them at any time.
+    """
+    from vector_lake import tantivy_index
+
+    return tantivy_index if tantivy_index.enabled() else None
+
+
+def _tan_quiet(action, *args, **kwargs):
+    """Run a mirror operation, logging rather than raising: a mirror must not fail a write."""
+    try:
+        return action(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - deliberate: the authoritative write already landed
+        logging.getLogger("vector-lake-tantivy").warning(
+            "tantivy mirror %s failed: %s: %s (rebuild with tantivy_index.rebuild_from_sqlite)",
+            getattr(action, "__name__", action), type(exc).__name__, exc,
+        )
+        return None
+
+
 def search_index_keys() -> set[str]:
     """Every node_key currently materialised in the FTS projection."""
     init_db()
+    mirror = _tantivy()
+    if mirror is not None:
+        keys = _tan_quiet(mirror.search_keys)
+        if keys is not None:
+            return keys
     return {
         row["node_key"]
         for row in get_connection().execute("SELECT DISTINCT node_key FROM wiki_search_index")
@@ -1957,6 +2007,9 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str, cont
                 "INSERT OR REPLACE INTO wiki_search_index_state (node_key, content_hash, updated_at) VALUES (?, ?, ?)",
                 (node_key, content_hash, datetime.now(timezone.utc).isoformat()),
             )
+    mirror = _tantivy()
+    if mirror is not None:
+        _tan_quiet(mirror.upsert, node_key, title, summary, text)
 
 
 def clear_search_index():
@@ -1966,6 +2019,9 @@ def clear_search_index():
     with transaction():
         conn.execute("DELETE FROM wiki_search_index")
         conn.execute("DELETE FROM wiki_search_index_state")
+    mirror = _tantivy()
+    if mirror is not None:
+        _tan_quiet(mirror.clear)
 
 
 def search_index_state() -> dict[str, str]:
@@ -2122,6 +2178,9 @@ def delete_search_index(node_key: str):
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (node_key,))
+    mirror = _tantivy()
+    if mirror is not None:
+        _tan_quiet(mirror.delete_node, node_key)
 
 def delete_node_cascade(node_key: str):
     conn = get_connection()
@@ -2146,6 +2205,9 @@ def delete_node_cascade(node_key: str):
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
         conn.execute(f"DELETE FROM vec_embeddings WHERE page_key IN ({placeholders})", related_ids)
         conn.execute(f"DELETE FROM vec_embedding_inputs WHERE node_key IN ({placeholders})", related_ids)
+        mirror = _tantivy()
+        if mirror is not None:
+            _tan_quiet(mirror.delete_node, node_key)
         conn.execute(
             "DELETE FROM claims WHERE "
             "f_page_key = ? OR "
@@ -2384,10 +2446,37 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
     query_tok = query_tok.strip()
     if not query_tok:
         return []
-        
-    query_esc = " ".join(f'"{t}"' for t in query_tok.split())
 
     conn = get_connection()
+    mirror = _tantivy()
+    if mirror is not None:
+        # Ranking comes from tantivy, metadata from the authoritative projection (so a mirror
+        # that knows about more keys than the FTS table still cannot invent a page).
+        ranked = _tan_quiet(mirror.search, query_tok.split(), limit)
+        if ranked:
+            keys = [key for key, _ in ranked]
+            ranks = dict(ranked)
+            placeholders = ",".join("?" for _ in keys)
+            cur = conn.execute(
+                f"SELECT node_key, title, summary FROM wiki_search_index WHERE node_key IN ({placeholders})",
+                keys,
+            )
+            metadata = {row["node_key"]: (row["title"], row["summary"]) for row in cur.fetchall()}
+            return [
+                {
+                    "node_key": key,
+                    "title": metadata.get(key, ("", ""))[0],
+                    "summary": metadata.get(key, ("", ""))[1],
+                    "rank": ranks[key],
+                }
+                for key in keys
+                if key in metadata
+            ]
+        if ranked is not None:
+            return []
+
+    query_esc = " ".join(f'"{t}"' for t in query_tok.split())
+
     cur = conn.execute("""
         SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
         FROM wiki_search_index 

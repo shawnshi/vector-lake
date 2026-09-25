@@ -353,6 +353,21 @@ def _bootstrap_ci(differences: list[float]) -> tuple[float, float, float] | None
 RULE_PATH = REPO / "benchmarks" / "search_eval_rule.json"
 
 
+def _fts_backend() -> str:
+    """Which lexical backend this run actually uses, recorded in the run config.
+
+    Read through ``tantivy_index.enabled()`` rather than straight from the environment so the label
+    matches what the code would do -- an uninstalled wheel falls back to FTS5 with a warning, and a
+    run that fell back must not claim to be a tantivy run.
+    """
+    try:
+        from vector_lake import tantivy_index
+
+        return "tantivy" if tantivy_index.enabled() else "fts5"
+    except Exception:  # noqa: BLE001 - an absent module means the FTS5 path
+        return "fts5"
+
+
 def load_rule(path: pathlib.Path) -> dict:
     """Read the rule card, or fail closed.
 
@@ -830,6 +845,12 @@ def main() -> int:
             # scored on this label set: an audit of where the judged-relevant pages are lost found
             # 7 of 12 "in the pool, ranked out" pages were Sources, so its 0.6 is a hypothesis.
             "source_rank_penalty": os.environ.get("VECTOR_LAKE_SOURCE_RANK_PENALTY", ""),
+            # The lexical backend is a ranking input like the rest: it decides which candidates
+            # reach top_k and how the lexical signal scores.  Without it here, an FTS5 run and a
+            # tantivy run record the *same* configuration and --compare refuses the pair as
+            # "both runs used the same config", which is exactly what happened on 2026-09-25 while
+            # evaluating tantivy by hand with the switch set per arm.
+            "fts_backend": _fts_backend(),
             "top_k": args.top_k,
             "vectors": args.vectors,
             "labels": str(args.labels),

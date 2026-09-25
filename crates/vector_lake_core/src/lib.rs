@@ -6,6 +6,7 @@ mod graph_fusion;
 mod graph_topology;
 mod text_similarity;
 mod local_bm25;
+mod tokenizer;
 
 #[pyfunction]
 fn version() -> &'static str {
@@ -43,6 +44,10 @@ fn vector_lake_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // 模块 6: 候选池局部 BM25 内存重排
     m.add_function(wrap_pyfunction!(local_bm25::fast_bm25_rerank, m)?)?;
+
+    // 模块 7: CJK 分词（jieba-rs 由本 crate 自身钉定版本，不再由 rjieba wheel 决定）
+    m.add_function(wrap_pyfunction!(tokenizer::cut, m)?)?;
+    m.add_function(wrap_pyfunction!(tokenizer::cut_joined, m)?)?;
 
     Ok(())
 }

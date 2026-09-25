@@ -322,6 +322,46 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     try:
         from vector_lake.db_store import get_connection
         conn = get_connection()
+
+        # The switch has to be honoured *here* as well as in ``db_store.search_wiki``.  This
+        # function is the lexical half of the hybrid retrieval pipeline, and it queries
+        # ``wiki_search_index`` directly -- so when only that other site was wired, the
+        # ``VECTOR_LAKE_FTS`` switch was inert on the path that actually answers queries.  Measured:
+        # both arms of the round-3 eval returned byte-identical results and the same four FTS5
+        # failures, which is how the gap was found.
+        from vector_lake import tantivy_index
+
+        if tantivy_index.enabled():
+            # The same sanitized term list the FTS5 arm searches, so the comparison isolates the
+            # engine.  Term queries carry no syntax, so the `.`/`'` inputs that make FTS5 raise
+            # "syntax error near" simply match literally here.
+            ranked = tantivy_index.search(query_tok.split(), limit=limit)
+            if not ranked:
+                _LAST_FTS_ERROR.msg = None
+                return []
+            keys = [key for key, _score in ranked]
+            ranks = dict(ranked)
+            placeholders = ",".join("?" for _ in keys)
+            metadata = {
+                row["node_key"]: (row["title"], row["summary"])
+                for row in conn.execute(
+                    f"SELECT node_key, title, summary FROM wiki_search_index"
+                    f" WHERE node_key IN ({placeholders})",
+                    keys,
+                )
+            }
+            _LAST_FTS_ERROR.msg = None
+            return [
+                {
+                    "node_key": key,
+                    "title": metadata.get(key, ("", ""))[0],
+                    "summary": metadata.get(key, ("", ""))[1],
+                    "rank": ranks[key],
+                }
+                for key in keys
+                if key in metadata
+            ]
+
         cur = conn.execute("""
             SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
             FROM wiki_search_index 
@@ -689,9 +729,16 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
     recall is unchanged; this only re-orders within that pool and replaces the
     raw `-bm25` magnitudes that previously dominated the blend.
 
-    The lexical signal comes from ``bm25s`` over title + summary + aliases. The
-    page body is deliberately not read here: it would add per-candidate file IO
-    to every query, and ``index.json`` no longer carries it.
+    The lexical signal comes from ``vector_lake_core.fast_bm25_rerank`` (the Rust core) over title +
+    summary + aliases. The page body is deliberately not read here: it would add per-candidate file
+    IO to every query, and ``index.json`` no longer carries it.
+
+    Why the Rust path is **required** rather than preferred: a pure-Python BM25 reranker was kept as
+    a fallback for hosts without the extension, but the build path here is ``maturin develop`` and
+    ``tool_doctor`` already reports the core as a first-class check, so the fallback's only effect
+    was to make the same query pay a second, differently-scored engine on the hosts least able to
+    afford it.  Without the symbol the rerank degrades to the documented no-op
+    (``VECTOR_LAKE_RERANK_WEIGHT=0`` semantics: keep the upstream order) and says so at WARNING.
 
     Scores are **pool-normalised**, not absolute: min-max within the pool means
     the leading candidate always reports 1.0, and a pool with no lexical signal
@@ -713,10 +760,14 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
     if weight <= 0.0:
         return candidates
 
-    try:
-        import bm25s
-    except ImportError:
-        log.debug("bm25s is not installed; skipping local reranking.")
+    if not (HAVE_CORE and hasattr(vector_lake_core, "fast_bm25_rerank")):
+        # Fail open and loudly: with no reranker the upstream order stands, which is exactly what
+        # VECTOR_LAKE_RERANK_WEIGHT=0 means.  Silent here would hide a broken install, because the
+        # scores keep looking normalised either way.
+        log.warning(
+            "Local reranking unavailable: vector_lake_core.fast_bm25_rerank is missing "
+            "(build the Rust core with `maturin develop`); keeping upstream order."
+        )
         return candidates
 
     from vector_lake import tokenizer as _tokenizer
@@ -728,54 +779,33 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
             part for part in (str(node.get("title") or ""), str(node.get("summary") or ""), alias_text) if part
         ).strip()
 
-    # Pre-tokenize with the project tokenizer, then let bm25s bind the tokens by
-    # splitting on whitespace only (its default \w\w+ pattern cannot segment CJK).
+    # Pre-tokenize with the project tokenizer and hand the core whitespace-split tokens; the Rust
+    # side scores them and blends the upstream signal, so no second engine and no Python-side
+    # re-normalisation is involved.
     documents = [_tokenizer.tokenize_joined(_document(node)) for _, node in candidates]
     query_tokens = _tokenizer.cut(query)
     if not query_tokens or not any(documents):
         return candidates
 
     try:
-        if hasattr(bm25s, "BM25") and hasattr(bm25s.BM25, "index"):
-            if "Exploding" in getattr(bm25s, "__name__", "") or "Exploding" in getattr(bm25s.BM25, "__qualname__", ""):
-                bm25s.BM25().index([])
-
-        if HAVE_CORE and hasattr(vector_lake_core, "fast_bm25_rerank"):
-            doc_tokens = [doc.split() for doc in documents]
-            upstream_scores = [float(score) for score, _ in candidates]
-            rerank_indices = vector_lake_core.fast_bm25_rerank(
-                list(query_tokens), doc_tokens, upstream_scores, weight
-            )
-            if len(rerank_indices) == len(candidates):
-                return [(score, candidates[idx][1]) for idx, score in rerank_indices]
-
-        corpus = bm25s.tokenize(documents, stopwords=[], token_pattern=r"(?u)\S+", show_progress=False)
-        retriever = bm25s.BM25()
-        retriever.index(corpus, show_progress=False)
-        lexical = [float(value) for value in retriever.get_scores(query_tokens)]
+        rerank_indices = vector_lake_core.fast_bm25_rerank(
+            list(query_tokens),
+            [document.split() for document in documents],
+            [float(score) for score, _ in candidates],
+            weight,
+        )
     except Exception as exc:
         # Fail open: a reranker fault must never drop results.
         log.warning("Local reranking failed (%s: %s); keeping upstream order.", type(exc).__name__, exc)
         return candidates
 
-    if len(lexical) != len(candidates):
-        log.warning("Local reranking returned %s scores for %s candidates; keeping upstream order.",
-                    len(lexical), len(candidates))
+    if len(rerank_indices) != len(candidates):
+        log.warning(
+            "Local reranking returned %s scores for %s candidates; keeping upstream order.",
+            len(rerank_indices), len(candidates),
+        )
         return candidates
-
-    def _normalise(values: list[float]) -> list[float]:
-        low, high = min(values), max(values)
-        if high - low <= 1e-12:
-            return [0.0] * len(values)
-        return [(value - low) / (high - low) for value in values]
-
-    upstream = _normalise([float(score) for score, _ in candidates])
-    lexical_norm = _normalise(lexical)
-    blended = [(1.0 - weight) * u + weight * b for u, b in zip(upstream, lexical_norm)]
-
-    # Stable: ties keep their upstream relative order.
-    order = sorted(range(len(candidates)), key=lambda index: (-blended[index], index))
-    return [(round(blended[index], 6), candidates[index][1]) for index in order]
+    return [(score, candidates[index][1]) for index, score in rerank_indices]
 
 
 def _entity_first_order(

@@ -24,7 +24,6 @@ Two knobs, both off by default and registered in the README:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sqlite3
@@ -83,24 +82,30 @@ def annotate_enabled() -> bool:
 
 
 def _latest_canonical_names(prefixes: tuple[str, ...]) -> dict[str, str]:
-    """``raw path -> canonical page`` for the newest successful job of each source."""
+    """``raw path -> canonical page`` for the newest successful job of each source.
+
+    The two fields are extracted **in SQL** rather than by ``json.loads`` on every row.  Measured
+    2026-09-25 on the live ledger: 3 658 successful ingest jobs hold **156.6 MB** of payload (each
+    carries the full ~50 KB ingest prompt), and pulling them into Python to read ``filepath`` and
+    ``canonical_name`` cost 1 211 ms versus 495 ms for ``json_extract``.  The payload is the wrong
+    place for a hot read to look, but until those two fields have columns of their own this is the
+    cheap side of the same read.
+    """
     from vector_lake.db_store import get_connection
 
     connection = get_connection()
     placeholders = ",".join("?" for _ in _SUCCESS_STATES)
     latest: dict[str, tuple[str, str]] = {}
     rows = connection.execute(
-        "SELECT payload, completed_at, updated_at FROM jobs "
-        f"WHERE task_type = 'ingest' AND status IN ({placeholders})",
+        "SELECT json_extract(payload, '$.filepath') AS filepath,"
+        " json_extract(payload, '$.canonical_name') AS canonical_name,"
+        " completed_at, updated_at FROM jobs"
+        f" WHERE task_type = 'ingest' AND status IN ({placeholders})",
         _SUCCESS_STATES,
     )
     for row in rows:
-        try:
-            payload = json.loads(row["payload"])
-        except (ValueError, TypeError):
-            continue
-        filepath = str(payload.get("filepath") or "").replace("\\", "/")
-        canonical = str(payload.get("canonical_name") or "")
+        filepath = str(row["filepath"] or "").replace("\\", "/")
+        canonical = str(row["canonical_name"] or "")
         if "raw/" not in filepath or not canonical:
             continue
         relative = "raw/" + filepath.split("raw/", 1)[1]
@@ -124,15 +129,18 @@ def author_page_keys(*, refresh: bool = False) -> frozenset[str]:
     prefixes = author_source_prefixes()
     try:
         connection = get_connection()
-        # ``data_version`` covers another connection's commit; a write on this connection does not
-        # move it, so the ledger's own size and newest stamp are part of the key too.
-        version = connection.execute("PRAGMA data_version").fetchone()[0]
+        # Invalidation is keyed on the ledger this facet actually depends on.  ``PRAGMA
+        # data_version`` used to be part of the key and it bumps on *any* commit from another
+        # connection -- with a running daemon that is every outbox row, embedding batch and status
+        # heartbeat, so the cache was effectively per-query.  The jobs ledger cannot be missed this
+        # way: an insert or delete moves ``COUNT(*)``, and any update sets ``updated_at`` to now,
+        # which moves ``MAX(updated_at)``.  (The read itself is still a scan -- an index on
+        # ``jobs(updated_at)`` is the follow-up, measured at 259 ms for this key.)
         ledger = connection.execute(
             "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM jobs"
         ).fetchone()
         key = (
             str(connection.execute("PRAGMA database_list").fetchone()[2]),
-            version,
             int(ledger[0]),
             str(ledger[1]),
             prefixes,

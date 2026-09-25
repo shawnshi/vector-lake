@@ -1,13 +1,18 @@
-"""Tests for the bm25s-powered Phase-2 candidate reranker.
+"""Tests for the Phase-2 candidate reranker, which is now a required call into the Rust core.
 
 Contract that matters:
 
 * reranking must never change candidate *membership* (recall is decided upstream
   by FTS5 + graph expansion), only the order within the pool,
 * ``VECTOR_LAKE_RERANK_WEIGHT=0`` must reproduce the previous ordering exactly,
-* a missing or failing bm25s must fail open, not drop results.
+* a missing or failing reranker must fail open, not drop results -- and must say so, because the
+  scores look normalised either way,
+* the Python BM25 engine (``bm25s``) is gone: the rerank exists only as
+  ``vector_lake_core.fast_bm25_rerank``, so a host without the extension gets the documented no-op
+  rather than a second, differently-scored implementation (renamed from ``test_rerank_bm25s.py``
+  on 2026-09-25 with that change).
 """
-import sys
+import logging
 import types
 
 import pytest
@@ -85,27 +90,51 @@ def test_invalid_weight_falls_back_to_the_default(monkeypatch):
     assert {node["_key"] for _, node in after} == {node["_key"] for _, node in before}
 
 
-def test_missing_bm25s_fails_open(monkeypatch):
+def test_missing_rust_core_fails_open_and_warns(monkeypatch, caplog):
+    """No extension -> no rerank.  Degrading quietly would look identical to a working install."""
     before = _candidates()
-    monkeypatch.setitem(sys.modules, "bm25s", None)
+    monkeypatch.setattr(tool_search, "HAVE_CORE", False)
 
-    assert tool_search._rerank_candidates_locally("电子病历", before) == before
+    with caplog.at_level(logging.WARNING):
+        after = tool_search._rerank_candidates_locally("电子病历", before)
+
+    assert after == before
+    assert "reranking unavailable" in caplog.text
+    assert "maturin" in caplog.text
 
 
-def test_bm25s_failure_fails_open(monkeypatch):
-    class Exploding(types.ModuleType):
-        class BM25:
-            def index(self, *args, **kwargs):
-                raise RuntimeError("index exploded")
-
+def test_rust_rerank_failure_fails_open_and_warns(monkeypatch, caplog):
+    class ExplodingCore(types.SimpleNamespace):
         @staticmethod
-        def tokenize(*args, **kwargs):
-            return []
+        def fast_bm25_rerank(*args, **kwargs):
+            raise RuntimeError("index exploded")
 
-    monkeypatch.setitem(sys.modules, "bm25s", Exploding("bm25s"))
     before = _candidates()
+    monkeypatch.setattr(tool_search, "HAVE_CORE", True)
+    monkeypatch.setattr(tool_search, "vector_lake_core", ExplodingCore())
 
-    assert tool_search._rerank_candidates_locally("电子病历", before) == before
+    with caplog.at_level(logging.WARNING):
+        after = tool_search._rerank_candidates_locally("电子病历", before)
+
+    assert after == before
+    assert "reranking failed" in caplog.text
+
+
+def test_a_short_rerank_result_fails_open(monkeypatch, caplog):
+    """A score list that does not cover every candidate cannot be blended; keep upstream."""
+    before = _candidates()
+    monkeypatch.setattr(tool_search, "HAVE_CORE", True)
+    monkeypatch.setattr(
+        tool_search,
+        "vector_lake_core",
+        types.SimpleNamespace(fast_bm25_rerank=lambda *a, **k: [(0.5, 0)]),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        after = tool_search._rerank_candidates_locally("电子病历", before)
+
+    assert after == before
+    assert "keeping upstream order" in caplog.text
 
 
 def test_runs_are_deterministic():

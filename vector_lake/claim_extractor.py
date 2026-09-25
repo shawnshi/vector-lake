@@ -14,6 +14,37 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: Which implementation produces the claim blocks: ``rust`` (default) or ``python``.
+CLAIM_BLOCK_BACKEND = os.environ.get("VECTOR_LAKE_CLAIM_BLOCKS", "rust").strip().lower()
+
+
+def _rust_blocks(body: str):
+    """``[(kind, heading, raw_text)]`` from the Rust core, or ``None`` to fall back to mistune.
+
+    Returns ``None`` -- never raises -- for every reason the old path should be used: the backend
+    switch, a body with the bytes the two parsers disagree on, or a missing/short core.  A block
+    extractor must not turn an optional accelerator into a failure mode.
+    """
+    if CLAIM_BLOCK_BACKEND != "rust":
+        return None
+    if "\x00" in body or "\ufffd" in body:
+        return None
+    try:
+        import vector_lake_core
+    except ImportError:
+        return None
+    if not hasattr(vector_lake_core, "fast_extract_blocks"):
+        return None
+    try:
+        return [
+            (block.kind, block.heading, block.raw_text)
+            for block in vector_lake_core.fast_extract_blocks(body)
+        ]
+    except Exception as exc:  # noqa: BLE001 - fail open to mistune, loudly enough to be greppable
+        log.warning("Rust block extraction failed (%s: %s); using mistune.", type(exc).__name__, exc)
+        return None
+
+
 def _stable_id(prefix: str, value: str) -> str:
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=12).hexdigest()
     return f"{prefix}_{digest}"
@@ -203,6 +234,36 @@ def _clean_claim_text(text: str, limit: int = 360) -> str:
 
 
 def _iter_blocks(body: str) -> list[dict]:
+    """Blocks claim extraction consumes, from the Rust core when it agrees with mistune.
+
+    The Rust `fast_extract_blocks` is a parity port of the mistune walk below (measured 2026-09-25:
+    1495/1500 pages, 20 720 blocks, identical `kind`/`heading`/`raw_text`; 13.6 s -> 0.2 s per
+    corpus).  Two carve-outs keep the remainder from changing derived data:
+
+    * **bodies carrying NUL or U+FFFD bytes** stay on mistune.  Those four pages are the only place
+      the two parsers were measured to disagree by content (2-6 characters), and the live claim
+      corpus contains **none** of those bytes -- so the Rust path would be introducing them, not
+      reproducing mistune;
+    * **`VECTOR_LAKE_CLAIM_BLOCKS=python`** forces the old path, because a block extractor feeds
+      120k claim rows and a switch is cheaper than trust.
+
+    One further known difference is *not* carved out: `Concept_GAIN-矩阵.md`, where mistune folds a
+    column-0 `# ` heading into the preceding list while pulldown-cmark ends the list, so one block
+    is attributed to that heading.  It is a single block on a single page, recorded in the
+    CHANGELOG rather than hidden.
+    """
+    rust_blocks = _rust_blocks(body)
+    if rust_blocks is not None:
+        return [
+            {
+                "kind": kind,
+                "heading": heading,
+                "text": _clean_claim_text(raw_text),
+                "raw_text": raw_text,
+            }
+            for kind, heading, raw_text in rust_blocks
+        ]
+
     import mistune
     markdown = mistune.create_markdown(renderer='ast')
     ast = markdown(body or "")

@@ -18,12 +18,90 @@ config = load_config()
 EXCLUDE_PATHS = config.get("exclude_paths", list(DEFAULT_EXCLUDE_PATHS))
 
 try:
-    from watchdog.events import FileSystemEventHandler
-    from watchdog.observers import Observer
-except ImportError:
-    print("Error: `watchdog` library is not installed. Please run `pip install watchdog`.", flush=True)
+    from watchfiles import Change as _FileChange, watch as _watch
+    _WATCHFILES_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - host without the wheel
+    _FileChange = None
+    _watch = None
+    _WATCHFILES_IMPORT_ERROR = exc
+
+if _WATCHFILES_IMPORT_ERROR is not None:
+    print("Error: `watchfiles` library is not installed. Please run `pip install watchfiles`.", flush=True)
     import sys
     sys.exit(1)
+
+
+class _WatchEvent:
+    """The event surface the handlers use, kept from the ``watchdog`` days.
+
+    ``watchfiles`` reports ``(Change, path)`` for added/modified/deleted and has no move event
+    (a rename arrives as deleted + added, which is exactly what the handlers do with a move).
+    Keeping a tiny event object means the handlers, their per-path debounce and their managed-
+    projection filtering stay byte-for-byte the code the tests already exercise.
+    """
+
+    __slots__ = ("src_path", "dest_path", "is_directory", "event_type")
+
+    def __init__(self, src_path, change):
+        self.src_path = src_path
+        self.dest_path = src_path
+        self.is_directory = os.path.isdir(src_path)
+        self.event_type = change.name
+
+
+class FileSystemEventHandler:
+    """Local base class: the handlers only need their own ``on_*`` methods to exist."""
+
+
+class _WatchLoop(threading.Thread):
+    """One ``watchfiles`` watcher for one directory, dispatching into one handler.
+
+    Replaces ``watchdog.observers.Observer``.  The two monitored trees want different
+    recursion (wiki: not recursive, raw: recursive) and ``watchfiles`` fixes recursion per
+    call, so this is one loop per directory instead of one observer with two schedules.
+    """
+
+    def __init__(self, handler, path, recursive: bool, label: str):
+        super().__init__(name=f"watch-{label}", daemon=True)
+        self.handler = handler
+        self.path = path
+        self.recursive = recursive
+        self.label = label
+        self._stop_event = threading.Event()
+
+    def run(self):
+        dispatch = {
+            _FileChange.added: getattr(self.handler, "on_created", None),
+            _FileChange.modified: getattr(self.handler, "on_modified", None),
+            _FileChange.deleted: getattr(self.handler, "on_deleted", None),
+        }
+        try:
+            for changes in _watch(
+                self.path,
+                recursive=self.recursive,
+                stop_event=self._stop_event,
+                debounce=int(DEBOUNCE_SECONDS * 500),
+            ):
+                for change, raw_path in changes:
+                    callback = dispatch.get(change)
+                    if callback is None:
+                        continue
+                    try:
+                        callback(_WatchEvent(str(raw_path), change))
+                    except Exception as exc:  # noqa: BLE001 - one bad event must not kill the loop
+                        log.warning("Watch handler %s failed on %s: %s", self.label, raw_path, exc)
+        except Exception as exc:  # noqa: BLE001 - a dead watcher has to be visible, not silent
+            log.exception("Watcher %s stopped: %s", self.label, exc)
+            write_status(
+                "error", 0, index_queue.qsize(),
+                f"Watcher {self.label} stopped: {type(exc).__name__}", str(exc), component="watchdog",
+            )
+
+    def stop(self):
+        self._stop_event.set()
+
+    def join(self, timeout=None):
+        super().join(timeout)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -720,14 +798,16 @@ def _start_watchdog_locked():
 
     thread_supervision.start("ingest-worker", start_worker)
 
-    observer = Observer()
+    watchers: list[_WatchLoop] = []
 
     from vector_lake.wiki_utils import get_wiki_dir
 
     wiki_dir = str(get_wiki_dir())
     if os.path.exists(wiki_dir):
         wiki_handler = WikiIndexHandler()
-        observer.schedule(wiki_handler, wiki_dir, recursive=False)
+        watcher = _WatchLoop(wiki_handler, wiki_dir, False, "wiki")
+        watcher.start()
+        watchers.append(watcher)
         log.info(f"Wiki AST monitor active on directory: {wiki_dir}")
 
     from vector_lake.wiki_utils import get_memory_dir
@@ -738,10 +818,10 @@ def _start_watchdog_locked():
     raw_dir = str(memory_dir / "raw")
     if os.path.exists(raw_dir):
         raw_handler = RawWatchdogHandler()
-        observer.schedule(raw_handler, raw_dir, recursive=True)
+        watcher = _WatchLoop(raw_handler, raw_dir, True, "raw")
+        watcher.start()
+        watchers.append(watcher)
         log.info(f"Raw source monitor active on directory: {raw_dir}")
-
-    observer.start()
     log.info("Vector Lake Watchdog Agent is now running in Background Index/Lint mode.")
     write_status("idle", 0, index_queue.qsize(), "Watchdog started", "", component="watchdog")
     last_heartbeat = 0.0
@@ -760,7 +840,8 @@ def _start_watchdog_locked():
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("Termination signal received. Shutting down Watchdog...")
-        observer.stop()
+        for watcher in watchers:
+            watcher.stop()
     finally:
         # Taking the supervised runner down with the watchdog keeps one owner for the
         # ingest queue; the supervisor's own atexit hook covers an abrupt exit.
@@ -776,10 +857,12 @@ def _start_watchdog_locked():
         except Exception:
             pass
         try:
-            observer.stop()
+            for watcher in watchers:
+                watcher.stop()
         except Exception:
             pass
-    observer.join()
+    for watcher in watchers:
+        watcher.join(timeout=5)
 
 
 def start_watchdog():

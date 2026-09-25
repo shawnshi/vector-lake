@@ -12,8 +12,10 @@ Two gaps made the pipeline's state unrecoverable without a human:
   and its MCP tool, so 27 jobs aged 33.8 h to 184.6 h were still open when a consumer finally
   appeared.
 
-This loop makes both automatic.  It is deliberately boring: it does the same two calls an
-operator would, on a timer, and reports what they did.
+This loop makes both automatic.  It is deliberately boring: it does the same calls an operator
+would, on a timer, and reports what they did.  A third call joined it on 2026-09-25: the memory
+Gram-index maintenance above, because the 10:00/23:00 scheduled occurrences were the only place it
+ran and that left the slow path in place for up to 13 hours after a day of churn.
 """
 
 from __future__ import annotations
@@ -174,7 +176,7 @@ def catch_up_once(
 
     age = stale_task_max_age_seconds() if max_age_seconds is None else int(max_age_seconds)
     embed_batch = embedding_batch_size() if embedding_batch is None else int(embedding_batch)
-    summary = {"expired": 0, "enqueued": "", "markers_released": 0, "embeddings": {}, "errors": []}
+    summary = {"expired": 0, "enqueued": "", "markers_released": 0, "embeddings": {}, "gram": "", "errors": []}
 
     try:
         # Markers first: a source whose marker outlived its job is invisible to the scan below,
@@ -203,6 +205,20 @@ def catch_up_once(
         log.warning("Catch-up scan failed: %s: %s", type(exc).__name__, exc)
 
     try:
+        # Gram-index maintenance rides this loop because the scheduled occurrences (10:00 and
+        # 23:00) are too far apart to bound the slow path: a day of churn left every memory search
+        # on the exact projected scan for up to 13 hours (measured 2026-09-25).  The call is cheap
+        # when nothing is due -- it compares a dirty count and a search count -- and spends the
+        # ~77 s rebuild only when :func:`memory_gram_index.rebuild_due_reason` can show the debt has
+        # already paid for it.
+        from vector_lake import memory_gram_index
+
+        summary["gram"] = str(memory_gram_index.maybe_rebuild_memory_gram_index())
+    except Exception as exc:  # noqa: BLE001 - one half failing must not lose the others
+        summary["errors"].append(f"gram: {type(exc).__name__}: {exc}")
+        log.warning("Catch-up gram-index maintenance failed: %s: %s", type(exc).__name__, exc)
+
+    try:
         summary["embeddings"] = _embedding_catch_up(embed_batch)
     except Exception as exc:  # noqa: BLE001 - a provider outage must not stop the other halves
         summary["embeddings"] = {"candidates": 0, "embedded": 0, "skipped": ""}
@@ -227,6 +243,7 @@ def describe(summary: dict) -> str:
         f"markers_released={summary.get('markers_released', 0)}",
         f"expired={summary['expired']}",
         f"scan={str(summary['enqueued'])[:80]}",
+        f"gram={str(summary.get('gram') or 'skipped')[:80]}",
         f"vectors={vectors}",
     ]
     if summary["errors"]:

@@ -26,6 +26,24 @@
 #   either -- the only remaining edges are igraph's `test` extra and, outside this
 #   project's declared set, torch.  Tree shape: -2 leaf packages, and neither had
 #   dependents inside the declared set.
+# * watchdog was replaced by watchfiles on 2026-09-25: the daemon's two monitors now run on
+#   the Rust `notify` crate through a PyO3 binding (one watcher loop per directory, because
+#   watchfiles fixes recursion per call).  watchdog's per-handler event surface is kept by a
+#   local `_WatchEvent`/`FileSystemEventHandler` shim, so the handler bodies and their tests
+#   are unchanged.  A removal the tree does not check is a removal that comes back, so
+#   tests/test_dependency_manifest.py pins both the absence of watchdog and the presence of
+#   watchfiles.
+# * bm25s removed 2026-09-25: the pool rerank is now a required call into the Rust core
+#   (``vector_lake_core.fast_bm25_rerank``).  It was never on the hot path here -- the Rust symbol
+#   was already preferred and bm25s only ran on hosts without the extension -- so the fallback's
+#   only effect was to give those hosts a second, differently-scored engine.  Without the symbol
+#   the rerank degrades to the documented no-op (upstream order) and logs it.  Checked by
+#   tests/test_dependency_manifest.py, which also pins the import's absence.
+# * tantivy added 2026-09-25 as the switch-gated replacement for the FTS5 projection
+#   (VECTOR_LAKE_FTS=tantivy, default fts5).  Wheel used:
+#   tantivy-0.26.2-cp313-cp313-win_amd64.whl.  The FTS5 tables stay authoritative and
+#   tantivy_index.rebuild_from_sqlite() rebuilds the mirror from them, so the switch can be
+#   turned off at any time without a migration.
 # * rjieba wheel used: rjieba-0.2.1-cp38-abi3-win_amd64.whl, carrying jieba-rs
 #   0.9.x.  Update this pin and tokenizer.JIEBA_RS_PINNED together when a
 #   binding for jieba-rs 0.11 is published.
@@ -45,10 +63,10 @@ python-dotenv==1.2.2
 igraph==1.0.0
 leidenalg==0.12.0
 PyYAML==6.0.3
-watchdog==6.0.0
+watchfiles==1.2.0
 google-genai==2.7.0
 fastmcp==4.0.4
 sqlite-vec==0.1.9
+tantivy==0.26.2
 rjieba==0.2.1
 mistune==3.3.2
-bm25s==0.3.11

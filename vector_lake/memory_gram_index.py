@@ -122,6 +122,54 @@ AUTO_REBUILD_MAX_DOCS = 2_000
 #: ``gram-index --if-due`` -- settles the debt.
 REBUILD_AFTER_WRITES = 500
 
+#: Cost basis for the amortisation branch of :func:`rebuild_due_reason`.
+#:
+#: Both numbers are measured on this corpus (2026-09-25), and both have moved since
+#: :data:`REBUILD_AFTER_WRITES` was chosen:
+#:
+#: * a rebuild now costs **~77 s** (staging 58.0 + pack 16.5 + publish 2.0) on 69 929 documents;
+#:   the ~430 s the older note cites belongs to a 146 679-document corpus;
+#: * the indexed path saves **~0.46 s per memory search** (782 ms indexed against 1 240 ms on the
+#:   exact projected scan, same day and corpus).
+#:
+#: So one rebuild is repaid after roughly **166 searches**, not the ~1 200 the write-count note
+#: implies.  A write count cannot express that: it fires on churn instead of on debt incurred.  Its
+#: visible failure: until 2026-09-25 the only caller was the 10:00/23:00 occurrence, so a churny
+#: day left every memory search on the slow path for up to 13 hours -- measured that day: 9 212
+#: live dirty documents, memory retrieval 1 240 ms instead of 782 ms.
+REBUILD_COST_SECONDS = 77.0
+SEARCH_SECONDS_SAVED = 0.46
+
+
+def _searches_since_last_rebuild() -> int | None:
+    """Searches the ledger recorded since the base was last built, or ``None`` if unknowable.
+
+    Search count is the unit the decision is actually denominated in -- the index either saves
+    ~0.46 s per search or it does not -- but the lake keeps no query table, so the ledger is the
+    only place a search is visible.  ``None`` (disabled ledger, unreadable file, no build stamp)
+    leaves the write-count threshold as the only gate instead of pretending the count is zero.
+
+    The comparison is lexicographic on ISO-8601 UTC: the base stamp is written by ``gmtime()`` as
+    ``YYYY-MM-DDTHH:MM:SS`` and ledger entries carry ``...Z``-style ``+00:00``, so the shared prefix
+    decides.  Two events in the same second can therefore count as one search of overshoot -- a
+    second, against a 166-search bar.  Rotated ledger generations are not walked, so this is a
+    floor, not a total.
+    """
+    try:
+        from vector_lake import search_ledger
+
+        since = str(gram_index_state().get("updated_at") or "")
+        if not since:
+            return None
+        return sum(
+            1
+            for entry in search_ledger.entries()
+            if str(entry.get("at") or "") > since
+        )
+    except Exception:  # noqa: BLE001 - only the gate is lost, never the cheaper fallback
+        return None
+
+
 _LONG_RUN = re.compile(r"[0-9a-z]{3,}")
 
 # Field-mask weights, indexed by mask (bit0 key, bit1 text, bit2 page).
@@ -694,14 +742,19 @@ def writes_since_rebuild(conn=None) -> int:
 def rebuild_due_reason(conn=None) -> str | None:
     """Why a rebuild is due, or ``None`` when it is not.
 
-    Two reasons, and the second is not a matter of degree: a base that cannot answer a
-    search at all -- absent (never built, truncated), written by an older
-    :data:`GRAM_FORMAT_VERSION` -- is due whatever the write count says.  A write-count threshold alone
-    reports "not due" for that state *forever*, and that is exactly the state a format
-    version bump or a restore leaves a large corpus in: the read path refuses to build an
-    absent base above :data:`AUTO_REBUILD_MAX_DOCS`, so nothing else would ever settle it.
-    Reporting the reason rather than a bare boolean is also what keeps the dry-run text
-    honest, since "0 documents written" cannot explain why a rebuild is proposed.
+    Three reasons.  Two are not matters of degree: a base that cannot answer a search at all --
+    absent (never built, truncated), written by an older :data:`GRAM_FORMAT_VERSION` -- is due
+    whatever the write count says.  A write-count threshold alone reports "not due" for that state
+    *forever*, and that is exactly the state a format version bump or a restore leaves a large
+    corpus in: the read path refuses to build an absent base above :data:`AUTO_REBUILD_MAX_DOCS`,
+    so nothing else would ever settle it.  Reporting the reason rather than a bare boolean is also
+    what keeps the dry-run text honest, since "0 documents written" cannot explain why a rebuild is
+    proposed.
+
+    The third reason is the amortisation one, and it exists because the first two are consulted only
+    when someone asks: writes answer "has the corpus churned", never "is the slow path being paid
+    for".  With :data:`REBUILD_COST_SECONDS` and :data:`SEARCH_SECONDS_SAVED` measured, the debt is
+    computable, so it is compared instead of guessed.
     """
     conn = conn or get_connection()
     try:
@@ -714,6 +767,16 @@ def rebuild_due_reason(conn=None) -> str | None:
     live = writes_since_rebuild(conn)
     if live >= REBUILD_AFTER_WRITES:
         return f"{live} document(s) written since the last rebuild (threshold {REBUILD_AFTER_WRITES})"
+    if live > 0:
+        searched = _searches_since_last_rebuild()
+        if searched is not None:
+            saved = searched * SEARCH_SECONDS_SAVED
+            if saved >= REBUILD_COST_SECONDS:
+                return (
+                    f"{live} document(s) written and {searched} search(es) since the last rebuild; "
+                    f"at {SEARCH_SECONDS_SAVED}s saved per search that is {saved:.0f}s of slow path "
+                    f"against a ~{REBUILD_COST_SECONDS:.0f}s rebuild"
+                )
     return None
 
 

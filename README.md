@@ -55,7 +55,7 @@ graph TD
         DB --> GOV["governance_queue"]
     end
     subgraph read [读路径]
-        PINDEX --> SEARCH["search<br>expand + FTS5 BM25 + PPR + bm25s 重排"]
+        PINDEX --> SEARCH["search<br>expand + FTS5 BM25 + PPR + Rust 同池重排"]
         VEC --> SEARCH
         OM --> PACKET["Memory Packet"]
         SEARCH --> QUERY["query<br>预算受控的上下文组装"]
@@ -521,7 +521,9 @@ mutation 路径（每页的 schema 校验、`verify_asset`、canonical change se
 - `VECTOR_LAKE_STALE_TASK_MAX_AGE_SECONDS`：兜底把多旧的摄取任务视为陈旧（默认 `86400` 秒）。
 - `VECTOR_LAKE_RUNNER_STALE_SECONDS`：Runner / 监督器心跳过期阈值，默认 `2400` 秒。
 - `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
-- `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。**尚未在判定集上验收**（无 yes/no 结论可引用，不要把它当作已验证的改进）。实现上每次查询都会用 40 篇候选重建一次 bm25s 索引（实测 6 ms，可忽略）；重排故障时 fail-open（保留上游顺序并记 warning，不会丢结果）。
+- `VECTOR_LAKE_FTS`：词汇半边的检索后端。默认 `fts5`（历史行为：SQLite FTS5 出候选 + `bm25(wiki_search_index)` 出词法分）；`tantivy` 改由 Rust 的 tantivy 引擎（`tantivy-py`，索引落在 `wiki/.meta/tantivy_index/`）承担同一职责。契约逐项保留：输入仍是项目分词器（jieba-rs）预切好的空格串、词项之间是 AND、每个词在 `title`/`summary`/`text` 里命中、`rank` 沿用 FTS5 的**负号**约定（升序最好在前，`tool_search` 里那句 `raw_score * -1.0` 依赖它）。**默认不切换**：池内排序属于相关性变更，按本仓库的规则要一次一个开关、在预注册判定集上过门（`benchmarks/search_eval_decisions*.md`）。镜像写入是 fail-open 的（镜像失败只记 warning，权威写入已落盘），FTS5 表仍是权威投影，`python -c "from vector_lake import tantivy_index as t; t.rebuild_from_sqlite()"` 可随时从它重建镜像；schema 版本不一致时自动重建而不是拿字段含义变了的索引去查询。
+- `VECTOR_LAKE_CLAIM_BLOCKS`：claim 抽取的块提取器。默认 `rust`（`vector_lake_core.fast_extract_blocks`）；`python` 强制回到 mistune 实现。两者已做逐字节 parity（1500 页 / 14 560 块：1496 页完全相同，唯一不同的 4 页正是正文含 NUL 字节的页——那些页由本开关的兄弟规则自动改走 mistune，所以生产输入上两侧输出一致）。带 NUL 或 U+FFFD 的正文永远走 mistune：那两个解析器在那些字节上会差几个字符，而线上 claim 语料里**一个这类字节都没有**，走 Rust 反而会把它们引进去。实测收益 7.8×（0.15 → 0.02 ms/页，全语料 1.2 s → 0.2 s）——这是摄取路径而非热查询路径，绝对量很小。
+- `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × Rust BM25 词汇分`（打分与混合都在 `vector_lake_core.fast_bm25_rerank` 里完成）；设为 `0` 可完全恢复旧排序。**尚未在判定集上验收**（无 yes/no 结论可引用，不要把它当作已验证的改进）。重排引擎是**必选的 Rust 核心**：没有该符号时不再回退到 Python 实现，而是降级为“保持上游顺序”并在 WARNING 里点名 `maturin develop`（分数看起来仍然归一化，静默降级无法与正常安装区分）。
 - `VECTOR_LAKE_ENTITY_NAME_PRIORITY`：查询**点名**某一页时是否让其优先于“只是在谈论它”的页，默认 `0`（关）。开启后按实体名在查询中的**位置**分层（提问把主语放在最前，“X 的公司战略…”、“X 关于 Y”），层内仍按混合分排序。机制来源：九个问法（三个主体）显示裸实体名让主体页排第 1（1.000），加上分析式框架词（“核心价值、优势及市场竞争力”）后掉到第 2/5/6/13 名，因为那些词出现在**分析该实体的文档**里而不在实体自己的页上。
   **判定：默认保持 `0`。** 注册口径为 r3 标注集（`search_eval_labels_r3_p.jsonl` / `_r3_consensus.jsonl`，300 条）+ `--vectors snapshot` + `search_replay.py --compare`：primary nDCG@5 **+0.0275**（CI [+0.005, +0.051]，p=0.015，**CI 不含 0 通过**）、MRR **+0.0551**（CI [+0.025, +0.087]，p=0.000），但**最小效应量 +0.143 SD 未达注册门槛 +0.30 SD**，且 **recall 回退 −0.0070** → 规则 **NOT MET**。回退的机制已记录：“点名”不等于“要它”——`shawnshi` 这类查询把人物页提到第 1，而标签要的是技能产品页。判定与数值见 `benchmarks/search_eval_decisions_round3.md` 末节。
 - `VECTOR_LAKE_FUSION`：FTS 与向量两路的融合方式。默认 `sum`（历史行为：`-bm25` 与 `sim²·15` 两个原始量级相加）；`rrf` 改按名次融合（`Σ 1/(60+rank)`，常量见 `tool_search.RRF_K`），并把**图扩展也表达成同一量纲的第三路名次**。
@@ -575,14 +577,15 @@ mutation 路径（每页的 schema 校验、`verify_asset`、canonical change se
 
 阈值参考（合成语料：3 个强内聚簇 × 8 节点）：L1 恢复出 3 个社区、簇内同社区率 100%、固定种子下可复现、社区 ID 跨重跑稳定。
 
-#### 检索重排：bm25s
+#### 检索重排：Rust 核心（`fast_bm25_rerank`）
 
-`bm25s` 提供弹性的 BM25 实现，用于 **Phase-2 同池重排**（`tool_search._rerank_candidates_locally`）：
+同池重排（`tool_search._rerank_candidates_locally`）由 Rust 核心完成，不再有 Python 引擎：
 
 - **候选集成员不变**（召回由上游 FTS5 + 图扩展决定），只改变池内顺序。
-- 词汇信号来自 `title + summary + aliases`（不读正文：否则每次查询都要逐候选读文件）。
+- 词汇信号来自 `title + summary + aliases`（不读正文：否则每次查询都要逐候选读文件），预先用项目分词器切好后交给核心。
 - 分数为**池内归一化**（min-max），不是绝对相关度：因此首位候选通常显示 `1.000`，并列最大的候选保持并列。
 - 默认权重 0.4 保留上游影响力，避免把**本就无词汇重叠的图扩展候选项**压到底部。
+- 缺核心或缺符号 → fail-open 为“上游顺序”并记 WARNING；`bm25s` 已于 2026-09-25 从依赖中移除（理由：它只在不具备扩展的主机上生效，而那些主机拿到的是另一套打分）。
 
 #### CJK 分词
 
@@ -592,13 +595,31 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 |---|---|---|
 | **`rjieba`（唯一后端）** | `jieba-rs` 的官方 PyO3 绑定（同作者 messense），Rust 实现 | 必需依赖；提供 `cp38-abi3` wheel（Windows / macOS / manylinux / musllinux），**无需编译器** |
 
-**版本真相（重要）**：`rjieba 0.2.1` 在它的 `Cargo.toml` 里钉定的是 **`jieba-rs = "0.9.0"`**，即实际生效的 Rust crate 是 **0.9.x**，而**不是** 0.11。`jieba-rs 0.11.0` 于 2026-09-16 发布，**目前没有任何已发布的 Python 绑定**；本机也无 Rust 工具链（无 `cargo`/`rustc`/`maturin`），无法从 sdist 自建。该事实在代码中以常量 `tokenizer.JIEBA_RS_PINNED` 记录，并由 `doctor` 与 `backend_version()` 直接显示，例如：
+**版本真相（重要）**：`rjieba 0.2.1` 在它的 `Cargo.toml` 里钉定的是 **`jieba-rs = "0.9.0"`**，即运行中生效的 Rust crate 是 **0.9.x**；`rjieba` 至今没有新于 0.2.1 的发布（2026-04-25），而 crate 已到 0.11.0（2026-09-16）。这个事实在代码中以 `tokenizer.JIEBA_RS_PINNED` 记录，并由 `doctor` / `backend_version()` 显示：
 
 ```text
 [OK] Tokenizer Backend: rjieba 0.2.1 (jieba-rs 0.9.x); no add_word() on this backend
 ```
 
-待 `rjieba` 发布基于 0.11 的版本后，只需同步 `requirements.txt` / `requirements.lock.txt` 的版本号与 `JIEBA_RS_PINNED`。
+**0.11 现在有了自己的路，且已量过差异（2026-09-25）**：jieba-rs 0.11.0 已直接写进
+`crates/vector_lake_core/Cargo.toml`，核心导出 `cut` / `cut_joined`（HMM 开启，与 `rjieba.cut(text)`
+同形），因此版本不再由某个 wheel 的隐含依赖决定。实测对比 250 页 / 500 串：
+
+| 对比对象 | 结果 |
+|---|---|
+| 完整 token 流 | **16/500 相同（3.2%）** |
+| **只含 CJK 的 token 流** | **500/500 相同（100%），差异位置 0** |
+
+即 0.9 → 0.11 改的是** ASCII/标点串的切分**（`Concept_1 - 0` → `Concept_1-0`、`1+5 + 2` → `1 + 5 + 2`），
+**中文词切分一字未变**。落地仍需三步：① 装新 `.pyd`（`site-packages/vector_lake_core/vector_lake_core.pyd`，
+被运行中的 MCP/守护进程占用时无法覆盖，必须等它们重启；备份在 `scratch/core_backup/`）；② 重建词法索引
+（FTS 的 `title/summary/text` 存的是预切结果，后端又是 FTS 缓存键的一部分，所以会自动失效而不是错服）；
+③ 因属于相关性变更，仍受本仓“一次一个开关 + 预注册判定集”的约束。
+
+**本机构建注意**：默认工具链 `stable-x86_64-pc-windows-gnu` 在本机能编译但**链接失败**
+（`unable to find library -lgcc/-lgcc_eh`），必须用 `cargo +stable-x86_64-pc-windows-msvc build --release`；
+`maturin build` 的打包步骤会去拉 MSVC CRT 清单（`aka.ms/vs/17/...`）而本机网络不可达，因此改用 cargo 产出的
+cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决定，文件名必须叫 `vector_lake_core.pyd`）。
 
 #### 原生性能加速 (Rust Native Acceleration)
 
@@ -607,20 +628,32 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | 模块 | 核心加速路径 | 机制与收益 |
 |---|---|---|
 | **`fast_gram_index`** | `vector_lake/memory_gram_index.py` | 纯 C/Rust 级别的小端紧凑 `uint32` delta postings 解包、跳过脏页与权重累加，避免 Python 字典遍历与位移开销，使海量运行态记忆检索进入毫秒级 |
-| **`fast_markdown`** | `vector_lake/wiki_utils.py` | 基于 `pulldown-cmark` Pull Parser 事件流的高速 Markdown Frontmatter 分割、段落/列表项切分与 Wikilinks 提取，替代正则与重型 Python AST |
-| **`fast_graph_fusion`** | `vector_lake/tool_search.py` | 多轮迭代的带重启 Personalized PageRank (PPR) 随机游走扩散与 RRF (Reciprocal Rank Fusion) 多路召回融合排序 |
-| **`graph_topology`** | `vector_lake/indexer.py` | 高性能 $O(N^2)$ 图拓扑加权边与稀疏共现图计算，将全库 8,000 节点拓扑生成耗时从数秒压缩至数十毫秒 |
-| **`text_similarity`** | `vector_lake/tool_lint.py` | 纯 Rust 实现的 Gestalt/Ratcliff-Obershelp 算法，替代 Python `difflib.SequenceMatcher`，提速全库实体名称碰撞排查 |
-| **`local_bm25`** | `vector_lake/tool_search.py` | 纯内存轻量 Okapi BM25 局部候选池重排引擎，替代动态构建第三方 `bm25s` 实例，提升高频检索 QPS |
+| **`fast_markdown`** | `vector_lake/wiki_utils.py`、`vector_lake/claim_extractor.py` | 基于 `pulldown-cmark` Pull Parser 事件流的高速 Frontmatter 分割、章节列表项计数与段落/列表项块提取（claim 抽取 0.15 → 0.02 ms/页，见 `VECTOR_LAKE_CLAIM_BLOCKS`）。`fast_extract_wikilinks` 已导出但**无调用点**——仓里还没人接它，不要按它已生效来估收益 |
+| **`fast_graph_fusion`** | `vector_lake/tool_search.py` | 带重启 Personalized PageRank (PPR) 随机游走扩散。同模块导出的 `fast_reciprocal_rank_fusion` 同样**无调用点**（RRF 目前在 Python 里算），且 2026-09-25 实测它比那几行 Python **慢**（5.7 µs vs 8.3 µs，因为每查询的列表只有 6–17 项、过界成本占主导）——**不要接** |
+| **`graph_topology`** | `vector_lake/indexer.py` | `fast_calculate_weighted_edges` 计算稀疏共现图的加权边。下面那些耗时数字来自更早的语料（未在现语料重测） |
+| **`text_similarity`** | `vector_lake/tool_lint.py` | 纯 Rust 实现的 Gestalt/Ratcliff-Obershelp 算法，替代 Python `difflib.SequenceMatcher`；2026-09-25 实测在 380 对名称上 **10.25×**（3.2 ms → 0.3 ms），批量版（`fast_batch_sequence_matcher_ratios`，无调用点）相对它只多 1.3 个点 |
+| **`local_bm25`** | `vector_lake/tool_search.py` | 纯内存轻量 Okapi BM25 局部候选池重排引擎；2026-09-25 起是**唯一**引擎（第三方 `bm25s` 回退已移除），打分与权重混合一并在此完成 |
 
-* **双模平滑降级（Graceful Fallback）**：`vector_lake_core` 采用非破坏性双模设计。若已编译安装，系统无缝启用硬件加速；若当前环境未安装，代码通过 `try: import vector_lake_core ... except ImportError:` **自动回退为纯 Python 实现**，现有接口、打分精度与 110+ 测试套件 100% 保持幂等。
+> “无调用点”是事实描述而不是缺陷清单：2026-09-25 按 ROI 逐个量过，结论是 `fast_batch_sequence_matcher_ratios`、`fast_reciprocal_rank_fusion`、
+> `extract_grams`（被同名 Python 实现追着跑，二者实测 1.0×、gram 集合 4000/4000 相同）都不值得接；真正符合
+> “单次载荷大”形状的 `fast_extract_blocks` 已接上。判断依据（过界下限 4.9 µs/次 vs 每次载荷大小）记在 `CHANGELOG.md`。
+
+* **双模平滑降级（Graceful Fallback）**：`vector_lake_core` 采用非破坏性双模设计。若已编译安装，系统无缝启用硬件加速；若当前环境未安装，代码通过 `try: import vector_lake_core ... except ImportError:` 自动回退。**例外：同池重排没有 Python 回退**——缺核心时它降级为“保持上游顺序”并记 WARNING（见上一节），因为一个只在弱主机上生效的第二套 BM25 打分本身就是隐患。
 * **状态可观测性**：`python cli.py doctor` 自动诊断原生加速状态：
   * 已激活：`[OK] Native Acceleration: vector-lake-core v0.1.0 (Rust fast-core active)`
   * 未安装：`[OK] Native Acceleration: pure-python (optional vector-lake-core not installed)`
-* **本地构建与更新**：
+* **本地构建与更新**（2026-09-25 在这台主机上实测过，与说明书不同）：
   ```powershell
-  python scripts/build_core.py
+  # `scripts/build_core.py` 内部是 `maturin build --release` + `pip install --force-reinstall`；
+  # 本机两处都会失败：maturin 的打包步会去拉 MSVC CRT 清单（aka.ms）而网络不可达；
+  # 装回 site-packages 又会被运行中的 MCP/守护进程占用的 .pyd 挡住。
+  cd crates/vector_lake_core
+  cargo +stable-x86_64-pc-windows-msvc build --release   # 默认的 gnu 工具链在本机“能编不能链”
+  # 产物即扩展模块（PyO3 初始化名由 lib target 决定，文件名必须是 vector_lake_core.pyd）：
+  #   把 target/release/vector_lake_core.dll 复制成 site-packages/vector_lake_core/vector_lake_core.pyd
+  # 先停掉占用它的进程（MCP 服务、守护进程），否则 Windows 不允许覆盖已加载的 DLL。
   ```
+  要交付可安装的 wheel 而 maturin 打包不通时，用 `scratch/package_core_wheel.py` 手工组装（包目录 + dist-info + 重算 RECORD）。
 
 **已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。回退后端移除后这一点不再需要权衡：`add_word()` 一律返回 False，词表注册无法生效。
 
@@ -672,7 +705,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `vector_lake/indexer.py` | `index.json` / `claim_topology.json` 生成、FTS 投影、稀疏图遍历与增量更新 |
 | `vector_lake/embedding_scheduler.py` | RPM/TPM 限额下的可断点向量回填（`vec_embeddings`） |
 | `vector_lake/tokenizer.py` | CJK 分词后端（`rjieba`，单一后端），含 `JIEBA_RS_PINNED` |
-| `vector_lake/tool_search.py` | 混合检索（本地扩展 + FTS5 BM25 + 多跳 PPR + bm25s 同池重排）与 Memory Packet、上下文组装 |
+| `vector_lake/tool_search.py` | 混合检索（本地扩展 + FTS5 BM25 + 多跳 PPR + Rust 同池重排）与 Memory Packet、上下文组装 |
 | `vector_lake/claim_extractor.py` | Markdown 页面 → entity / claim / evidence / source |
 | `vector_lake/tool_memory.py` | 运行态记忆的物理写回（Wiki-as-Database） |
 | `vector_lake/governance_metrics.py` | 治理债务指标与合并候选枚举 |
@@ -722,7 +755,21 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-本轮实测结果（2026-09-25）：本轮只改三处判定——合并的落盘与可回放性（`governance_service`）、claim 提取的占位符/运行态过滤（`claim_extractor`）、Synthesis 骨架的文档与门禁对齐（`schema_validator` + `tool_lint`）。
+本次会话实测结果（2026-09-25 下午）：模型缝失败证据、守护进程监听换 `watchfiles`、tantivy 后端（开关默认关）、
+`author_page_keys` 取数与缓存键、gram 重建门改成按检索次数摊销、claim 块提取换 Rust。
+
+- `python -m pytest -p no:cacheprovider -q` → **1613 passed**（新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、rerank 契约 16 等；
+  同时把 `tests/test_rerank_bm25s.py` 更名为 `test_rerank_candidates.py`）。
+- `python cli.py gram-index --apply` → 340 482 gram / 14 473 499 posting / 69 929 文档，phase `stage=58.0s, pack=16.5s, publish=2.0s`（比旧注释里的 ~430 s 快得多，语料也更小）；
+  重建后 `dirty=0`、`gram_index_usable()=True`，可用性检查 15.8 ms/次 → 0.1 ms/次。
+- **py-spy stage profile**（`assemble_context`，受守护进程 embedding 兜底争用，只引用阶段级差值）：`_indexed_memory_candidates` 自耗 61.8%、
+  sqlite-vec 10.7%、`gram_index_usable` 每查询 9 次共约 10%、`author_page_keys` 8.8%；记忆检索 1 240 → 782 ms/次，author facet 242 → 16.9 ms/查询。
+- **判定集评测**（`benchmarks/search_replay.py` + 规则卡 `search-eval-rule/1.2`，第三批 300 查询、`--vectors snapshot`）：
+  fts5 vs tantivy 主指标 nDCG@5 0.8350 → 0.8198（差值 −0.0152，CI [−0.028, −0.002]）→ **RULE NOT MET，默认保持 fts5**。
+  评测同时暴露出两个真缺陷并已修：`VECTOR_LAKE_FTS` 在真实检索路径（`tool_search._get_fts_search_results`）上是无效的；harness 的 config 指纹里没有词法后端。
+- Windows 工具链：默认 `stable-x86_64-pc-windows-gnu` 在本机**能编不能链**（缺 `-lgcc/-lgcc_eh`），构建核心须显式用 msvc；`maturin build` 的打包步因拉不到 MSVC CRT 清单而失败。
+
+上午实测结果（2026-09-25 上午，同样是当日完成的改动）：本轮只改三处判定——合并的落盘与可回放性（`governance_service`）、claim 提取的占位符/运行态过滤（`claim_extractor`）、Synthesis 骨架的文档与门禁对齐（`schema_validator` + `tool_lint`）。
 
 - `python -m pytest -p no:cacheprovider -q` → **1554 passed**（新增 9 个用例：合并 fail-closed、注册表名字回退、未落盘合并检测、占位符与运行态叙述过滤、骨架顺序与 lint 报告）。
 - `python cli.py doctor` → `Write Gate: clean`、`Page Edge Projection` 与已发布边一致、`Vector Projection` 无 missing/stale/unstamped、`Memory Gram Index` `usable=True` 且 `queued=0`。

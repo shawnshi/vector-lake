@@ -108,78 +108,181 @@ pub fn fast_count_list_items(body: &str, section_marker: &str) -> usize {
     count
 }
 
-/// 使用 pulldown-cmark 提取标题、段落和列表项 blocks
+/// Extract the blocks claim extraction consumes: top-level paragraphs and the items of top-level
+/// lists, each with the text mistune's `extract_text` would have produced.
+///
+/// This is a **parity port**, not an approximation.  `vector_lake/claim_extractor.py::_iter_blocks`
+/// walks mistune's AST and emits a block per top-level `paragraph` and per item of a top-level
+/// `list`; the extraction rule it applies (`extract_text`) is: a code block contributes a single
+/// space and nothing else, a soft/hard break contributes a space, and a node contributes its own
+/// `raw` followed by its children's.  Three things therefore differ from the naive pulldown walk
+/// this function used to do, and each was a measured divergence:
+///
+/// * **code blocks are skipped** (they used to be appended to whatever buffer was open);
+/// * **only items of a top-level list emit a block** -- a nested list's items are not separate
+///   claims, their text accumulates into the enclosing item, which is what mistune's recursion
+///   does when it walks the outer `list_item`;
+/// * **paragraphs inside a list item do not emit** (the Python walk never visits them).
+///
+/// `raw_text` is the extracted text; `text` repeats it uncleaned on purpose.  Porting
+/// `_clean_claim_text` here would mean re-implementing a five-step regex chain (whitespace
+/// collapse, non-greedy `(Source: ...)` stripping, typed links, legacy links, truncation) without
+/// the regex crate, which is exactly where a silent divergence would come from -- so the cleaner
+/// stays in Python and the parity test compares the text this function returns.
 #[pyfunction]
 pub fn fast_extract_blocks(body: &str) -> Vec<MarkdownBlock> {
     let parser = Parser::new(body);
     let mut blocks = Vec::new();
 
     let mut current_heading: Option<String> = None;
-    let mut active_tag: Option<&str> = None;
-    let mut current_text = String::new();
+    // What is accumulating now: a heading, a top-level paragraph, or a top-level list item.
+    #[derive(PartialEq)]
+    enum Buffer {
+        Heading,
+        Paragraph,
+        Item,
+    }
+    let mut buffer: Option<Buffer> = None;
+    let mut text = String::new();
+    // Nesting of `Item` starts.  Only depth 1 emits; deeper items share the enclosing buffer.
+    let mut item_depth: usize = 0;
+    // The Python walk visits only the *top level* of mistune's AST: `block_quote`, `table` and
+    // footnote definitions are never entered, so nothing inside them is a claim.  Measured -- a
+    // templated blockquote (`> **Chunking Rule...**`, shipped in the page template) was being
+    // emitted as a paragraph here and shifted every later block on those pages by one.
+    let mut list_depth: usize = 0;
+    let mut other_container_depth: usize = 0;
+    let mut in_code_block = false;
 
     for event in parser {
         match event {
             Event::Start(Tag::Heading { .. }) => {
-                active_tag = Some("heading");
-                current_text.clear();
+                buffer = Some(Buffer::Heading);
+                text.clear();
             }
             Event::End(TagEnd::Heading(_)) => {
-                current_heading = Some(current_text.trim().to_string());
-                current_text.clear();
-                active_tag = None;
+                // Only a top-level heading moves `current_heading`.  The Python walk visits just the
+                // top level of mistune's AST, so a heading nested in a list item or a blockquote
+                // never becomes the heading of the following blocks -- measured on
+                // `Concept_GAIN-矩阵.md`, where an H1 inside the timeline list left every later
+                // bullet attributed to the previous section under mistune and to the H1 here.
+                if list_depth == 0 && other_container_depth == 0 && item_depth == 0 {
+                    current_heading = Some(text.trim().to_string());
+                }
+                text.clear();
+                buffer = None;
             }
             Event::Start(Tag::Paragraph) => {
-                active_tag = Some("paragraph");
-                current_text.clear();
+                // A paragraph inside a list item, a blockquote or a table is not its own claim.
+                if item_depth == 0 && list_depth == 0 && other_container_depth == 0 {
+                    buffer = Some(Buffer::Paragraph);
+                    text.clear();
+                }
             }
             Event::End(TagEnd::Paragraph) => {
-                let raw = current_text.trim().to_string();
-                if !raw.is_empty() {
-                    let cleaned = clean_claim_text(&raw, 280);
-                    blocks.push(MarkdownBlock {
-                        kind: "paragraph".to_string(),
-                        heading: current_heading.clone(),
-                        raw_text: raw,
-                        text: cleaned,
-                    });
+                if item_depth == 0 && list_depth == 0 && other_container_depth == 0
+                    && buffer == Some(Buffer::Paragraph)
+                {
+                    let raw = text.trim().to_string();
+                    if !raw.is_empty() {
+                        blocks.push(MarkdownBlock {
+                            kind: "paragraph".to_string(),
+                            heading: current_heading.clone(),
+                            raw_text: raw.clone(),
+                            text: raw,
+                        });
+                    }
+                    text.clear();
+                    buffer = None;
                 }
-                current_text.clear();
-                active_tag = None;
+            }
+            Event::Start(Tag::List(_)) => {
+                list_depth += 1;
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_depth = list_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::BlockQuote(_))
+            | Event::Start(Tag::Table(_))
+            | Event::Start(Tag::TableHead)
+            | Event::Start(Tag::TableRow)
+            | Event::Start(Tag::TableCell)
+            | Event::Start(Tag::FootnoteDefinition(_)) => {
+                other_container_depth += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_))
+            | Event::End(TagEnd::Table)
+            | Event::End(TagEnd::TableHead)
+            | Event::End(TagEnd::TableRow)
+            | Event::End(TagEnd::TableCell)
+            | Event::End(TagEnd::FootnoteDefinition) => {
+                other_container_depth = other_container_depth.saturating_sub(1);
             }
             Event::Start(Tag::Item) => {
-                active_tag = Some("item");
-                current_text.clear();
+                item_depth += 1;
+                if item_depth == 1 && list_depth == 1 && other_container_depth == 0 {
+                    buffer = Some(Buffer::Item);
+                    text.clear();
+                }
+                // Deeper: keep accumulating into the enclosing item's buffer.
             }
             Event::End(TagEnd::Item) => {
-                let raw = current_text.trim().to_string();
-                if !raw.is_empty() {
-                    let cleaned = clean_claim_text(&raw, 280);
-                    blocks.push(MarkdownBlock {
-                        kind: "bullet".to_string(),
-                        heading: current_heading.clone(),
-                        raw_text: raw,
-                        text: cleaned,
-                    });
+                if item_depth == 1 && list_depth == 1 && other_container_depth == 0
+                    && buffer == Some(Buffer::Item)
+                {
+                    let raw = text.trim().to_string();
+                    if !raw.is_empty() {
+                        blocks.push(MarkdownBlock {
+                            kind: "bullet".to_string(),
+                            heading: current_heading.clone(),
+                            raw_text: raw.clone(),
+                            text: raw,
+                        });
+                    }
+                    text.clear();
+                    buffer = None;
                 }
-                current_text.clear();
-                active_tag = None;
+                item_depth = item_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+                // ``block_code`` contributes one space, and only where a buffer is open (a
+                // top-level code block belongs to no emitted block at all).
+                if buffer.is_some() {
+                    text.push(' ');
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
             }
             Event::Text(t) => {
-                if active_tag.is_some() {
-                    current_text.push_str(&t);
+                if buffer.is_some() && !in_code_block {
+                    text.push_str(&t);
                 }
             }
+            // Inline code and inline HTML are text in mistune's ``raw`` walk.
             Event::Code(c) => {
-                if active_tag.is_some() {
-                    current_text.push_str(&c);
+                if buffer.is_some() && !in_code_block {
+                    text.push_str(&c);
                 }
             }
-            Event::SoftBreak | Event::HardBreak => {
-                if active_tag.is_some() {
-                    current_text.push(' ');
+            Event::Html(h) | Event::InlineHtml(h) => {
+                if buffer.is_some() && !in_code_block {
+                    text.push_str(&h);
                 }
             }
+            // A soft break becomes a space; a hard break becomes nothing.  That asymmetry is
+            // mistune's, not a choice: mistune 3 emits the token ``linebreak`` for a hard break,
+            // and `claim_extractor.extract_text` only special-cases ``("softbreak",
+            // "hardbreak")`` -- so ``linebreak`` falls through to ``node.get("raw", "")`` and
+            // contributes nothing.  The obvious port (space for both) is what the first parity run
+            // measured: 7 pages differing by exactly the number of hard breaks.
+            Event::SoftBreak => {
+                if buffer.is_some() && !in_code_block {
+                    text.push(' ');
+                }
+            }
+            Event::HardBreak => {}
             _ => {}
         }
     }

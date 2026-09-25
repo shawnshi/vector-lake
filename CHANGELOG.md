@@ -1,5 +1,417 @@
 # Unreleased
 
+## 更正：scheduled-lint 并沒有“没触发”；而且它确实限制了降级窗口——重建门改为按检索次数摊销，挂进 15 分钟的 catch-up
+
+**先更正我自己的判断。** 前两节我把“自 14:37 后未再触发 gram 重建”当成运维异常，错了：
+`SCHEDULED_LINT_HOURS = (10, 23)` —— **每天两次**，不是每小时。逐小时验算：11:00–22:00 算出的
+`due` 全部等于 marker 里的 `2026-09-25-10`，于是按设计 no-op（“running at most once per occurrence”）；
+下一次是 23:00。而 14:37（06:37 UTC）不在任何 occurrence 边界上，三个 wrapper 日志里 0 条重建记录，
+而同窗口的 `scratch/` 有上一会话的产物（`anchor_drafts.jsonl` 14:59）——最一致的解释是**上一会话手工跑的**，
+跟我 18:20 手动跑的那次同类。我是从 marker 的小时制格式反推出“小时级频率”的，属于把格式当成了机制。
+
+**但底下有个真问题。** 重建只在 10:00 / 23:00 被询问，而询问条件又是写计数 ≥ 500，于是“今天这样的一天”
+（我那 931 次页面重写 + 常规摄取）会让索引长时间不可用：实测当天 9 212 条 live dirty、记忆检索
+**1 240 ms 而不是 782 ms**，最坏持续 **13 小时**。而那个 500 的成本依据也已经过时：
+
+| | 注释里（2026-09-18）| 今天实测 |
+|---|---|---|
+| 语料 | 146 679 文档 | 69 929 文档 |
+| 一次重建 | ~430 s | **76.5 s**（58.0 + 16.5 + 2.0）|
+| 每次检索省 | — | **0.46 s**（1240 → 782 ms）|
+| 摊平点 | ~1 200 次检索 | **~166 次检索**（而日检索量 99–804 次）|
+
+**改动（按仓内“用实测单位”的做法）：**
+
+1. `memory_gram_index` 新增实测常量 `REBUILD_COST_SECONDS = 77.0` 与 `SEARCH_SECONDS_SAVED = 0.46`，
+   并新增 `_searches_since_last_rebuild()`：从 search_ledger 数出 base 上次构建之后的检索次数（ledger 里 `at` 与
+   state 的 `updated_at` 同为 UTC，可比；旋转掉的旧代不追，所以是下限）。
+2. `rebuild_due_reason` 新增第三条理由：**脏 > 0 且 检索数 × 0.46 s ≥ 77 s** 即为到期，返回文字带上两个数字。
+   写计数门与“无可用 base”两条原样保留（后者是硬状态，不能靠计数）。ledger 不可读时返回 `None`，
+   回退到写计数门，**不把“未知”当作“0 次检索”**。
+3. 挂到 `catch_up_once()`（15 分钟）作为第四个独立半边，失败被包含并计入 `errors`，`describe()` 输出 `gram=`。
+   不脏时只是一次脏计数 + 一次 ledger 计数；到期才花那 ~77 s。
+
+新增 `tests/test_gram_rebuild_policy.py`（6 项）：break-even 由常量算出（改数字不会静默移动门槛）、
+`bar` 次到期而 `bar-1` 次不到期、未知检索数回退写计数门、无脏永不到期、catch-up 报告 gram 半边、
+gram 抛错不影响 scan 半边。
+
+**保留的取舍（未改，写清楚）：** `REBUILD_AFTER_WRITES = 500` 仍是主触发（它约束无界 churn），
+所以一次“写很多但没人检索”的日子仍会在 500 脏时重建——那次重建不欠债。要把它也改成摊销口径
+（或提高阈值）是另一次政策选择，需要你点头。
+
+## tantivy 判定集评测：RULE NOT MET（差 0.140 SD，CI 在负侧排除 0），默认保持 fts5；而它先找出了我自己的两处缺口
+
+按规则卡 `search-eval-rule/1.2` 跑第三批（300 查询 / r3 consensus 标注 / `--vectors snapshot` / top_k=5），
+两臂差异只有词法后端：
+
+| 指标 | fts5（left）| tantivy（right）| diff | wins/losses | 95% CI |
+|---|---|---|---|---|---|
+| ndcg@5 | 0.8350 | 0.8198 | **-0.0152** | 16/26 | [-0.028, -0.002] |
+| recall@5 | 0.9081 | 0.9023 | -0.0058 | 5/6 | [-0.020, +0.007] |
+| success@5 | 0.9773 | 0.9697 | -0.0076 | 0/2 | [-0.019, +0.000] |
+| MRR | 0.8586 | 0.8384 | -0.0202 | 7/20 | [-0.038, -0.003] |
+
+判据（universe = confirmable：300 judged / **264 confirmable** / 42 discordant）：
+
+- **FAIL** 主指标均值差 ≥ +0.30 SD（实测 **-0.140 SD**；+0.05 绝对线在本构成上等于 +0.463 SD，report-only）
+- **FAIL** 主指标 bootstrap 95% CI 排除 0 —— 实测 `[-0.028, -0.002]`，是**在负侧**排除，即这是一个可检出的小幅回退而非噪声
+- **FAIL** 次要指标不得回退（success / recall / MRR 三项均回退）
+- PASS 至少 100 条 confirmable（264）
+
+结论：**RULE NOT MET，默认保持 `fts5`**（与当前默认一致，无需改动）。tantivy 保留在开关之后供后续复测。
+
+**这次评测先找出了我自己的两处缺口，而不是先给出结论：**
+
+1. `VECTOR_LAKE_FTS` 在真实检索路径上是**无效的**。混合检索的词法半边是
+   `tool_search._get_fts_search_results`，它直接对 `wiki_search_index` 发 SQL，绕过了我先前接线的
+   `db_store.search_wiki`。第一次两臂跑出了**逐位相同**的结果（连 4 条 FTS5 报错都一样）——这就是发现方式。
+   已在那一处同样接入开关（同一批已清洗的 term、同一 `rank` 负号约定），重跑后两臂才真正分开。
+2. harness 的 config 指纹里**没有词法后端**这一项，于是 `--compare` 直接拒绝：
+   “both runs used the same config”。已加 `fts_backend`（走 `tantivy_index.enabled()` 而不是直接读环境变量，
+   免得装了主机回退到 fts5 的那次运行自称 tantivy）。
+
+顺带修了一个真 bug：`tantivy_index.stats()` 未 `reload()`，少报最后一批（写 7139、可见 7000）。
+
+**限定必须写明**：标注是在语料 `47f13074f363` 上做的，本次读的是 `b88ce6936d35`（语料自 09-22 已变，包括今天
+我做的删声明/重指/大批页面重写），harness 也警告未判页计为不相关。这影响**绝对**数值、不影响配对方向；
+因此上面的差值可信，但不能与第三批归档数直接对齐。另有一个指标外的事实：tantivy 臂不再出现那 4 条
+`fts5: syntax error near "."/"'"`（term 查询无语法），即它在 `.'` 类查询上更鲁棒——但只影响 4 条查询，
+且不足以翻默认。
+
+## mistune → Rust 块提取：生产输入上做到逐字节一致；同时纠正我上一条自己测错的数
+
+块提取从 mistune 换成 `vector_lake_core.fast_extract_blocks`，带 `VECTOR_LAKE_CLAIM_BLOCKS`（默认 `rust`）
+可一键回退。parity 是靠“跑 harness → 看差异 → 改规则”迭代出来的，四处差异都是实测发现的：
+
+| 差异 | 真实规则 |
+|---|---|
+| 引用块/表格/脚注定义里的内容被当成 clause | Python 只遍历 mistune AST 的**顶层**，这些容器根本不进 |
+| 嵌套列表逐项各发一条 bullet | 只有**顶层**列表的项才是 clause；嵌套项的文入并入父项（模板里的引用块 `> **Chunking Rule...**` 曾被当段落发出去，把每页后续块整体错位一个）|
+| 硬换行变空格 | mistune 3 硬换行的 token 叫 `linebreak`，而 Python 那个 `("softbreak", "hardbreak")` 分支根本匹配不到——**硬换行实际什么都不贡献**；“显而易见”的写法（都变空格）正是第一次 parity 测出来的 7 页差异 |
+| 嵌套标题会改写 `current_heading` | 同为顶层限制：列表/引用块里的标题不改变当前章节 |
+
+**验证（用生产 reader `read_markdown_file` 取真正文）**：1500 页 / 14 560 块 → **1496 页完全相同**；
+唯一不同的 4 页正好是正文含 NUL 字节的页（86/147/261/134 个），而**线上 claim 语料里一个 NUL 与 U+FFFD 都没有**
+（抽样 5 000 条：0/0）——也就是说走 Rust 会把这两个字节**引进去**而不是复现 mistune。所以加了一条有依据的绕行：
+带 NUL/U+FFFD 的正文永远走 mistune；缺符号或抛错也 fail-open 回 mistune 并记 WARNING。清洗器**故意留在 Python**：
+在不用 regex crate 的前提下重写五步正则链（空白折叠、非贪婪 `(Source: ...)`、typed link、legacy link、截断）
+正是静默偏差最容易发生的地方。新增 19 项 parity 测试（含绕行、开关、fail-open）。
+
+**纠正我自己上一条的错误**：前面报的“66–77×、7 页不同”**两个数都是错的**，肇因在我的 harness：
+它用 `text.split('---', 1)[1]` 当正文，于是把 **frontmatter 也喂给了两个解析器**（而 YAML 列表行会被当成顶层列表，
+无中生有造出差异），mistune 还白付了构 YAML 的钱。取真正文后的诚实数字是 **7.8×**
+（0.15 → 0.02 ms/页；全语料 1.2 s vs 0.2 s），有差异的页也从 7 → 4 且全部有解释。
+教训与上一条同构：**比较继承 harness 的输入 bug**；差一倍的收益必须看输入对不对。
+
+另需说明边际值：claim 抽取是**摄取期**路径而不是热查询路径，全语料省约 1 秒。这次换取的真正价值是
+“去掉一个语义不确定的变量 + Rust 与 Python 行为已被锁住”，而不是速度。
+
+**wheel 已重建并验证**：`scratch/wheelout/vector_lake_core-0.1.0-cp38-abi3-win_amd64.whl`（2.82 MB）
+装到临时 `--target` 后导入正常（`cut` / `fast_extract_blocks` / `fast_bm25_rerank` / `fast_reciprocal_rank_fusion`
+均在）。流程与早前记录的障碍一致：`maturin build` 的打包步会拉 `aka.ms` 的 MSVC CRT 清单而本机不可达，
+所以 wheel 是手工组装的（包目录 + dist-info + 重算 RECORD，脚本 `scratch/package_core_wheel.py`）；
+装进 site-packages 仍被运行中的 MCP/守护进程占用的旧 `.pyd` 挡住，需先重启它们。
+
+## 更正上一节的「接线比换库更划算」：两个候选实测是 1.0× 与 0.69×，结论站不住
+
+上节列的六个“编译了但零调用”的原语，按 ROI 逐个量了一遍，结论反过来：**没有一个值得接**。先把清点改对：
+`lib.rs` 实际 `wrap_pyfunction!` 17 个（16 个模块函数 + `version`）；全仓（除 `scratch/`、`target/`、CHANGELOG）
+真正零引用的是 5 个 `fast_reciprocal_rank_fusion` / `fast_extract_wikilinks` / `fast_extract_blocks` /
+`fast_batch_sequence_matcher_ratios` / `fast_accumulate_terms`；而 `extract_grams` **不是零引用**——
+`memory_gram_index.py:156` 有个**同名 Python 实现**在做同一件事（Rust 那份闲置、Python 那份在用），
+这个名字碰撞正是当初用 grep 看走眼的原因，而它当时看着是“最值得接”的那个。
+
+实测（新 core 与 4 000/380 真实样本，见 `scratch/probe_gram_wiring.py`）：
+
+| 原语 | Python 对应物 | 实测 | 判定 |
+|---|---|---|---|
+| `extract_grams` | `memory_gram_index.extract_grams`（每文档一次，69 929 份）| **1.0×**（309 vs 317 ms / 4 000 份），gram 集合 **4000/4000 完全相同** | 接了省不到东西 |
+| `fast_reciprocal_rank_fusion` | `tool_search` 里的 RRF（每查询，3 列表 × 6-17 项）| **0.69×**（Python 5.7 µs vs Rust 8.3 µs）| 接了是**回退** |
+| `fast_batch_sequence_matcher_ratios` | `tool_lint` 的循环 | 单条版（**已接**）**10.25×**；批量版 11.59× | 相对已实现的收益只剩 +1.3 个点 |
+| `fast_extract_blocks` | `claim_extractor` 的 mistune | 未测 | 阻塞在语义对齐，不是接线 |
+| `fast_extract_wikilinks` / `fast_accumulate_terms` | 未定位到 Python 对应物 / 每查询 | 未测 | 不能声称 ROI |
+
+机制也量了：**一次纯过界调用就要 4.9 µs**（`cut_joined('x')` × 20 000），而每文档的 blob 中位数只有 **172 字节**，
+两侧又都是分配主导（一份文档必然产生单字+双字共数百个 gram，Rust 侧每个 gram 一个 `String` + 回建 `dict`）。
+所以“每项一小段文本 × 上万次”这个形状**天花板就是几个百分点**。反观真正拿到收益的那些已接原语——
+postings 打包/解包（总共 1 445 万条）、BM25 同池重排、PPR、加权边、相似度（10×）——全部是
+**单次载荷很大**、过界成本可以被摊薄的形状。
+
+方法论错误值得记下：我把“无调用点”（事实）直接推论成“用 Python 做很贵”（假设），只数了循环规模、
+没量**每次调用的载荷大小与过界下限**。“未被调用”是事实，“在 Python 里贵”是假设，两者之间必须有一次测量。
+
+按同一规则，真正符合形状的是 `fast_extract_blocks`：每次调用吃**一整页正文**（KB 级）× 8 000 页 ≈ 24 MB
+过界，地板能被摊薄；但它的真实障碍是**语义对齐**（截断 280 vs 360、嵌套列表项、代码块，见早前节的表），
+那是要写 Rust，不是接线。
+
+本节只改结论，不动代码：按上面数据去接这些原语都是负收益。
+
+## `Cargo.toml` 里本来就没有 `rjieba` 依赖：版本一直是 wheel 隐含的；已把 jieba-rs 0.11 钉进我们自己的核心并量出差异
+
+先查事实，不先改文件：本仓只有一份 `Cargo.toml`（`crates/vector_lake_core/`），它的依赖是 pyo3 /
+pulldown-cmark / serde / serde_json / rayon，`Cargo.lock` 的包列表里也没有任何 jieba。所以“把 `Cargo.toml` 里的
+`rjieba` 改成正确版本”**没有可改的对象**——真正决定版本的是已发布的 `rjieba` wheel 自己的 `Cargo.toml`
+（钉的 `jieba-rs = "0.9.0"`），而 rjieba 最新发布仍是 0.2.1（2026-04-25），crate 却已到 0.11.0（2026-09-16）。
+
+要把“正确版本”变成本仓可决定的事，只能自己拥有这个绑定，于是：
+
+- `crates/vector_lake_core/Cargo.toml` 加 `jieba-rs = "0.11"`（附上“为何 pin 在这份文件里”的注释）；
+- 新增 `src/tokenizer.rs`：`cut(text)` / `cut_joined(text)`，**HMM 开启**（即 `rjieba.cut(text)` 的默认形状），
+  并用 `OnceLock` 只加载一次词典；在 `lib.rs` 注册为模块 7；
+- 实构：0.11 的 API 已经变过（`cut` 返回 `Vec<Token>` 而不再是 `Vec<&str>`，取 `token.word`），编译报错后
+  按 vendored 源码改正；`cargo +stable-x86_64-pc-windows-msvc build --release` 通过，Python 侧实测可调用。
+
+**差异实测（250 页 / 500 串）——这一步决定了能不能直接切**：
+
+| 对比对象 | 结果 |
+|---|---|
+| 完整 token 流 | **16/500 相同（3.2%）** |
+| **仅 CJK 的 token 流** | **500/500 相同（100%），差异位置 0** |
+
+即 0.9 → 0.11 改的是 **ASCII/标点串的切分**（`Concept_1 - 0` → `Concept_1-0`、`1-5 - 2` → `1-5-2`、
+`1+5 + 2` → `1 + 5 + 2`，两个方向都有），**中文词切分一字未变**。
+
+**因此没有顺手切后端**：FTS 的 `title/summary/text` 存的就是预切结果，改后端等于重建全部词法索引（内存 gram 索
+引同理），而 tokenizer 版本又本就是 FTS 缓存键的一部分（会自动失效而不是错服）；且这属于相关性变更，按本仓规则要
+过预注册判定集。现在能做的是“已拥有 0.11 + 已知差异边界”，切换仍是一个独立决定。
+
+两个环境事实一并记下（下次不必重踩）：默认工具链 `stable-x86_64-pc-windows-gnu` **能编不能链**
+（`unable to find library -lgcc/-lgcc_eh`），必须显式用 msvc；`maturin build` 的打包步骤会去拉 MSVC CRT 清单
+（`aka.ms/vs/17/release/channel`）而本机网络不可达，所以直接用 cargo 产出的 cdylib 当扩展模块——注意 PyO3 的
+初始化函数名由 lib target 决定，文件必须叫 `vector_lake_core.pyd`（改名会 `does not define module export function`）。
+活着的 `.pyd` 被运行中的 MCP/守护进程占用，无法就地覆盖，新构建以并存方式放在 `scratch/core011/`，原文件备份在
+`scratch/core_backup/vector_lake_core.pyd.bak-20260925`；激活需先重启占用者。
+
+## 池内重排改成必选 Rust，`bm25s` 从依赖里除名
+
+`_rerank_candidates_locally` 不再 `import bm25s`：词汇信号与权重混合都在
+`vector_lake_core.fast_bm25_rerank` 里，缺少该符号时降级为“保持上游顺序”并记 WARNING（点名
+`maturin develop`）。降级必须出声，因为**两条路径的分数看起来都是归一化的**，静默降级与正常安装无法区分。
+连带删掉了 Python 侧的 normalise/blend/sort 整段（核心直接返回已排序的混合分），少 35 行和一个依赖。
+
+本机行为**不变**：该主机 `HAVE_CORE=True`，Rust 路径本来就是生效的那条（实测重排确实发生：
+`A,B,C → B,A,C`）。真正改变的是**没有扩展的主机**——它们以前静默换成另一套 BM25 打分，现在直接失去重排。
+这是有意的取舍：依赖管理上这里就是 `maturin develop` 构建 + doctor 把核心当一等检查，回退路径唯一的实际效果是
+让最弱的主机拿到第二个不同打分的引擎。
+
+除名按本仓仪式做全：`requirements.txt` / `requirements.lock.txt` / `tool_doctor.py` 依赖表 /
+`test_dependency_manifest.py`（新增 `test_bm25s_is_gone_and_the_rerank_is_mandatory_rust`，同时钉住 import 不再出现）；
+测试文件 `tests/test_rerank_bm25s.py` → `tests/test_rerank_candidates.py`（原名已在撒谎），从 13 项扩到 16 项，
+新增三个 fail-open 案：缺核心、核心抛错、返回条数不匹配。全量 `1588 passed`。
+
+顺手改正两条 README 里已经不成立的断言：
+
+- “本机无 Rust 工具链（无 `cargo`/`rustc`/`maturin`）” —— 已过时：2026-09-25 实测本机有 cargo/rustc 1.98.1 与
+  maturin 1.15.0（当时为接 tantivy 后端做的工具链检查）；`rjieba` 卡在上游没有 0.11 绑定，不是本地建不了。
+- “未安装核心时自动回退为纯 Python 实现” —— 全局话不再成立：同池重排是例外，它降级为 no-op（已写进该节）。
+
+## 按 profile 的顺序治了三处：gram 索引已恢复，重复的可用性检查不再是事，`author_page_keys` 降了 5.5 倍
+
+上一节说好了“先拿回快路径再谈别的”，执行结果与当时预计的顺序不同，如实记：
+
+**1）快路径已恢复。** `python cli.py gram-index --apply`。实测比文档快得多：stage=58.0s、pack=16.5s、
+publish=2.0s（文档里 465 s 是更大语料/更早状态），产出 340 482 gram / 14 473 499 posting / 69 929 文档。
+状态：dirty 队列 20 241（live 9 212）→ **0**；`gram_index_usable()` False → **True**；那条每次查询都要跑的
+可用性检查从 15.8 ms/次 → **0.1 ms/次**。
+
+**2）原计划第二步（把可用性检查从 9 次/查询降到 1 次）作废。** 它当初贵是因为每次都要对 2 万行 dirty 队列
+做带相关 `EXISTS` 的 COUNT；队列清空后 150 次调用合计 **0.8 ms/查询**。实测面前不改代码——为 0.8 ms 动
+热路径不划算。
+
+**3）`author_page_keys` 的真正病因不是“缺缓存”，而是它读错了地方。** 它本来就有缓存，但：缓存键里塞了
+`PRAGMA data_version`（守护进程每提交一次 outbox/embedding/心跳就变），且取数要 `SELECT payload` 把
+**3 658 个成功任务、156.6 MB 的 payload**（每行带着 ~50 KB 摄取提示词）整个读进 Python 再 `json.loads`，
+只为取 `filepath` 与 `canonical_name` 两个字段。实测：旧取数 **1 211 ms**，改 `json_extract` 后 495 ms；
+缓存键读本身又 259 ms。三处一起改：
+
+- 取数改 SQL 内 `json_extract`（不再把 156 MB 拉进 Python）；
+- 缓存键去掉 `data_version`，只留 ledger 指纹 `(COUNT(*), MAX(updated_at))` —— 插入/删除改 COUNT，
+  任何更新都会把 `updated_at` 抬到当下从而改 MAX，依赖关系才是正确的那个；
+- 加 `idx_jobs_updated_at`，让指纹读变成索引查询（实测 146 ms → **0.2 ms**）。
+
+加索引立刻踩到本仓自己的坑（`init_db()` 在 `_schema_is_complete` 为真时短路，DDL 只对新库生效），
+按仓内已有的 `_*_format_is_stale` 模式补了 `_jobs_ledger_index_is_stale`，并实测了“drop 掉 → init_db()
+自动重建”这条路径。结果：冷计算 **1 470 → 266 ms**，缓存命中 **300 → 0.4 ms**。
+
+profile 复查（同一天，stage 计时）：`author facet` 242 ms/查询 → **16.9 ms**（其中 p50 0.3 ms，均值被一次
+合法重算 264 ms 拉起）；`gram usable check` 154 → 0.7 ms；`memory retrieval` 1 240 → 782 ms/次。
+
+**仍未做，且现在是第一位**：`build_memory_packet` 每次查询被调 **1.76 次**（17 查询 30 次）——warnings 非空
+就会按 burst 上限重建一次，在索引健康的当下几乎每次都触发，约 1.5 s/查询，比刚治掉的两项都大。
+第二是 `_search_scored_pages`（p50 278 ms、max 2 531 ms 的尾巴）。三个待办都写进了本节；本节所有 wall 数值
+都受守护进程 embedding 兜底（`missing=301`）干扰，故只引用阶段级、不受争用的差值。
+
+## `assemble_context` 的 1.5 s 不在 Python 里，也不在 Rust 能救的地方：它跑的是“gram 索引不可用”的降级扫描
+
+先测量再讨论 port。stage 计时（真 MEMORY 根，12 次调用）+ py-spy（200 Hz，10 233 样本）两边对得上：
+
+| | |
+|---|---|
+| `assemble_context` wall | p50 **1 574 ms**（bench 档案里 09-18/19 是 1 033 ms）|
+| `_indexed_memory_candidates`（自耗）| **61.8%** |
+| `gram_index_usable()` | 每次查询 **9 次**，单次均 15.8 ms，合计约 10% |
+| `author_page_keys`（自耗）| 8.8%（每次查询重算）|
+| `_get_vector_search_results`（sqlite-vec）| 10.7% |
+| bm25s / `fast_bm25_rerank` / 分词 | 合计 < 1% |
+
+根因是**数据状态触发了降级路径**，不是 Python 比 Rust 慢：`gram_index_usable()` 为假（dirty 队列 20 241 行，其中 **9 212 条 live**；索引物料化 `updated_at=2026-09-25T06:37:53`，此后未再重建），于是每次检索都走 `search_operational_memory` 的「projected scan」——一条对 69 929 行 `operational_memory_index` 计算 relevance 表达式再排序的 SQL。61.8% 的自耗落在那一行 `conn.execute`，即**在 SQLite 里**。
+
+顺手证伪两件事：先前列的 Rust 候选清单（bm25s、池内重排、分词）在这条路径上**合计不到 1%**，所以“再 port 一批 Python”在这里没有性价比；真正该做的顺序是：
+
+1. 恢复索引（`cli.py gram-index --apply`，或让定时 lint 的 `maybe_rebuild_memory_gram_index` 真的跑起来）——先拿回快路径，再重测；
+2. 把 `gram_index_usable()` 从每次查询 9 次降到 1 次（每次都是一次带相关 EXISTS 的 COUNT）；
+3. 给 `author_page_keys` 加缓存/失效（8.8% 花在一个每次查询都重算的署名面）。
+
+待办（当晚已闭合，见上方那条）：定时重建为何自 14:37 后未再触发**当时被我当作运维异常记下，实际是我看错了**——
+`SCHEDULED_LINT_HOURS = (10, 23)` 是每天两次而非每小时，14:37 也不在任一次 occurrence 上；真正的政策问题是
+“两次之间可降级长达 13 小时”。全文更正见本节末尾的修正说明。
+
+## 依赖里真值得换 Rust 的只有两个：`watchdog` 换成 `watchfiles`，FTS5 换成 tantivy（开关默认关）
+
+先把基线量清：本项目自己的 bench（同一语料 ~7.9–8.5k 页）里 `search_vector_lake[page]` 本地 p50
+**48 ms**、开着 embedding provider 是 **202 ms**——**76% 花在网络往返**；真实账本 814 条查询 p50 218 ms 而
+p90 1.85 s / p99 2.7 s，而本地样本极稳（min 45 / max 51 ms），尾巴是 provider 重试而不是 Python。
+所以“把更多 Python 换成 Rust”能动的只是那 48 ms 里的一块，而 `assemble_context` 0.9–1.1 s 那条本地路径
+目前还没有 stage profile，先 port 就是猜。
+
+**已完成 1：`watchdog` → `watchfiles`（Rust `notify`）。** 守护进程的两个监听改成每个目录一个
+`_WatchLoop`（watchfiles 的 recursion 是整次调用级，不能像 watchdog 那样一个 observer schedule 两个目录），
+同时保留 `FileSystemEventHandler`/`_WatchEvent` 本地垫片，因此两个 handler 的事件逻辑、按路径 3 秒去抖、
+受管投影过滤全部逐字未动。实测：created/modified/deleted 都能送达 handler，`recursive=True` 能收到子目录事件，
+`stop()` 后线程能干净退出；监听线程死亡现在会写 `error` 状态而不是静默。依赖侧按本仓的除名仪式做全：
+requirements/lock/doctor/`test_dependency_manifest.py` 四处同时改（新增一条“watchdog 不存在且 watchfiles 被导入”的守卫）。
+
+**已完成 2：tantivy 作为 FTS5 的开关式替代（`VECTOR_LAKE_FTS`，默认仍 `fts5`）。**
+新增 `vector_lake/tantivy_index.py`（白空格+小写分析器、AND-of-terms、“每个词在 title/summary/text 命中”的
+布尔查询、`node_key` fast field）、在 `db_store` 的四个写点/两个读点/两个删点接入镜像。契约逐项保留，尤其是
+**`rank` 沿用 FTS5 的负号约定**（`tool_search` 里 `raw_score * -1.0` 依赖它）与返回值形状。设计上 FTS5 表仍是
+权威投影，镜像失败 fail-open 只记 warning，`rebuild_from_sqlite()` 可随时从 FTS5 重建（迁移/恢复路径），
+schema 版本不一致自动重建。新增 8 项测试（含默认不切换、AND 语义、排序符号、删/清同步、重建、fail-open）。
+
+**未完成（如实记录，不是已完成）**：
+
+- **`mistune` → `fast_extract_blocks`（Rust）没动。** 读完两边实现后发现**不是 drop-in**：Rust 用 280 字截断
+  而 Python 默认 360；Rust 对**嵌套列表项**逐项各发一条 bullet，Python 只发顶层项；Rust 不跳过代码块，
+  Python 把 block_code 计入空串；两侧 cleaner 也不一致。claim 提取喂着 12 万条 claim，改错了是静默改变整个
+  语料，所以必须先改 Rust 语义 + 重建 wheel + 对全量 8k 页做逐块 parity 才能换。
+- **`bm25s` 没有移除。** 它只在“host 没有 Rust 扩展”时才是回退路径（热路径已走 `fast_bm25_rerank`），
+  而 tantivy 这次替的是 FTS5 半边；池内重排仍由现有 Rust 路径承担。要拆掉 `bm25s` 得把池内重排也改成
+  必选 Rust（或改由 tantivy 出分），这是下一步的事。
+- **没在判定集上测过，所以默认没有翻。** 池内排序属于相关性变更，按本仓预注册规则必须一次一个开关、
+  在 `benchmarks/search_eval_decisions*.md` 的口径下过门才谈默认切换。
+
+## 「已处理」不等于「已入库」：1 767 个 raw 里 52 个有账本无页面，其中 43 条账本行是修复写进去的
+
+问“还有哪些 raw 没摄入”，守护进程的答案是 **0**：它自己的 catch-up 报 `No new files to ingest. System is
+fully synced.`，`jobs` 表零条非终态任务，我按同套发现/跳过规则重扫 1 767 个 `.md/.txt` 也是 0。但把
+“有 `processed_files` 行”当成“已入库”就错了：**52 个文件有账本行、wiki 里却没有页面**，而扫描信任账本，
+所以它们永远不会被第二次看上一眼。逐条读 job 记录才对上：43 条 `completed` 的 `result_json` 写的是
+`maintenance:operator_trust_hash_baseline_upgrade`(24) / `complete_already_processed`(19)，即账本修复把行
+补上去的，不是真摄入；11 条 `finalized/rejected`（无页面本就是合同结果，几乎全是 `raw/youtube/` 那批
+“算力/坍缩/降维”标题文章）；4 条 `superseded`；1 条 `standalone` 却无页面——这才是真异常。
+live 页加上 `.meta/backups` 全文 grep：**49 个在任何地方都没痕迹**，只有 3 个被别的页面提过。
+
+另有三类永远不会被 pipeline 碰：**204 个扩展名不在支持列表**（`Huggingface-Daily-Papers/` 下 177 个 pdf +
+`news/` 下 27 个 json）——它们既不进队列也不报错，是隐形地带；391 个按配置排除（`stocks/` 318、`garmin/` 42、
+`personal-insights/` 31）加 3 个私有，属有意为之。
+
+还有一类是账本本身的谎：**133 行指向磁盘上已不存在的文件**（账本 1 903 行 > 语料 1 767 个就是它），已清：
+101 条是 `news/` 与 `news/2026Q2/` 搬到 `news/2026Q3/` 后留下的重复行（目标路径的行都在，快照与旧行逐位相同），
+32 条是文件已被删除（其中 28 条仍被某个 page 的 `sources:` 声明引用）。在事务里一次删完，
+账本 1 903 → **1 770 行 = 扫描范围内 1 767 + 私有 3**，**0 行指向不存在的文件**；回退凭据
+`scratch/ledger_residue_deleted.json`（含每行原值与 INSERT 语句）。清理后重跑审计：待摄入仍是 0，“已入库且未变”
+1 715 → 1 716（多出的就是重投那一篇），清扫过的 `residue` 归 0。
+
+这里我自己先数错过一次，一并记下防止复用：初版审计把私有目录只按 posix 形式登记进磁盘路径集，而账本存的是
+native 形式，于是 `raw/privacy/Diary/` 下 3 个存在的日记被报成“文件不存在”，残渣数从 133 虚高了 3 到 136。
+账本从来没错，错的是审计的路径形式比较（已修）。
+
+同一批残渣的**页面侧**也一并处理了，但规模比初报的大得多：直接扫全部页面的 `sources:` 才发现，真
+“文件已删却还被声明”的是 **236 条**（我最初的 28 是从账本残渣倒推的，只覆盖有账本行的那些），另有
+**745 条根本不是删除**——声明串把文件名的全角 `：` 写成了空格（`后稀缺利维坦：AI 驱动…` vs 实际
+`后稀缺利维坦 AI 驱动…`），文件就在磁盘上，删了等于销毁 739 个页面的活溯源。按操作者选择的口径 B
+（删非私有、留私有）：**两个批次共 192 个页面 / 194 条声明**删完，剩 42 条全在 `raw/privacy/Diary/`
+（私有不碰），745 条待重指。每页过 5 项断言（body 逐字节相同、frontmatter 除 `sources` 外一致、`sources`
+键仍在、目标声明消失、删除条数匹配），171 页变成 `sources: []`；回退凭据在 `.meta/migrations/drop-dangling-sources-*.rollback.jsonl`。
+
+三个自己踩的坑一并记下，免得下次重踩：`dump_yaml` 会把老页面的 frontmatter 整个重排（30 行页面变 27
+行 diff），所以改成只重写 `sources` 块的手术式编辑；YAML 支持把 plain scalar 折行（`- raw/news/Show HN
+... for 8` / `  years.md`），以及声明串里真实存在**双空格**，两者都要求匹配时不能折叠空白；写验证脚本时
+把 `get_raw_dir()`（已是 `<MEMORY>/raw`）又拼了一次 `raw/`，结果把 21 个保留下来的活声明误报成“已死”。
+
+批量提交时还碰到一次真实写锁竞争：第二批 164 页里第一个 25 页块过了，第二个块 20 秒超时
+（`DatabaseLockTimeout`，守护进程的 catch-up/outbox 正在写）。这是竞争不是故障，恢复脚本按磁盘对账
+（已改完的跳过、未改的重建）后重试完成 114/114。
+
+745 条声明串写错的也已重指完毕。逐字符对账后这是一个单一故事：**声明里写的是归一化之前的文件名，磁盘上
+是归一化之后的**——`：` 变空格 606 条、`：` 直接删掉 46、`_` 变空格 33、`｜` 变空格或被删 39、`[]`/`【】` 被删 34、
+`？`/`！` 变空格 19，另有一类声明里多了个 `MEMORY/` 路径段（15）。它们的文件都在，所以上一轮的口径 B
+没碰它们——删了就是销毁活溯源。
+
+做法上三个必要约束：目标文件按归一化 stem key 匹配，而 raw 里有 222 个 key 对应多个文件，所以重名时用
+与声明串的相似度选（6 条命中此路，0 条无法判定）；重写只改 `sources` 条目里的值，保留原有引号风格，
+新值不能当 plain scalar（名字里有 ` #`）时改单引号（7 条）；每页过 6 项断言（body 逐字节相同、frontmatter
+除 `sources` 外一致、条目数不变、所有 raw 声明均已存在、不新增重复条目、目标已就位）。提交按 25 页分块、
+每块最多 3 次退避重试，并按墙钟预算（每次调用 150 秒）停机，4 次调用跑完 739 页 / 745 条，无一条回滚。
+
+两处逆预期：一页（`Concept_Software-3-0`）**本来就**把同一个文件声明了两次，断言因此拦住它——检查从“不得有
+重复”改成“不得新增重复”，没顺手替别人删东西；写锁竞争又踩到两次（25 页块 20 秒超时），仍是竞争而非故障。
+
+验证：分类器复查后 dangling 从 787 条降到 **42 条**，且这 42 条全是私有日记树（未动）；被改的 739 页里
+**没有任何一条 raw 声明指向不存在的文件**。副作用需要知道：重写页面会按设计作废其向量，所以 catch-up
+从 `missing=0` 变成 `missing=501 stale_inputs=701`，守护进程每轮补 200 个，约半小时内自行归零；没有向量
+期间的检索靠 gram 索引，不是丢页。
+
+那 1 条异常经操作者授权单独重投：在事务里删掉它的 `processed_files` 行（回退凭据
+`scratch/redispatch_receipt.json`），再由守护进程自己的扫描入队。runner 105 秒后 `finalized`，页面
+`Source_算力深渊与直觉的幽灵-2026-09-01.md` 已存在且 `sources:` 声明此 raw 路径、`source_hash` 已盖章，
+其余 51 个未动（账本 1 903 行不变、无在途任务、无 in-flight 标记）。本次模型只给了页面没给 `integration`
+块，于是 runner 用自己的 fallback 补了 `standalone`——页面成立、无关系边。
+
+顺带一个未处置的观察：账本里的哈希既有旧行的 `sha256:...` 也有新写入的 md5，而比较用的是 md5
+（`calculate_hash`），两者永不相等——该分支只会得出“内容已变”，方向偏安全（宁可重摄而不漏摄），
+没动它。
+
+## 模型缝的失败证据被自己的截断销毁：`pi` 从 `--no-session` 换成隔离 session 目录，失败时留下全文日志
+
+2026-09-25 16:24 watchdog 换到计划任务后，Runner 的第一个周期报了一笔 `model-failed`，写进
+`runner_status.json` 的原文是：
+
+```
+model runner exited 4: model seam: pi exited 1: [pi-web-access] ...
+Extension error (...NVlabs\SoL-Pi\src\sol-pi\index.ts): SoL-Pi requires a persistent Pi session directory
+Extension error (C:\Users\s
+```
+
+最后一行停在 `C:\Users\s`——不是子进程没报，而是缝只留 `stderr[:400]`、Runner 再留 300 字符，两者叠加后真正的死因必然落在窗口之外。**这次修的是“失败不可诊断”这件事本身**：一条线的报错被自己的截断吃掉，比它偶尔失败更贵。
+
+探测后是两个独立缺陷，各自都有读数，不是一个猜测：
+
+- `--no-session` 会连 session 根一起拿掉。实测同一个子进程在一次运行里重复打印
+  `SoL-Pi requires a persistent Pi session directory` **8、11、2 次**（视任务规模），全程非致命，
+  但它在做任何工作之前就先烧掉约 1 KB stderr——正好填满 Runner 的错误预算；同时 pi-subagents 的
+  preflight 退化成 `host_required`，子会话与 artifacts 落到共享临时树而不是本项目的树。
+- 换成 `--session-dir <repo>/scratch/runner_sessions` 后，同一条命令的 stderr **降到 0 字节**
+  （连 `pi-web-access` 那行也消失），`subagent-artifacts/` 落进本项目 scratch，运行仍是单次、不可续。
+  该目录按年龄（3 天）清理，而不是按数量，免得删掉正在跑的兄弟进程的会话。
+- 失败改为留全文：`scratch/runner_model-<stamp>-<pid>-{out,err}.log`，并且**日志路径排在消息最前面**
+  ——Runner 是从右往左截断的，路径必须比尾部先活下来。
+- 顺手收掉两个边缘：`TimeoutExpired` 以前直接抛 traceback，现在是带证据的模型失败；scratch 不可写时
+  退到临时 session 根继续跑，而不是新增一种失败模式（成功路径不写 stderr，噪声不能花掉错误预算）。
+
+证据：用真实 ingest 包直连缝跑通（exit 0、stderr 0 字节、契约数组合法、74–81 秒）；边界探针复刻上面那段
+被截断的 stderr，Runner 实际保留 303 字符，**日志路径与末尾真因都在**，指向的日志文件 1 209 字节、以
+`provider error: 402 insufficient balance` 结尾；新增 `tests/test_ingest_model_seam.py` 8 项，全量
+`1574 passed`（改动前 1 566）。
+
+诚实记录两点未闭合：
+
+- `pi exited 1` 本身是一次性瞬时故障，没能复现——4 次受控探测（`--no-session` 有无委派、大工具结果）
+  全部 exit 0，且 4 分钟后第二个周期就把同一笔任务 `finalized`，`jobs` 表里没有滞留租约。所以这次
+  没有“修复根因”的宣称，只有“它无法再隐藏”。
+- 子进程仍带着 `write`/`edit` 工具，只靠系统提示词约束“不要写文件”。要机械保证，应传
+  `--tools read,grep,find,ls,subagent`；这需要单独验证，因为工具名写错会让委派静默失效——比现状更糟。
+
 ## 运行态：守护进程从临时 shell 搬到计划任务（强杀后可自愈）
 
 守护进程一直由临时 shell `Start-Process` 拉起，于是它的寿命绑在那个 shell 上。2026-09-25 上一代
