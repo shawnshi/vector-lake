@@ -317,10 +317,10 @@ MEMORY/
 | 摄取交接 | `sync_vector_lake` · `prepare_ingest_batch` · `list_ingest_tasks` · `claim_ingest_tasks` · `finalize_ingest` · `expire_ingest_tasks` · `list_abandoned_ingest_sources` · `clear_abandoned_ingest_sources` · `list_terminal_failed_ingest_jobs` · `close_terminal_failed_ingest_jobs` |
 | 检索与运行态记忆 | `search_vector_lake` · `query_logic_lake` · `search_timeline` · `update_operational_memory` · `finalize_query_synthesis` |
 | 治理与审查 | `review_governance_list` · `resolve_governance_item` · `get_governance_debt` · `trigger_audit_graph` · `merge_suggestions_vector_lake` · `check_duplicate_entity` · `bulk_reconciliation` · `review_strategic_purpose` |
-| 自愈与体检 | `lint_vector_lake` · `gc_vector_lake` · `doctor_vector_lake` · `trace_vector_lake` · `trigger_autonomous_research` |
+| 自愈与体检 | `lint_vector_lake`（物理写入结果与 `fixes_applied` 严格对齐，支持 `(OSError, UnicodeDecodeError, ValueError)` 精准诊断） · `gc_vector_lake` · `doctor_vector_lake` · `trace_vector_lake` · `trigger_autonomous_research` |
 | 写入与结构 | `write_wiki_page` · `rename_entity` · `batch_replace_links` · `delete_source` · `propose_schema_mutation` |
 | 维护与投影 | `projection_report` · `canonical_backfill` · `projection_rebuild_index` · `embedding_backfill` · `wiki_restore` · `rebuild_timeline_events` · `memory_gram_index_status` · `rebuild_memory_gram_index` · `backup_retention_report` · `idempotency_index_status` · `repair_idempotency_keys` · `claim_projection_drift_report` · `repair_claim_pointers` |
-| 可视化 | `visualize_vector_lake` |
+| 可视化 | `visualize_vector_lake`（支持 `open_browser` 及 `VECTOR_LAKE_NO_BROWSER` / `HEADLESS` / `CI` 静默环境变量，杜绝无头/后台执行时浏览器弹窗阻塞） |
 
 > 以下底层 CLI 命令仍然保留，供人类开发者日常手动调试与状态维护。
 

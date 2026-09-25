@@ -378,6 +378,7 @@ def visualize_vector_lake(
     max_edges: int = DEFAULT_MAX_PAGE_EDGES,
     min_edge_weight: float = 0.0,
     lock_timeout_seconds: float = DEFAULT_INDEX_LOCK_TIMEOUT_SECONDS,
+    open_browser: bool = True,
 ):
     bootstrap = governance_store.ensure_canonical_store_populated()
     if bootstrap.get("bootstrapped"):
@@ -448,7 +449,17 @@ def visualize_vector_lake(
     with open(output_path, "w", encoding="utf-8") as handle:
         handle.write(html)
 
-    webbrowser.open(f"file:///{output_path.replace(os.sep, '/')}")
+    should_open = (
+        open_browser
+        and not os.environ.get("VECTOR_LAKE_NO_BROWSER")
+        and not os.environ.get("HEADLESS")
+        and not os.environ.get("CI")
+    )
+    if should_open:
+        try:
+            webbrowser.open(f"file:///{output_path.replace(os.sep, '/')}")
+        except Exception as e:
+            log.warning(f"Failed to open browser automatically: {e}")
     meta = graph_data.get("meta", {})
     page_edges_str = f"{meta.get('rendered_page_edges', len(graph_data['pageGraph']['edges']))} backbone edges"
     if meta.get("pruned"):

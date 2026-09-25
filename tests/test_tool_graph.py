@@ -106,3 +106,24 @@ def test_build_graph_payload_meta_auditing():
     assert meta["rendered_page_edges"] == 5
     assert meta["pruned"] is True
     assert len(payload["pageGraph"]["edges"]) == 5
+
+
+def test_visualize_vector_lake_respects_headless_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("VECTOR_LAKE_NO_BROWSER", "1")
+    opened = []
+    monkeypatch.setattr(tool_graph.webbrowser, "open", lambda url: opened.append(url))
+
+    index_file = tmp_path / "index.json"
+    index_file.write_text('{"nodes": {}, "weighted_edges": []}', encoding="utf-8")
+    monkeypatch.setattr(tool_graph, "get_index_path", lambda: index_file)
+    monkeypatch.setattr(tool_graph, "get_claim_graph_path", lambda: tmp_path / "claim_graph.json")
+
+    # Call with open_browser=False
+    res = tool_graph.visualize_vector_lake(output_dir=str(tmp_path), open_browser=False)
+    assert "Opened graph in browser" in res or "Visualized" in res
+    assert len(opened) == 0
+
+    # Call with open_browser=True, but environment variable VECTOR_LAKE_NO_BROWSER=1 is set
+    res2 = tool_graph.visualize_vector_lake(output_dir=str(tmp_path), open_browser=True)
+    assert len(opened) == 0
+

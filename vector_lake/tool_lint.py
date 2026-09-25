@@ -190,11 +190,13 @@ def _type_from_filename(filename: str) -> str:
     return filename.split("_", 1)[0].lower() if "_" in filename else "concept"
 
 
-def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
+def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str) -> bool:
     try:
         write_markdown_file(filepath, frontmatter, body, skip_validation=False)
+        return True
     except Exception as e:
         log.warning(f"Failed to write fixed frontmatter to {filepath}: {e}")
+        return False
 
 
 def _generate_id(stem: str) -> str:
@@ -300,8 +302,8 @@ def lint_vector_lake(auto_fix: bool = False):
         node_key = filename[:-3]
         try:
             frontmatter, body, content = read_markdown_file(filepath)
-        except Exception:
-            issues["frontmatter"].append(f"{filename}: Cannot read file")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            issues["frontmatter"].append(f"{filename}: Cannot read file ({type(exc).__name__}: {exc})")
             continue
 
         if not content.startswith("---"):
@@ -409,8 +411,8 @@ def lint_vector_lake(auto_fix: bool = False):
                 for fname in filenames[1:]:
                     if fname in parsed:
                         parsed[fname]["fm"]["id"] = _generate_id(fname[:-3])
-                        _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"])
-                        fixes_applied += 1
+                        if _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"]):
+                            fixes_applied += 1
 
     # 3. Alias Conflicts
     for alias, filenames in alias_map.items():
@@ -424,8 +426,8 @@ def lint_vector_lake(auto_fix: bool = False):
                         if alias in aliases:
                             aliases.remove(alias)
                             parsed[fname]["fm"]["aliases"] = aliases
-                            _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"])
-                            fixes_applied += 1
+                            if _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"]):
+                                fixes_applied += 1
                             # The alias is gone from disk now, so it is no longer claimed here:
                             # otherwise one report says both "claim removed" and "two pages
                             # declare this name", about the same run.
@@ -571,8 +573,10 @@ def lint_vector_lake(auto_fix: bool = False):
                 )
 
         if auto_fix and changed:
-            _write_fixed_frontmatter(data["path"], frontmatter, data["body"])
-            fixes_applied += 1
+            if _write_fixed_frontmatter(data["path"], frontmatter, data["body"]):
+                fixes_applied += 1
+            else:
+                issues["frontmatter"].append(f"{filename}: Auto-fix write failed")
 
         try:
             validate_schema(frontmatter, data["body"], filename)
