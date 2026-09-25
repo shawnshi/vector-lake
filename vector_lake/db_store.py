@@ -1549,6 +1549,30 @@ def _alias_registry_value_index_is_stale(conn: sqlite3.Connection) -> bool:
     return not {"idx_alias_registry_value"} <= _index_names(conn)
 
 
+def _search_state_rowid_is_stale(conn: sqlite3.Connection) -> bool:
+    """Whether ``wiki_search_index_state`` lacks ``fts_rowid``, or is not backfilled yet.
+
+    Why the rowid exists: ``wiki_search_index`` is an FTS5 table, and FTS5 cannot serve a lookup on a
+    *column* -- so ``DELETE FROM wiki_search_index WHERE node_key = ?`` scans the whole index per
+    call.  Measured 2026-09-25 on the live lake, per row: that delete **52.4 ms**, the ``INSERT``
+    0.1 ms, and ``DELETE ... WHERE rowid = ?`` **0.33 ms** (158x).  The profile had already put 87% of
+    a rebuild inside that function, on the delete's line.
+
+    Checking for NULL as well as absence matters: a crash between the ``ALTER`` and the backfill
+    would otherwise leave the column present and empty forever, because ``init_db`` short-circuits.
+    """
+    if "fts_rowid" not in _table_columns(conn, "wiki_search_index_state"):
+        return True
+    try:
+        return bool(
+            conn.execute(
+                "SELECT 1 FROM wiki_search_index_state WHERE fts_rowid IS NULL LIMIT 1"
+            ).fetchone()
+        )
+    except sqlite3.OperationalError:
+        return True
+
+
 def init_db():
     db_path = get_db_path()
     db_key = str(db_path.resolve())
@@ -1567,6 +1591,7 @@ def init_db():
             and not _timeline_format_is_stale(get_connection())
             and not _jobs_ledger_index_is_stale(get_connection())
             and not _alias_registry_value_index_is_stale(get_connection())
+            and not _search_state_rowid_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1947,6 +1972,25 @@ def _init_db_once(db_key: str):
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_alias_registry_value ON alias_registry(value)"
         )
+
+        # The FTS projection's deletion key, and its backfill.  Additive: a database that never runs
+        # this still works, because every delete site keeps its ``node_key`` fallback.
+        try:
+            conn.execute("ALTER TABLE wiki_search_index_state ADD COLUMN fts_rowid INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+        if conn.execute(
+            "SELECT 1 FROM wiki_search_index_state WHERE fts_rowid IS NULL LIMIT 1"
+        ).fetchone():
+            # One pass over the FTS table, not a correlated subquery per row: the latter would re-scan
+            # the virtual table once per row, which is the 271 s mistake this change is about.
+            pairs = list(conn.execute("SELECT rowid, node_key FROM wiki_search_index"))
+            conn.executemany(
+                "UPDATE wiki_search_index_state SET fts_rowid = ? WHERE node_key = ?",
+                [(int(row[0]), str(row[1])) for row in pairs],
+            )
+            log.info("Backfilled fts_rowid for %d FTS row(s).", len(pairs))
         
         # Add expression-based indexes for performance
         try:
@@ -2016,16 +2060,30 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str, cont
     """
     conn = get_connection()
     with transaction():
-        # FTS5 doesn't support ON CONFLICT REPLACE directly, so we delete then insert.
-        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
-        conn.execute("""
+        # FTS5 does not support ON CONFLICT REPLACE, so this deletes then inserts -- and the delete
+        # must go through the rowid: ``WHERE node_key = ?`` scans the whole virtual table (52.4 ms
+        # per row measured, against 0.33 ms by rowid).  The node_key form is kept as well so a row
+        # whose position was never recorded is still removed.
+        rowid = _search_index_rowid(conn, node_key)
+        if rowid is not None:
+            # Verified by node_key as well: a rowid is a position, and a position can be reassigned
+            # if the index is ever rebuilt, so deleting on it alone could remove another page's row.
+            # The pair is still a point delete -- the row is located by rowid and only its node_key
+            # column is checked -- where the node_key alone is a full scan of the virtual table.
+            conn.execute(
+                "DELETE FROM wiki_search_index WHERE rowid = ? AND node_key = ?", (rowid, node_key)
+            )
+        else:
+            conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        cursor = conn.execute("""
             INSERT INTO wiki_search_index (node_key, title, summary, text)
             VALUES (?, ?, ?, ?)
         """, (node_key, title, summary, text))
         if content_hash is not None:
             conn.execute(
-                "INSERT OR REPLACE INTO wiki_search_index_state (node_key, content_hash, updated_at) VALUES (?, ?, ?)",
-                (node_key, content_hash, datetime.now(timezone.utc).isoformat()),
+                "INSERT OR REPLACE INTO wiki_search_index_state"
+                " (node_key, content_hash, updated_at, fts_rowid) VALUES (?, ?, ?, ?)",
+                (node_key, content_hash, datetime.now(timezone.utc).isoformat(), cursor.lastrowid),
             )
     mirror = _tantivy()
     if mirror is not None:
@@ -2042,6 +2100,23 @@ def clear_search_index():
     mirror = _tantivy()
     if mirror is not None:
         _tan_quiet(mirror.clear)
+
+
+def _search_index_rowid(conn: sqlite3.Connection, node_key: str) -> int | None:
+    """The FTS rowid recorded for a node, or ``None`` when none was recorded.
+
+    Read through the state table, which is keyed by ``node_key`` -- asking the FTS table itself would
+    be the full scan this function exists to avoid.
+    """
+    try:
+        row = conn.execute(
+            "SELECT fts_rowid FROM wiki_search_index_state WHERE node_key = ?", (node_key,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def search_index_state() -> dict[str, str]:
@@ -2194,7 +2269,16 @@ def finish_embedding_run(run_id: str, status: str, processed: int, failed_batche
 def delete_search_index(node_key: str):
     conn = get_connection()
     with transaction():
-        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        # By rowid when it was recorded: `WHERE node_key = ?` scans the whole FTS index
+        # (52.4 ms per row measured against 0.33 ms), and the node_key form stays as the
+        # fallback for rows whose position predates the backfill.
+        rowid = _search_index_rowid(conn, node_key)
+        if rowid is not None:
+            conn.execute(
+                "DELETE FROM wiki_search_index WHERE rowid = ? AND node_key = ?", (rowid, node_key)
+            )
+        else:
+            conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (node_key,))
@@ -2221,7 +2305,16 @@ def delete_node_cascade(node_key: str):
             (node_key, node_key, node_key + ".md"),
         ).fetchall()
 
-        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        # By rowid when it was recorded: `WHERE node_key = ?` scans the whole FTS index
+        # (52.4 ms per row measured against 0.33 ms), and the node_key form stays as the
+        # fallback for rows whose position predates the backfill.
+        rowid = _search_index_rowid(conn, node_key)
+        if rowid is not None:
+            conn.execute(
+                "DELETE FROM wiki_search_index WHERE rowid = ? AND node_key = ?", (rowid, node_key)
+            )
+        else:
+            conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
         conn.execute(f"DELETE FROM vec_embeddings WHERE page_key IN ({placeholders})", related_ids)
         conn.execute(f"DELETE FROM vec_embedding_inputs WHERE node_key IN ({placeholders})", related_ids)
