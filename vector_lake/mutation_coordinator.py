@@ -46,6 +46,7 @@ def materialize_markdown_projection(
     mutation_type: str,
     payload_text: str | None = None,
     validation_mode: str = "full",
+    pre_parsed_frontmatter: dict | None = None,
 ) -> Path:
     """Idempotently materialize the Markdown projection for one outbox row."""
     filepath = resolve_wiki_mutation_path(
@@ -64,7 +65,7 @@ def materialize_markdown_projection(
         if not filepath.exists():
             raise ValueError(f"Outbox update for {filename} has no payload and no existing Markdown projection.")
         payload_text = filepath.read_text(encoding="utf-8")
-    atomic_write_text(filepath, payload_text, validation_mode=validation_mode)
+    atomic_write_text(filepath, payload_text, pre_parsed_frontmatter=pre_parsed_frontmatter, validation_mode=validation_mode)
     return filepath
 
 
@@ -141,11 +142,14 @@ def _prepare_mutations(
                 verify_asset(content, filename, frontmatter, get_index_path(), is_new)
             else:
                 validate_schema(frontmatter, content, filename, get_index_path(), is_new)
+        else:
+            frontmatter = None
 
         prepared.append(
             {
                 "filename": filename,
                 "content": content,
+                "frontmatter": frontmatter,
                 "filepath": filepath,
                 "mutation_type": mutation_type,
                 "has_expected_version": has_expected_version,
@@ -193,6 +197,7 @@ def execute_mutation_batch(
             origin="mutation_coordinator",
             auto_approve=True,
             summary=f"Canonical mutation for {filename}",
+            pre_parsed_frontmatter=mutation.get("frontmatter"),
         )
         prepared_change_sets.append(change_set)
 
@@ -230,30 +235,43 @@ def execute_mutation_batch(
             change_set["published_at"] = published_at
         governance_store.record_prepared_change_sets(prepared_change_sets)
 
-        for mutation in prepared:
-            filename = mutation["filename"]
-            content = mutation["content"]
-            outbox_ids.append(
-                db_store.enqueue_mutation(
-                    filename,
-                    mutation["mutation_type"],
-                    payload_text=content,
-                    idempotency_key=mutation["idempotency_key"],
-                    validation_mode=validation_mode,
-                )
-            )
+        outbox_items = [
+            {
+                "filename": mutation["filename"],
+                "mutation_type": mutation["mutation_type"],
+                "payload_text": mutation["content"],
+                "idempotency_key": mutation["idempotency_key"],
+                "validation_mode": validation_mode,
+            }
+            for mutation in prepared
+        ]
+        outbox_ids = db_store.enqueue_mutations_batch(outbox_items)
+
         if canonical_callback is not None:
             canonical_callback()
 
     deferred = []
+    import inspect
+    sig = inspect.signature(materialize_markdown_projection)
+    supports_frontmatter = "pre_parsed_frontmatter" in sig.parameters
+
     for mutation, outbox_id in zip(prepared, outbox_ids):
         try:
-            materialize_markdown_projection(
-                mutation["filename"],
-                mutation["mutation_type"],
-                mutation["content"],
-                validation_mode=validation_mode,
-            )
+            if supports_frontmatter:
+                materialize_markdown_projection(
+                    mutation["filename"],
+                    mutation["mutation_type"],
+                    mutation["content"],
+                    validation_mode=validation_mode,
+                    pre_parsed_frontmatter=mutation.get("frontmatter"),
+                )
+            else:
+                materialize_markdown_projection(
+                    mutation["filename"],
+                    mutation["mutation_type"],
+                    mutation["content"],
+                    validation_mode=validation_mode,
+                )
         except Exception as exc:
             deferred.append(mutation["filename"])
             log.error(

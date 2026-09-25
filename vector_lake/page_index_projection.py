@@ -359,11 +359,13 @@ def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
         with transaction():
             conn.execute("DELETE FROM page_index_edges")
             if edge_rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO page_index_edges "
-                    "(sequence, source_key, target_key, weight) VALUES (?, ?, ?, ?)",
-                    edge_rows,
-                )
+                for start_idx in range(0, len(edge_rows), 5000):
+                    chunk = edge_rows[start_idx : start_idx + 5000]
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO page_index_edges "
+                        "(sequence, source_key, target_key, weight) VALUES (?, ?, ?, ?)",
+                        chunk,
+                    )
     if stamp is not None:
         digest_supported = _edge_digest_supported(conn)
         columns = (
@@ -544,15 +546,28 @@ class _FileCatalog:
         ]
 
 
-def _fallback_note() -> str:
+class ProjectionNote(str):
+    """Enriched note string carrying machine-readable projection status."""
+
+    def __new__(cls, text: str, *, is_degraded: bool = True, source: str = "index.json", reason: str | None = None):
+        instance = super().__new__(cls, text)
+        instance.is_degraded = is_degraded
+        instance.source = source
+        instance.reason = reason
+        return instance
+
+
+def _fallback_note() -> ProjectionNote:
     note = (
         "page index projection is behind index.json; node and edge reads fell back to "
         "index.json itself (results are current; the outbox consumer rebuilds the projection)"
     )
     marker = projection_stale()
+    reason = None
     if marker is not None:
-        note += f"; last writer-reported refresh failure: {marker.get('reason')}"
-    return note
+        reason = marker.get("reason")
+        note += f"; last writer-reported refresh failure: {reason}"
+    return ProjectionNote(note, is_degraded=True, source="index.json", reason=reason)
 
 
 # One cached fallback catalog, keyed by the ``index.json`` stamp.

@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -139,7 +140,64 @@ def run_model(packet: dict, model_cmd: str) -> tuple:
     return files, ""
 
 
-def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
+def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: dict) -> tuple[dict, str]:
+    """Process a single claimed ingest task in isolation (C7 error containment)."""
+    res = {"duplicate": 0, "missing-source": 0, "needs-model": 0, "finalized": 0, "errors": 0, "model-failed": 0}
+    last_err = ""
+    packet = task.get("task_packet") or {}
+    processed = (packet.get("metadata") or {}).get("processed_data")
+    job_id = str(task.get("job_id") or "")
+    if packet.get("error") or not processed:
+        reason = str(packet.get("error") or "task packet carries no processed_data")
+        res["errors"] += 1
+        last_err = reason
+        if job_id:
+            record_ingest_failure(job_id, f"unusable task packet: {reason}")
+        return res, last_err
+
+    verdict = classify(processed, publication_index)
+    try:
+        if verdict in {"duplicate", "missing-source"}:
+            reason = REJECT_DUPLICATE if verdict == "duplicate" else REJECT_MISSING_SOURCE
+            result = finalize_ingest([], {**processed, "integration": {"disposition": "rejected", "reason": reason}})
+            res[verdict] += 1
+            if "Successfully finalized" in result:
+                res["finalized"] += 1
+            else:
+                res["errors"] += 1
+                last_err = result
+                if job_id:
+                    record_ingest_failure(job_id, f"rejection could not be finalized: {result}")
+        elif shadow or not model_cmd:
+            res["needs-model"] += 1
+            if job_id and os.environ.get("VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE", "0") != "1":
+                from vector_lake.db_store import release_job_for_retry
+                release_job_for_retry(job_id, "shadow run: model call skipped")
+        else:
+            files, error = run_model(packet, model_cmd)
+            if error:
+                res["model-failed"] += 1
+                last_err = error
+                if job_id:
+                    record_ingest_failure(job_id, f"model seam: {error}")
+                return res, last_err
+            result = finalize_ingest(files, _with_disposition(processed))
+            if "Successfully finalized" in result:
+                res["finalized"] += 1
+            else:
+                res["errors"] += 1
+                last_err = result
+                if job_id:
+                    record_ingest_failure(job_id, f"finalize rejected: {result}")
+    except Exception as exc:
+        res["errors"] += 1
+        last_err = f"{type(exc).__name__}: {exc}"
+        if job_id:
+            record_ingest_failure(job_id, f"{type(exc).__name__}: {exc}")
+    return res, last_err
+
+
+def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict, concurrency: int = 1) -> dict:
     claimed = json.loads(claim_ingest_tasks(limit=limit))
     batch = {"claimed": len(claimed), "duplicate": 0, "missing-source": 0,
              "needs-model": 0, "finalized": 0, "errors": 0, "model-failed": 0}
@@ -147,61 +205,27 @@ def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
         return batch
     publication_index = raw_publication_index()
 
-    for task in claimed:
-        packet = task.get("task_packet") or {}
-        processed = (packet.get("metadata") or {}).get("processed_data")
-        job_id = str(task.get("job_id") or "")
-        if packet.get("error") or not processed:
-            # C7: leave it to the runtime (it retires unreadable packets at claim time).
-            # The reason still has to reach the status file and the attempt budget: this
-            # branch used to count an error and record nothing, so the failure had no cause
-            # anywhere and the job was re-claimed until its lease expired.
-            reason = str(packet.get("error") or "task packet carries no processed_data")
-            batch["errors"] += 1
-            stats["last_error"] = reason
-            if job_id:
-                record_ingest_failure(job_id, f"unusable task packet: {reason}")
-            continue
-        verdict = classify(processed, publication_index)
-        try:
-            if verdict in {"duplicate", "missing-source"}:
-                reason = REJECT_DUPLICATE if verdict == "duplicate" else REJECT_MISSING_SOURCE
-                result = finalize_ingest([], {**processed, "integration": {"disposition": "rejected", "reason": reason}})
-                batch[verdict] += 1
-                if "Successfully finalized" in result:
-                    batch["finalized"] += 1
-                else:
-                    # A rejected finalize used to leave every counter at zero, so a
-                    # blocking gate looked like "no progress" with no recorded reason.
-                    batch["errors"] += 1
-                    stats["last_error"] = result
-                    if job_id:
-                        record_ingest_failure(job_id, f"rejection could not be finalized: {result}")
-            elif shadow or not model_cmd:
-                batch["needs-model"] += 1  # stays leased; nothing written
-            else:
-                files, error = run_model(packet, model_cmd)
-                if error:
-                    batch["model-failed"] += 1
-                    # assign, not setdefault: stats already carries "last_error": "",
-                    # so setdefault silently discarded the only diagnostic for the failure.
-                    stats["last_error"] = error
-                    if job_id:
-                        record_ingest_failure(job_id, f"model seam: {error}")
-                    continue
-                result = finalize_ingest(files, _with_disposition(processed))
-                if "Successfully finalized" in result:
-                    batch["finalized"] += 1
-                else:
-                    batch["errors"] += 1
-                    stats["last_error"] = result
-                    if job_id:
-                        record_ingest_failure(job_id, f"finalize rejected: {result}")
-        except Exception as exc:  # C7: contain per-task failure
-            batch["errors"] += 1
-            stats["last_error"] = f"{type(exc).__name__}: {exc}"
-            if job_id:
-                record_ingest_failure(job_id, f"{type(exc).__name__}: {exc}")
+    if concurrency > 1 and len(claimed) > 1:
+        workers = min(concurrency, len(claimed))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_process_task, task, shadow, model_cmd, publication_index)
+                for task in claimed
+            ]
+            for f in futures:
+                task_res, err = f.result()
+                for k, v in task_res.items():
+                    batch[k] += v
+                if err:
+                    stats["last_error"] = err
+    else:
+        for task in claimed:
+            task_res, err = _process_task(task, shadow, model_cmd, publication_index)
+            for k, v in task_res.items():
+                batch[k] += v
+            if err:
+                stats["last_error"] = err
+
     return batch
 
 
@@ -210,6 +234,9 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--once", action="store_true", help="run a single batch and exit")
     parser.add_argument("--interval", type=int, default=60, help="seconds between batches in loop mode")
+    parser.add_argument("--concurrency", "-c", type=int,
+                        default=int(os.environ.get("VECTOR_LAKE_RUNNER_CONCURRENCY", "1")),
+                        help="concurrent worker threads for model execution (default 1)")
     parser.add_argument("--shadow", action="store_true", default=True)
     parser.add_argument("--no-shadow", dest="shadow", action="store_false",
                         help="allow real writes (requires --model-cmd)")
@@ -244,7 +271,7 @@ def main() -> int:
 
     while True:
         try:
-            batch = process_once(args.limit, args.shadow, args.model_cmd, stats)
+            batch = process_once(args.limit, args.shadow, args.model_cmd, stats, args.concurrency)
             totals = stats["totals"]
             for key, value in batch.items():
                 totals[key] = int(totals.get(key, 0)) + int(value)

@@ -2233,6 +2233,20 @@ def published_edge_projection_drift(max_examples: int = 3) -> dict[str, object]:
     }
 
 
+def enqueue_mutations_batch(items: list[dict]) -> list[int]:
+    """Batch-enqueue mutations into the durable outbox within the caller's transaction."""
+    return [
+        enqueue_mutation(
+            item["filename"],
+            item["mutation_type"],
+            payload_text=item.get("payload_text"),
+            idempotency_key=item.get("idempotency_key"),
+            validation_mode=item.get("validation_mode", "full"),
+        )
+        for item in items
+    ]
+
+
 def enqueue_mutation(
     filename: str,
     mutation_type: str,
@@ -2254,11 +2268,11 @@ def enqueue_mutation(
                 (idempotency_key,),
             ).fetchone()
             if existing:
-                if existing["status"] == "failed":
+                if existing["status"] in {"failed", "completed"}:
                     conn.execute(
                         "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
-                        "last_error = NULL, available_at = ?, lease_until = NULL WHERE id = ?",
-                        (now, existing["id"]),
+                        "last_error = NULL, available_at = ?, lease_until = NULL, payload_text = ? WHERE id = ?",
+                        (now, payload_text, existing["id"]),
                     )
                 return int(existing["id"])
         cursor = conn.execute(

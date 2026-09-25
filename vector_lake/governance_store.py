@@ -2000,10 +2000,15 @@ def prepare_change_set_from_content(
     origin: str,
     summary: str | None = None,
     auto_approve: bool = False,
+    pre_parsed_frontmatter: dict | None = None,
 ) -> dict:
     """Build one canonical change set without applying or persisting it."""
     initialize_meta_store()
-    frontmatter, body = split_frontmatter(content)
+    if pre_parsed_frontmatter is not None:
+        frontmatter = pre_parsed_frontmatter
+        _, body = split_frontmatter(content)
+    else:
+        frontmatter, body = split_frontmatter(content)
     extracted = extract_page_objects(filename, frontmatter, body)
     if not extracted.get("entities") and not filename.startswith("System_"):
         raise ValueError(f"No canonical entity could be extracted from {filename}.")

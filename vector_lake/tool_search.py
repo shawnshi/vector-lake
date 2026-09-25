@@ -149,6 +149,13 @@ CANDIDATE_POOL = 40
 SOURCE_RANK_PENALTY = 0.6
 
 
+def _vector_sim_scale() -> float:
+    try:
+        return float(os.environ.get("VECTOR_LAKE_VECTOR_SIM_SCALE", "15.0"))
+    except ValueError:
+        return 15.0
+
+
 def _candidate_depth() -> int:
     return _env_positive_int("VECTOR_LAKE_CANDIDATE_DEPTH", CANDIDATE_DEPTH)
 
@@ -296,6 +303,9 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
         log.warning(f"Failed to query vec_embeddings: {e}")
         return {}, f"vec_embeddings query failed: {type(e).__name__}: {e}"
 
+_LAST_FTS_ERROR = threading.local()
+
+
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     from vector_lake import tokenizer as _tokenizer
 
@@ -306,6 +316,7 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     query_tok = re.sub(r'["*^&|()\-:\[\]{}]', ' ', query_tok)
     # Ensure it's not empty or just spaces
     if not query_tok.strip():
+        _LAST_FTS_ERROR.msg = None
         return []
         
     try:
@@ -317,11 +328,15 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
             WHERE wiki_search_index MATCH ? 
             ORDER BY rank LIMIT ?
         """, (query_tok, limit))
+        _LAST_FTS_ERROR.msg = None
         return [dict(row) for row in cur.fetchall()]
     except Exception as e:
-        log.warning(f"Failed to query fts5: {e}")
+        msg = f"FTS5 query failed ({type(e).__name__}: {e})"
+        log.warning(msg)
+        _LAST_FTS_ERROR.msg = msg
         return []
 
+@functools.lru_cache(maxsize=128)
 def _keyword_intent(query: str) -> str:
     """A keyword guess at the query's shape -- not an intent classifier, and named accordingly.
 
@@ -435,13 +450,35 @@ def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) ->
     )
 
 
-def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool = False, include_history: bool = False, memory_types: list[str] | None = None) -> str:
+def format_operational_memory_results(
+    query: str,
+    top_k: int = 8,
+    as_xml: bool = False,
+    include_history: bool = False,
+    memory_types: list[str] | None = None,
+    domain: str | None = None,
+    cluster: str | None = None,
+) -> str:
+    fetch_k = top_k * 3 if (domain or cluster) else top_k
     memories = governance_store.search_operational_memory(
         query,
-        top_k=top_k,
+        top_k=fetch_k,
         include_history=include_history,
         memory_types=memory_types,
     )
+    if domain:
+        d_lower = domain.lower()
+        memories = [
+            m for m in memories
+            if d_lower in str(m.get("source_page", "")).lower() or d_lower in str(m.get("domain", "")).lower()
+        ]
+    if cluster:
+        c_lower = cluster.lower()
+        memories = [
+            m for m in memories
+            if c_lower in str(m.get("topic_cluster", "")).lower()
+        ]
+    memories = memories[:top_k]
     if not memories:
         return "No operational memory matched the query."
     return "".join(_format_memory_result(memory, as_xml=as_xml, index=index) for index, memory in enumerate(memories))
@@ -509,11 +546,17 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         for memory in stale_or_conflicted[:6]
     ] or ["- None matched."]
 
+    from vector_lake import memory_gram_index
+    gram_usable = memory_gram_index.gram_index_usable()
+    policy_line = "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict."
+    if not gram_usable:
+        policy_line += " [DEGRADED: Operational memory gram index is behind; served via exact projected scan]"
+
     head = [
         "<MEMORY_PACKET>",
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
         f"Query: {query}",
-        "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict.",
+        policy_line,
         "",
     ]
     tail = [
@@ -561,6 +604,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         "memory_count": len(memories),
         "warning_count": len(stale_or_conflicted),
         "omitted_count": omitted,
+        "is_degraded": not gram_usable,
     }
 
 
@@ -870,6 +914,7 @@ def _search_scored_pages(
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = {}
+    vector_notes = []
     
     # 1. FTS5 Search
     fts_ranked: list[str] = []
@@ -877,6 +922,27 @@ def _search_scored_pages(
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
         fts_results = _get_fts_search_results(expanded_query, limit=_candidate_depth())
+        fts_error = getattr(_LAST_FTS_ERROR, "msg", None)
+        if fts_error:
+            vector_notes.append(fts_error)
+            if hasattr(catalog, "_nodes") and isinstance(catalog._nodes, dict):
+                fallback_hits = []
+                q_lower = query.lower()
+                toks_lower = [t.lower() for t in tokens if len(t) >= 2]
+                for k, node in catalog._nodes.items():
+                    title = str(node.get("title") or "").lower()
+                    k_lower = k.lower()
+                    score = 0.0
+                    if q_lower in title or q_lower in k_lower:
+                        score = 10.0
+                    elif any(t in title or t in k_lower for t in toks_lower):
+                        score = 5.0
+                    if score > 0.0:
+                        fallback_hits.append({"node_key": k, "title": node.get("title", k), "score": score})
+                fallback_hits.sort(key=lambda x: x["score"], reverse=True)
+                fts_results = fallback_hits[:_candidate_depth()]
+                if fts_results:
+                    vector_notes.append(f"FTS5 fallback: matched {len(fts_results)} node(s) from index.json")
         for position, row in enumerate(fts_results):
             key = row['node_key']
             raw_score = row.get('rank')
@@ -893,7 +959,6 @@ def _search_scored_pages(
         log.error(f"FTS5 Search failed: {e}")
 
     # 2. Vector Search (Hybrid blending)
-    vector_notes = []
     vector_ranked: list[str] = []
     query_vector, embedding_error = _get_query_embedding(query)
     if query_vector:
@@ -911,7 +976,7 @@ def _search_scored_pages(
                 contribution = 1.0 / (RRF_K + position + 1)
             else:
                 # scale similarity so it competes/blends with BM25.
-                contribution = (sim ** 2) * 15.0
+                contribution = (sim ** 2) * _vector_sim_scale()
             hybrid_scores[key] = hybrid_scores.get(key, 0.0) + contribution
             vector_ranked.append(key)
     else:
@@ -1109,9 +1174,9 @@ def _search_scored_pages(
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
-        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history)
+        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, domain=domain, cluster=cluster)
     if normalized_mode in {"claim", "claims"}:
-        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, memory_types=["fact"])
+        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, memory_types=["fact"], domain=domain, cluster=cluster)
 
     wiki_dir = str(get_wiki_dir())
     final_scored, vector_notes, error = _search_scored_pages(
@@ -1134,9 +1199,14 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
         snippet = ""
         if os.path.exists(filepath):
-            with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                content = handle.read()
-            snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:2500]  # V11.2: Expanded chunk limit
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+                snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:2500]
+            except OSError:
+                snippet = str(node.get("summary") or "")
+        else:
+            snippet = str(node.get("summary") or "")
             
         tension_edges = node.get("tension_edges", [])
         tension_info = ""

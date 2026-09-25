@@ -231,7 +231,7 @@ def reconcile_ingest_in_flight(grace_seconds: float = 120.0) -> dict:
     # invisible to the scan that would have re-enqueued them.
     from vector_lake.db_store import MAX_INGEST_ATTEMPTS
 
-    dispatchable = ("queued", "dispatched", "awaiting_subagent", "subagent_processing", "completed")
+    dispatchable = ("queued", "dispatched", "awaiting_subagent", "subagent_processing")
     placeholders = ", ".join("?" for _ in dispatchable)
     active: set[str] = set()
     rows = conn.execute(
@@ -650,7 +650,7 @@ def _normalise_search_text(value: str) -> str:
 _COLD_KB_CONTEXT = "- (no existing nodes: cold knowledge base)"
 
 
-def ingest_context_and_candidates(filepath: str, max_nodes: int = 40) -> tuple[str, list[dict]]:
+def ingest_context_and_candidates(filepath: str, max_nodes: int = 40, _cache: dict | None = None) -> tuple[str, list[dict]]:
     """The prompt's index context and the dispatch manifest, from one computation.
 
     They must come from the same calculation: the model is told to use only relations from the
@@ -676,7 +676,7 @@ def ingest_context_and_candidates(filepath: str, max_nodes: int = 40) -> tuple[s
                 "(`projection-rebuild-index`) before ingesting new sources."
             )
         return _COLD_KB_CONTEXT, []
-    candidates = select_ingest_candidates(filepath, max_nodes)
+    candidates = select_ingest_candidates(filepath, max_nodes, _cache=_cache)
     return _render_index_context(candidates), candidates
 
 
@@ -689,7 +689,7 @@ def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
     return ingest_context_and_candidates(filepath, max_nodes)[0]
 
 
-def select_ingest_candidates(filepath: str, max_nodes: int = 40) -> list[dict]:
+def select_ingest_candidates(filepath: str, max_nodes: int = 40, _cache: dict | None = None) -> list[dict]:
     """Source-relevant candidates from the complete index, as dispatch-manifest records."""
     index_path = get_index_path()
     try:
@@ -712,11 +712,20 @@ def select_ingest_candidates(filepath: str, max_nodes: int = 40) -> list[dict]:
         source_acronyms = {
             token.lower() for token in re.findall(r"\b[A-Z][A-Z0-9]{1,7}\b", source_text)
         }
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        nodes = index_data.get("nodes", {})
-        if not nodes:
-            return []
-        canonical_versions = governance_store.canonical_page_versions(set(nodes))
+
+        if _cache is not None and "nodes" in _cache and "canonical_versions" in _cache:
+            nodes = _cache["nodes"]
+            canonical_versions = _cache["canonical_versions"]
+        else:
+            index_data = json.loads(index_path.read_text(encoding="utf-8"))
+            nodes = index_data.get("nodes", {})
+            if not nodes:
+                return []
+            canonical_versions = governance_store.canonical_page_versions(set(nodes))
+            if _cache is not None:
+                _cache["nodes"] = nodes
+                _cache["canonical_versions"] = canonical_versions
+
         scored = []
         wiki_dir = get_wiki_dir()
         for key, node in nodes.items():
@@ -1502,6 +1511,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     from vector_lake.db_store import enqueue_job
     enqueued_count = 0
     last_payload = None
+    batch_cache: dict = {}
     # The batch is marked in-flight up front so a concurrent scan cannot schedule the same
     # source twice.  That leaves a window: if one file's enqueue raises, the loop aborts and
     # every file marked *after* it keeps a marker with no job behind it, so the source is
@@ -1517,7 +1527,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
                 # One computation supplies both the prompt's candidate list and the dispatch
                 # manifest, so the model can only ever name a candidate it was shown.
-                index_context, candidates = ingest_context_and_candidates(str(filepath))
+                index_context, candidates = ingest_context_and_candidates(str(filepath), _cache=batch_cache)
                 instructions = _build_ingest_instructions(
                     filepath, file_hash, canonical_name, index_context=index_context
                 )
@@ -1581,6 +1591,31 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
     from vector_lake.defense_hook import DefenseHookException
 
     try:
+        # Defense: parse string inputs if passed as JSON from CLI or loose MCP clients
+        if isinstance(files_written, str):
+            try:
+                files_written = json.loads(files_written)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"files_written string is not valid JSON: {exc}")
+        if not isinstance(files_written, list):
+            raise ValueError(f"files_written must be a list, got {type(files_written).__name__}")
+
+        if isinstance(processed_data, str):
+            try:
+                processed_data = json.loads(processed_data)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"processed_data string is not valid JSON: {exc}")
+        if not isinstance(processed_data, dict):
+            raise ValueError(f"processed_data must be a dict, got {type(processed_data).__name__}")
+
+        # Defense: unwrap nested {"metadata": {"processed_data": ...}} or {"processed_data": ...}
+        if "processed_data" in processed_data and isinstance(processed_data["processed_data"], dict):
+            processed_data = processed_data["processed_data"]
+        elif "metadata" in processed_data and isinstance(processed_data["metadata"], dict):
+            inner = processed_data["metadata"].get("processed_data")
+            if isinstance(inner, dict):
+                processed_data = inner
+
         files = files_written
         job_id = processed_data.get("job_id")
         if not job_id:

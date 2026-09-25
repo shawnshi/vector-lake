@@ -28,35 +28,45 @@ log = logging.getLogger("vector-lake-tool-query")
 # file refused to fork.
 
 
-QUERY_CONTEXT_TTL_SECONDS = 7 * 24 * 3600
+MAX_QUERY_CONTEXT_FILES = 50
+QUERY_CONTEXT_TTL_SECONDS = int(os.environ.get("VECTOR_LAKE_QUERY_CONTEXT_TTL", str(2 * 3600)))
 
 
 def _prune_stale_query_contexts(tmp_dir) -> None:
     """Drop payload files left by finished queries, so the directory cannot grow without bound.
 
-    Every call to :func:`prepare_query_context` writes a payload and nothing used to remove it:
-    the only reference to the name anywhere in the tree was the line that created it, and 24 files
-    had accumulated.  Pruning runs *before* this query's payload is written, so a file a live
-    reader may still be holding is never removed underneath it, and the window is generous enough
-    that an agent's own follow-up read is unaffected.
-
-    Housekeeping only: a failure degrades to a warning and must never cost the caller its query.
+    Prunes by age (default 2 hours) and caps total count (max 50 files, LRU eviction).
     """
     cutoff = time.time() - QUERY_CONTEXT_TTL_SECONDS
     try:
-        stale = [
-            entry
-            for entry in tmp_dir.glob("query_context_*.md")
-            if entry.stat().st_mtime < cutoff
-        ]
+        entries = sorted(
+            tmp_dir.glob("query_context_*.md"),
+            key=lambda p: p.stat().st_mtime,
+        )
     except OSError as exc:
         log.warning("Could not scan %s for stale query payloads: %s", tmp_dir, exc)
         return
-    for entry in stale:
+
+    # 1. Prune expired entries
+    retained = []
+    for entry in entries:
         try:
-            entry.unlink()
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink(missing_ok=True)
+            else:
+                retained.append(entry)
         except OSError as exc:
-            log.warning("Could not remove stale query payload %s: %s", entry.name, exc)
+            log.warning("Could not remove expired query payload %s: %s", entry.name, exc)
+            retained.append(entry)
+
+    # 2. Cap capacity (evict oldest if still exceeding MAX_QUERY_CONTEXT_FILES)
+    if len(retained) > MAX_QUERY_CONTEXT_FILES:
+        excess = len(retained) - MAX_QUERY_CONTEXT_FILES
+        for entry in retained[:excess]:
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Could not evict excess query payload %s: %s", entry.name, exc)
 
 
 COMPARATIVE_QUERY_PATTERN = re.compile(

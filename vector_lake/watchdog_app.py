@@ -133,8 +133,11 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
         now = time.time()
         with self.lock:
-            if len(self.last_triggered) > 2000:
-                self.last_triggered.clear()
+            if len(self.last_triggered) > 1000:
+                self.last_triggered = {
+                    k: v for k, v in self.last_triggered.items()
+                    if (now - v) <= DEBOUNCE_SECONDS * 2
+                }
             if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
                 return
             self.last_triggered[filepath] = now
@@ -159,6 +162,15 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         self.handle_event(event)
+
+    def shutdown(self, wait: bool = False):
+        """Cleanly shut down the background worker pool on daemon exit."""
+        with self.lock:
+            if hasattr(self, "executor"):
+                try:
+                    self.executor.shutdown(wait=wait)
+                except Exception as exc:
+                    log.warning("RawWatchdogHandler executor shutdown error: %s", exc)
 
 
 def process_mutation_outbox_batch(
@@ -188,6 +200,19 @@ def process_mutation_outbox_batch(
                     and target.read_text(encoding="utf-8") == row.get("payload_text")
                 )
             )
+            if not already_materialized:
+                # Debounce: if the row was just created by foreground coordinator, give it a tiny grace
+                # window to finish os.replace before background launches a concurrent duplicate write.
+                time.sleep(0.05)
+                already_materialized = (
+                    not target.exists()
+                    if row["mutation_type"] == "delete"
+                    else (
+                        row.get("payload_text") is not None
+                        and target.exists()
+                        and target.read_text(encoding="utf-8") == row.get("payload_text")
+                    )
+                )
             if not already_materialized:
                 materialize_markdown_projection(
                     filename,
@@ -320,6 +345,8 @@ def index_worker_loop():
     consecutive_failures = 0
     max_failures = 5
     backoff_base = 2
+    idle_streak = 0
+    last_idle_status_write = 0.0
 
     while True:
         try:
@@ -342,11 +369,13 @@ def index_worker_loop():
             if os.path.exists(flag_path):
                 try: os.remove(flag_path)
                 except OSError: pass
+                idle_streak = 0
 
             with global_task_lock:
                 stats = process_mutation_outbox_batch(limit=50)
 
             if stats["claimed"]:
+                idle_streak = 0
                 write_status(
                     "processing",
                     stats["completed"],
@@ -370,6 +399,7 @@ def index_worker_loop():
                     break
 
             if pending_legacy:
+                idle_streak = 0
                 write_status(
                     "processing",
                     0,
@@ -388,15 +418,22 @@ def index_worker_loop():
                     component="outbox",
                 )
             elif not stats["claimed"]:
-                write_status(
-                    "idle",
-                    0,
-                    index_queue.qsize(),
-                    "Outbox idle",
-                    "",
-                    component="outbox",
-                )
-                time.sleep(1)
+                idle_streak += 1
+                now_t = time.time()
+                # Write status when entering idle or on periodic 30s heartbeat, rather than every 1s
+                if idle_streak == 1 or (now_t - last_idle_status_write) >= 30.0:
+                    write_status(
+                        "idle",
+                        0,
+                        index_queue.qsize(),
+                        "Outbox idle",
+                        "",
+                        component="outbox",
+                    )
+                    last_idle_status_write = now_t
+                # Adaptive sleep: 1.0s up to 3.0s backoff during quiet periods
+                sleep_time = min(1.0 + (idle_streak - 1) * 0.25, 3.0)
+                time.sleep(sleep_time)
 
             if consecutive_failures:
                 write_status("idle", 0, index_queue.qsize(), "Outbox consumer recovered", "", component="outbox")
@@ -697,6 +734,7 @@ def _start_watchdog_locked():
 
     memory_dir = get_memory_dir()
 
+    raw_handler = None
     raw_dir = str(memory_dir / "raw")
     if os.path.exists(raw_dir):
         raw_handler = RawWatchdogHandler()
@@ -733,6 +771,11 @@ def _start_watchdog_locked():
         except Exception as exc:  # noqa: BLE001 - shutdown must not raise
             log.warning("Could not stop the ingest runner supervisor: %s: %s", type(exc).__name__, exc)
         try:
+            if raw_handler is not None:
+                raw_handler.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
             observer.stop()
         except Exception:
             pass
@@ -744,14 +787,32 @@ def start_watchdog():
     from filelock import FileLock, Timeout
     from vector_lake.wiki_utils import get_meta_dir
 
-    instance_lock = FileLock(str(get_meta_dir() / ".watchdog.instance.lock"))
+    lock_path = get_meta_dir() / ".watchdog.instance.lock"
+    pid_path = get_meta_dir() / "runtime" / ".watchdog.pid"
+    instance_lock = FileLock(str(lock_path))
     try:
         instance_lock.acquire(timeout=0)
     except Timeout as exc:
-        raise RuntimeError("A Vector Lake watchdog instance is already running for this MEMORY root.") from exc
+        holder_pid = None
+        if pid_path.exists():
+            try:
+                holder_pid = pid_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+        pid_hint = f" (holder PID: {holder_pid})" if holder_pid else ""
+        raise RuntimeError(f"A Vector Lake watchdog instance is already running for this MEMORY root{pid_hint}.") from exc
     try:
+        try:
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_path.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
         return _start_watchdog_locked()
     finally:
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         instance_lock.release()
 
 if __name__ == "__main__":
