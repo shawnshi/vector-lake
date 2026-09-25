@@ -560,6 +560,9 @@ mutation 路径（每页的 schema 校验、`verify_asset`、canonical change se
 - `VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING=1`：把 subagent 积压从降级告警升级为阻断写入。默认关闭。
 - `VECTOR_LAKE_SUBAGENT_RUN_ID`：本进程作为 outbox / job 租约持有者的标识；不设置时用 `hostname:pid`。
 - `VECTOR_LAKE_SEARCH_LEDGER=0`：关闭检索台账（默认开启）。每次检索向 `<meta>/runtime/search_ledger.jsonl` 追加一行：查询的**摘要而非原文**（`q_hash` + `q_chars`）、返回页键、每页来源（`fts` / `vec` / `both` / `ppr`）、耗时与降级说明；文件达 2 MiB 轮转一代，故上限 2×。它回答“同一条查询是不是答得不一样了”，也是 `benchmarks/search_replay.py` 与生产可比的前提；写入失败只会记 `debug`，不影响检索。
+- `VECTOR_LAKE_CORE_VERSION`：指定本进程使用哪个已安装的原生核心构建（不设则用 `vector_lake_core/_active_version.txt`，即 `scripts/install_core.py` 最后激活的那个）。用于灰度/回滚：一个进程可以钉在旧构建上，而其他进程已用新构建。
+- `VECTOR_LAKE_OUTBOX_PAYLOAD_KEEP_DAYS`：`mutation_outbox` 保留已完成行的载荷多少天（默认 **30**，`0` = 下次维护即清）。只清 `payload_text`，**不删行**：`enqueue_mutation` 靠同一幂等键**复活**终态行而不是插入第二行，删行会把重复的逻辑写入变成真的重复变更；实测 30 天窗口释放 **52 MB**。定时 lint 里执行。
+- `VECTOR_LAKE_RECLAIM_FREE_SPACE=1`：允许定时维护里的 `VACUUM`（默认**关闭**，只报告）。本库 `auto_vacuum=0`，删行只把页放进 freelist、文件永不回缩——实测 2 413 MB 文件里有 **622 MB** 可回收；但 VACUUM 要重写整个文件、需等量磁盘、且全程独占写锁，所以默认只在维护窗口由人触发，守护进程只打一行报告。
 - Ingest 完成必须提交领取阶段返回的 `job_id`、`lease_owner`、`lease_token` 和 `lease_generation`；过期 Worker 的结果会被最终 CAS 拒绝。
 
 ### 依赖与分词后端 (Dependencies & Tokenizer)
@@ -642,18 +645,16 @@ cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决�
 * **状态可观测性**：`python cli.py doctor` 自动诊断原生加速状态：
   * 已激活：`[OK] Native Acceleration: vector-lake-core v0.2.0 (Rust fast-core active)`
   * 未安装：`[OK] Native Acceleration: pure-python (optional vector-lake-core not installed)`
-* **本地构建与更新**（2026-09-25 在这台主机上实测过，与说明书不同）：
+* **本地构建与更新**（每次升级**不需停服**，这是 2026-09-25 改成的方式）：
   ```powershell
-  # `scripts/build_core.py` 内部是 `maturin build --release` + `pip install --force-reinstall`；
-  # 本机两处都会失败：maturin 的打包步会去拉 MSVC CRT 清单（aka.ms）而网络不可达；
-  # 装回 site-packages 又会被运行中的 MCP/守护进程占用的 .pyd 挡住。
-  cd crates/vector_lake_core
-  cargo +stable-x86_64-pc-windows-msvc build --release   # 默认的 gnu 工具链在本机“能编不能链”
-  # 产物即扩展模块（PyO3 初始化名由 lib target 决定，文件名必须是 vector_lake_core.pyd）：
-  #   把 target/release/vector_lake_core.dll 复制成 site-packages/vector_lake_core/vector_lake_core.pyd
-  # 先停掉占用它的进程（MCP 服务、守护进程），否则 Windows 不允许覆盖已加载的 DLL。
+  python scripts/install_core.py            # 构建(MSVC) + 安装到版本目录 + 写 shim + 激活
+  python scripts/install_core.py --list     # 已装版本 / 当前激活
+  python scripts/install_core.py --activate 0.1.0   # 回滚：只改指针
   ```
-  要交付可安装的 wheel 而 maturin 打包不通时，用 `scratch/package_core_wheel.py` 手工组装（包目录 + dist-info + 重算 RECORD）。
+  机制：PyO3 扩展的初始化符号由 lib 名决定（`PyInit_vector_lake_core`），所以文件名改不了；而 Windows 不允许覆盖已被加载的 DLL——今天两次升级都得 disable 计划任务 + 杀守护进程与 MCP 才换得动。现在每次构建放进**自己的版本目录**（`site-packages/vector_lake_core_0_2_0/vector_lake_core.pyd`，加载器只看路径最后一段，因而不要求文件名带版本），由 `vector_lake_core/__init__.py` 这个 shim 按 `VECTOR_LAKE_CORE_VERSION` → `_active_version.txt` 的顺序选一个。装新版本是**新增文件**，不动任何已被打开的文件，消费者在自身上次重启时接上新版本。实测：装 + 回滚演练全程 4 个服务 pid 未变。
+  ```
+  两个作业级注意：`maturin build` 在本机的打包步仍拉不到 MSVC CRT 清单，所以脚本直接用 cargo 产物；shim 会**接管 pip 管理的 `__init__.py`**（原件备份为 `__init__.py.pip-original`），因此以后重装 wheel 会让 shim 失效，需重跑一次 `install_core.py`。
+  ```
 
 **已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。回退后端移除后这一点不再需要权衡：`add_word()` 一律返回 False，词表注册无法生效。
 

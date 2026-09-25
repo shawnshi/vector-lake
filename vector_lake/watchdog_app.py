@@ -700,6 +700,43 @@ def scheduled_lint_loop():
                 except Exception as e:
                     log.error(f"Failed to truncate WAL: {e}")
 
+                # Storage: strip the payload weight out of the outbox ledger, then report what a
+                # VACUUM would return.  The outbox keeps a *row* per mutation forever on purpose
+                # (``enqueue_mutation`` revives a terminal row with the same idempotency key instead
+                # of inserting a second one), so only the payload is dropped; and the reclaim itself
+                # stays operator-window-only, because VACUUM rewrites the whole file and holding the
+                # write lock for it would be an outage (``VECTOR_LAKE_RECLAIM_FREE_SPACE=1`` opts
+                # in, and this host runs it in the deployment window instead).
+                try:
+                    from vector_lake import outbox_retention
+
+                    stripped = outbox_retention.prune_outbox_payloads(dry_run=False)
+                    if stripped["stripped"]:
+                        log.info(
+                            "Outbox payload retention stripped %d row(s) older than %d day(s), "
+                            "~%.1f MB freed to the freelist.",
+                            stripped["stripped"], stripped["keep_days"],
+                            stripped["bytes_to_strip"] / 1e6,
+                        )
+                except Exception as e:
+                    log.error(f"Outbox payload retention failed: {e}")
+
+                try:
+                    from vector_lake import db_store
+
+                    space = db_store.free_space_report()
+                    log.info(
+                        "Database space: %.0f MB file, %.0f MB free pages (auto_vacuum=%d).",
+                        space["file_bytes"] / 1e6, space["free_bytes"] / 1e6, space["auto_vacuum"],
+                    )
+                    reclaim = db_store.reclaim_free_space()
+                    if reclaim["vacuumed"]:
+                        log.info("Database reclaim freed %.0f MB.", reclaim["freed_bytes"] / 1e6)
+                    else:
+                        log.info("Database reclaim skipped: %s", reclaim["reason"])
+                except Exception as e:
+                    log.error(f"Database space report failed: {e}")
+
                 # Backups are written by the repair, projection and ingest paths and nothing ever
                 # removed them, so the tree grows without bound.  Housekeeping belongs here, next
                 # to the other scheduled maintenance; the bound never drops below the newest copy

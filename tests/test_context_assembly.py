@@ -139,3 +139,45 @@ def test_zero_budget_is_rejected(isolated_memory):
 def test_search_vector_lake_still_reports_a_missing_index(isolated_memory):
     db_store.init_db()
     assert "drying" in tool_search.search_vector_lake("anything").lower()
+
+
+def test_the_memory_packet_is_built_once_when_it_has_alerts(monkeypatch, isolated_memory):
+    """The order of the burst/nominal steps is a measured decision, not a preference.
+
+    ``assemble_context`` built the packet 1.76 times per query before 2026-09-25, i.e. alerts are the
+    common case and the discarded build was the nominal one (~0.8 s of retrieval per query).  Building
+    at the burst ceiling first produces the identical packet and pays the second retrieval only when
+    there is nothing to warn about -- this pins both branches and the budget each one uses.
+    """
+    from vector_lake import author_facet, page_index_projection, purpose_contract
+
+    db_store.init_db()
+    calls: list[int] = []
+    state = {"warnings": 1}
+
+    def fake_build(query, max_chars=0):
+        calls.append(max_chars)
+        return {
+            "packet": "packet",
+            "memory_count": 0,
+            "warning_count": state["warnings"],
+            "omitted_count": 0,
+        }
+
+    monkeypatch.setattr(tool_search, "build_memory_packet", fake_build)
+    monkeypatch.setattr(page_index_projection, "read_catalog", lambda: (None, None))
+    monkeypatch.setattr(purpose_contract, "render_strategy_directive", lambda: "")
+    monkeypatch.setattr(tool_search, "_search_scored_pages", lambda *a, **k: ([], [], None))
+    monkeypatch.setattr(author_facet, "author_page_keys", lambda **k: frozenset())
+
+    budget = 100_000
+    tool_search.assemble_context("q", max_chars=budget)
+    assert len(calls) == 1, f"alerts are the common case: {calls}"
+    assert calls[0] == int(budget * tool_search.BUDGET_SHARES["memory_burst"])
+
+    calls.clear()
+    state["warnings"] = 0
+    tool_search.assemble_context("q", max_chars=budget)
+    assert len(calls) == 2, f"a quiet packet is re-cut to the nominal share: {calls}"
+    assert calls[0] == int(budget * tool_search.BUDGET_SHARES["memory_burst"])
+    assert calls[1] == int(budget * tool_search.BUDGET_SHARES["operational_memory"])

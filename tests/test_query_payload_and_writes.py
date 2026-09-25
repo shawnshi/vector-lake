@@ -321,28 +321,38 @@ def test_the_retired_storm_section_list_stays_retired():
 
 
 def test_the_memory_share_is_nominal_and_the_burst_needs_an_alert(isolated_memory, monkeypatch):
-    """Memory took a hardcoded 0.50 of every budget; the declared share is 0.30."""
+    """Memory took a hardcoded 0.50 of every budget; the declared share is 0.30.
+
+    This asserted the *call order* (nominal, then burst only on an alert) as a proxy for that rule.
+    The rule is about which budget the returned packet was built with, and 2026-09-25 inverted the
+    order for a measured reason: alerts turn out to be the common case (1.76 builds per query), so
+    the discarded build was the nominal one.  The contract is unchanged; the proxy for it is now the
+    outcome, which is also what ``actual_memory_used`` and the caller budget depend on.
+    """
     from vector_lake import tool_search
 
     calls = []
 
-    def fake_packet(query, max_chars=60000):
+    def quiet_packet(query, max_chars=60000):
         calls.append(max_chars)
-        return {"packet": "m", "memory_count": 1, "warning_count": 0, "omitted_count": 0}
+        return {"packet": str(max_chars), "memory_count": 1, "warning_count": 0, "omitted_count": 0}
 
-    monkeypatch.setattr(tool_search, "build_memory_packet", fake_packet)
-    tool_search.assemble_context("q", max_chars=200000)
-    assert calls == [60000], f"expected only the nominal share, got {calls}"
+    monkeypatch.setattr(tool_search, "build_memory_packet", quiet_packet)
+    quiet = tool_search.assemble_context("q", max_chars=200000)
+
+    assert quiet["memory_packet"] == str(60000), f"no alert must mean the nominal share, got {calls}"
 
     calls.clear()
 
     def alerting_packet(query, max_chars=60000):
         calls.append(max_chars)
-        return {"packet": "m", "memory_count": 1, "warning_count": 2, "omitted_count": 0}
+        return {"packet": str(max_chars), "memory_count": 1, "warning_count": 2, "omitted_count": 0}
 
     monkeypatch.setattr(tool_search, "build_memory_packet", alerting_packet)
-    tool_search.assemble_context("q", max_chars=200000)
-    assert calls == [60000, 100000], f"expected nominal then burst, got {calls}"
+    alerting = tool_search.assemble_context("q", max_chars=200000)
+
+    assert alerting["memory_packet"] == str(100000), f"an alert must buy the burst, got {calls}"
+    assert len(calls) == 1, f"and it must not pay for a second retrieval to find that out: {calls}"
 
 
 # ---------------------------------------------------------------------------------------------

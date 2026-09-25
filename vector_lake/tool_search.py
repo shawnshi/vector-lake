@@ -76,6 +76,17 @@ def _fusion_mode() -> str:
     return requested
 
 
+def _fts_backend_name() -> str:
+    """Which lexical backend is actually serving queries: the same answer the harness records.
+
+    Read through ``tantivy_index.enabled()`` rather than the environment, so a host that asked for
+    tantivy but has no wheel reports ``fts5`` -- it fell back, and the ledger must say so.
+    """
+    from vector_lake import tantivy_index
+
+    return "tantivy" if tantivy_index.enabled() else "fts5"
+
+
 def _expansion_quota(pool_size: int) -> int | None:
     """Pool slots guaranteed to graph expansion, or ``None`` for the long-standing behaviour.
 
@@ -915,6 +926,12 @@ def _search_scored_pages(
 
     started = time.perf_counter()
 
+    # Resolved before ``_record`` is defined: the ledger closure references it, and the early exits
+    # (a missing index, unreadable tokens) record through that same closure -- referencing a local
+    # assigned further down raised ``NameError: cannot access free variable 'fusion_mode'`` on exactly
+    # those paths.
+    fusion_mode = _fusion_mode()
+
     def _record(returned_rows, notes, error=None):
         search_ledger.record(
             query,
@@ -924,6 +941,8 @@ def _search_scored_pages(
             notes=notes,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
             error=error,
+            fusion=fusion_mode,
+            fts_backend=_fts_backend_name(),
         )
 
     # Read-only source selection.  A reader never repairs the projection: the
@@ -947,13 +966,13 @@ def _search_scored_pages(
         return [], [], answer
 
     intent = _keyword_intent(query)
+    scored = []
     tokens = _expand_query_locally(query)
     if not tokens:
         _record([], [], error="No valid search tokens.")
         return [], [], "No valid search tokens."
 
-    fusion_mode = _fusion_mode()
-    scored = []
+    intent = _keyword_intent(query)
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = {}
@@ -1278,17 +1297,24 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
 
     index_budget = int(max_chars * BUDGET_SHARES["index_summary"])
 
-    # The nominal share, with the burst the comment below documents: memory used to take a
-    # hardcoded 0.50 of *every* budget, so the declared ``operational_memory`` share was
-    # decorative and the alert condition was never tested.  The packet is rebuilt at the burst
-    # ceiling only when it actually reports alerts, which is a rare second call.
+    # The nominal share and the burst ceiling.  Memory used to take a hardcoded 0.50 of *every*
+    # budget, so the declared ``operational_memory`` share was decorative and the alert condition was
+    # never tested; the two-step shape kept that honest by rebuilding at the burst ceiling when the
+    # packet actually reported alerts.
+    #
+    # The steps run burst-first because the comment this replaces was wrong about which case is rare:
+    # measured 2026-09-25, ``assemble_context`` built the packet **1.76 times per query**, so alerts
+    # are the common case and the build that was being thrown away was the *nominal* one -- ~0.8 s per
+    # query spent on a retrieval whose result was discarded.  Building at the ceiling first and
+    # shrinking only when there is nothing to warn about produces the identical packet (the same
+    # budget is used in each branch) and pays the second retrieval in the rare case instead.
+    nominal_budget = int(max_chars * BUDGET_SHARES["operational_memory"])
+    burst_budget = int(max_chars * BUDGET_SHARES["memory_burst"])
     memory_packet = build_memory_packet(
-        query, max_chars=int(max_chars * BUDGET_SHARES["operational_memory"])
+        query, max_chars=burst_budget if burst_budget > nominal_budget else nominal_budget
     )
-    if memory_packet["warning_count"]:
-        memory_packet = build_memory_packet(
-            query, max_chars=int(max_chars * BUDGET_SHARES["memory_burst"])
-        )
+    if not memory_packet["warning_count"] and burst_budget > nominal_budget:
+        memory_packet = build_memory_packet(query, max_chars=nominal_budget)
     actual_memory_used = len(memory_packet["packet"])
 
     purpose = ""

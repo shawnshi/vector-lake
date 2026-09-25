@@ -65,8 +65,17 @@ def record(
     notes: list[str] | None = None,
     elapsed_ms: float | None = None,
     error: str | None = None,
+    fusion: str | None = None,
+    fts_backend: str | None = None,
 ) -> None:
-    """Append one entry.  Never raises: a measurement must not break the thing it measures."""
+    """Append one entry.  Never raises: a measurement must not break the thing it measures.
+
+    ``fusion`` and ``fts_backend`` are recorded because without them a past answer cannot be
+    explained: the ledger kept the query digest, the timing and the returned rows, so "this query
+    answers differently now" was visible while *which retrieval configuration produced it* was not.
+    The eval harness recorded both in its run config; production did not -- measured 2026-09-25:
+    903 entries, ``fusion`` null in all of them.
+    """
     if not enabled():
         return
     try:
@@ -78,6 +87,10 @@ def record(
             "q_chars": len(str(query)),
             "returned": returned,
         }
+        if fusion:
+            entry["fusion"] = str(fusion)
+        if fts_backend:
+            entry["fts_backend"] = str(fts_backend)
         if notes:
             entry["notes"] = [str(note) for note in notes]
         if elapsed_ms is not None:

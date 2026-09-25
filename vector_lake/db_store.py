@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 import random
 import sqlite3
 import threading
@@ -2484,6 +2485,93 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
         ORDER BY rank LIMIT ?
     """, (query_esc, limit))
     return [dict(row) for row in cur.fetchall()]
+
+def free_space_report(conn: sqlite3.Connection | None = None) -> dict:
+    """Read-only: how much of the database file is free pages rather than data.
+
+    Measured 2026-09-25 on the live lake: 2 301 MB file, 151 760 free pages = **593 MB** that a
+    ``VACUUM`` would return.  ``auto_vacuum=0`` here, so every row deletion (a merge, a repair, a
+    superseded job, a stripped payload) moves pages to the freelist and the file never shrinks.
+    """
+    conn = conn or get_connection()
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    return {
+        "page_size": page_size,
+        "page_count": page_count,
+        "file_bytes": page_count * page_size,
+        "free_pages": free_pages,
+        "free_bytes": free_pages * page_size,
+        "auto_vacuum": int(conn.execute("PRAGMA auto_vacuum").fetchone()[0]),
+    }
+
+
+def reclaim_free_space(
+    conn: sqlite3.Connection | None = None,
+    min_free_mb: float = 256.0,
+    allow: bool | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Return freelist pages to the filesystem with ``VACUUM`` -- when it is warranted *and* allowed.
+
+    Deliberately not automatic.  ``VACUUM`` rewrites the whole file (2.3 GB here), needs free disk of
+    roughly that size, cannot run inside a transaction, and holds an exclusive lock for its duration:
+    a timer that fired it inside the daemon would turn routine storage maintenance into an outage for
+    every writer.  So the daemon only *reports* (:func:`free_space_report`), and the reclaim runs in
+    an operator window or with ``VECTOR_LAKE_RECLAIM_FREE_SPACE=1``.  ``busy_timeout`` is widened for
+    the duration so it waits for a writer rather than failing halfway.
+    """
+    conn = conn or get_connection()
+    before = free_space_report(conn)
+    threshold_bytes = max(0.0, float(min_free_mb)) * 1024 * 1024
+    permitted = allow
+    if permitted is None:
+        permitted = str(os.environ.get("VECTOR_LAKE_RECLAIM_FREE_SPACE", "")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    result = {**before, "vacuumed": False, "freed_bytes": 0, "seconds": 0.0, "reason": ""}
+    if before["free_bytes"] < threshold_bytes:
+        result["reason"] = (
+            f"freelist is {before['free_bytes'] / 1e6:.0f} MB, below the {min_free_mb:.0f} MB threshold"
+        )
+        return result
+    if not permitted:
+        result["reason"] = (
+            f"{before['free_bytes'] / 1e6:.0f} MB reclaimable; not permitted "
+            "(set VECTOR_LAKE_RECLAIM_FREE_SPACE=1, or run it in a maintenance window)"
+        )
+        return result
+    if dry_run:
+        result["reason"] = f"dry run: would reclaim {before['free_bytes'] / 1e6:.0f} MB"
+        return result
+
+    started = time.monotonic()
+    _arm_busy_timeout(conn, 600.0)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+    finally:
+        _arm_busy_timeout(conn, float(BEGIN_LOCK_BUDGET_SECONDS))
+    after = free_space_report(conn)
+    result.update(
+        {
+            "vacuumed": True,
+            "file_bytes": after["file_bytes"],
+            "free_pages": after["free_pages"],
+            "free_bytes": after["free_bytes"],
+            "freed_bytes": max(0, before["file_bytes"] - after["file_bytes"]),
+            "seconds": round(time.monotonic() - started, 1),
+            "reason": "vacuumed",
+        }
+    )
+    log.info(
+        "Database reclaim: %.0f MB -> %.0f MB (%.0f MB freed in %.1fs).",
+        before["file_bytes"] / 1e6, after["file_bytes"] / 1e6, result["freed_bytes"] / 1e6,
+        result["seconds"],
+    )
+    return result
+
 
 def get_processed_files() -> dict[str, str]:
     conn = get_connection()

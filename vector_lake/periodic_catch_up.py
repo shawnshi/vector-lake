@@ -103,7 +103,7 @@ def embedding_budget_seconds() -> float:
         return DEFAULT_EMBEDDING_BUDGET_SECONDS
 
 
-def _embedding_catch_up(batch_size: int) -> dict:
+def embedding_catch_up(batch_size: int) -> dict:
     """Re-embed pages whose vector the incremental index path invalidated.
 
     ``indexer.update_index_items`` drops a page's vector the moment the page is rewritten and,
@@ -219,7 +219,7 @@ def catch_up_once(
         log.warning("Catch-up gram-index maintenance failed: %s: %s", type(exc).__name__, exc)
 
     try:
-        summary["embeddings"] = _embedding_catch_up(embed_batch)
+        summary["embeddings"] = embedding_catch_up(embed_batch)
     except Exception as exc:  # noqa: BLE001 - a provider outage must not stop the other halves
         summary["embeddings"] = {"candidates": 0, "embedded": 0, "skipped": ""}
         summary["errors"].append(f"embeddings: {type(exc).__name__}: {exc}")
@@ -246,6 +246,18 @@ def describe(summary: dict) -> str:
         f"gram={str(summary.get('gram') or 'skipped')[:80]}",
         f"vectors={vectors}",
     ]
+    # Projection health as a state, not only as the last repair's sentence: the two halves above
+    # report what they *did*, which reads as "fine" on a sweep where nothing was due while a
+    # projection is in fact degraded (the gram index was in exactly that state for 13 hours on
+    # 2026-09-25).  Cheap: two counts plus one usability check.
+    try:
+        from vector_lake import projection_registry
+
+        line = projection_registry.status_line()
+        if line:
+            parts.append(f"projections=[{line[:160]}]")
+    except Exception as exc:  # noqa: BLE001 - the status surface must not fail the sweep
+        parts.append(f"projections=unavailable({type(exc).__name__})")
     if summary["errors"]:
         parts.append("errors=" + "; ".join(summary["errors"])[:160])
     return "; ".join(parts)

@@ -1,5 +1,42 @@
 # Unreleased
 
+## P0–P3：可归因、可回收、不停服、投影健康成状态；本地嵌入模型本轮**不做**
+
+按前面的架构审查分四批落地。每批都带验收证据，下面按批记。
+
+**P0（观测与存储）**
+
+- 检索台账现在记录 `fusion` 与 `fts_backend`（以前 903 条全为 null，只能看出“答得不一样了”而看不出是**哪套配置**答的）。
+- `mutation_outbox` 只清载荷不删行：30 天窗口实测释放 **52 MB**（原有 41 679 条已完成行、79.6 MB）。不删行是因为三个读者依赖行本身——其中最关键的是 `enqueue_mutation` 靠幂等键**复活**终态行而不是插第二行，删行会把重复的逻辑写入变成真的重复变更；`is_managed_projection_state` 靠“最新一行”的载荷做回声抑制，而真正在被写的文件的最新行永远是新的那些。
+- 新增 `free_space_report()` / `reclaim_free_space()`：本库 `auto_vacuum=0`，删行只进 freelist、文件永不回缩，实测 **2 413 MB 文件 / 622 MB freelist**。VACUUM 默认**只报告**（要重写整个文件、需等量磁盘、全程独占写锁），`VECTOR_LAKE_RECLAIM_FREE_SPACE=1` 才执行，或由人在维护窗口跑。两者都接在定时 lint 的备份保留旁边。
+- 过程中我自己引入并修掉一个真缺陷：`_record` 闭包引用了在其**下方**才赋值的 `fusion_mode`，于是所有“index.json 缺失/无有效 token”的早退路径都 `NameError`（7 个测试同时报出来）。
+
+**P1（不停服升级原生核心）**
+
+PyO3 扩展的初始化符号由 lib 名固定（`PyInit_vector_lake_core`），文件名改不了；而 Windows 不允许覆盖已加载的 DLL——今天两次升级都得 disable 计划任务 + 杀守护进程与 MCP。现在改为**每次构建一个版本目录**（`site-packages/vector_lake_core_0_2_0/vector_lake_core.pyd`——加载器只看路径最后一段，所以文件不必带版本名），由 `vector_lake_core/__init__.py` shim 按 `VECTOR_LAKE_CORE_VERSION` → `_active_version.txt` 选一个；装新版本是**新增文件**。
+
+实测验收：安装 0.2.0 与回滚演练全程 **4 个服务进程 pid 未变**（零停机）；`--activate 0.1.0` 后 `version()=0.1.0`、`blocks_contract` 缺失，且 `_rust_blocks` **拒绝**它并回退 mistune——即回滚到旧构建时语义门闩仍成立。工具：`scripts/install_core.py`（`--list` / `--activate` / `--check`）。
+
+两个作业事实：`maturin` 的打包步在本机仍拉不到 MSVC CRT 清单，所以脚本直接用 cargo 产物；shim 会**接管 pip 管理的 `__init__.py`**（原件存为 `__init__.py.pip-original`），所以以后重装 wheel 会让 shim 失效，需重跑一次。
+
+一个诚实的遗漏：本次会话早先说“备份了原 `.pyd`”实际没成功（cp 在锁住的文件上失败，之后的命令链断了），所以真正的 0.1.0 构件已经没了；演练里当 0.1.0 用的是 `scratch/core011` 里那份 **pre-marker parity 构建**。
+
+**P2（派生投影成一个契约，先两个试点）**
+
+新增 `vector_lake/projection_registry.py`：`Projection(name, authority, cost, health, repair, degrades)`，使现有健康检查与修复入口**有了同一形状**，并提供 `status()` / `reconcile()` / `status_line()`。试点两个——正是今天不得不手修的两个：`memory_gram`（曾降级最长 13 h）与 `vectors`（大改页后短 501 个）。`reconcile()` 逐个包含失败；`periodic_catch_up.describe()` 现在输出 `projections=[...]`，因此“索引不可用”是一个**可查状态**而非一句日志。`_embedding_catch_up` 因为要作为投影的修复入口而改为公开的 `embedding_catch_up`。
+
+**范围实话**：八条投影里只迁移了两条；其余六条（FTS5、tantivy、page_index、claim_index、timeline、governance）仍是旧形状。一次一条、各带测试。
+
+**P3（上下文路径：只减少了重复，本轮不换嵌入）**
+
+`assemble_context` 原来先按 nominal 构建 `memory_packet`，有 warnings 再按 burst 重建——而实测是 **1.76 次/查询**，即 warnings 是常态，被丢掉的是 nominal 那次（~0.8 s 检索/查询）。现在改成**先按 burst 构建**，只有在没有 warnings 时才回切 nominal：输出逐字相同（两个分支用的预算与原来一致），代价落在少见的那一侧。
+
+一个测试从“调用顺序”改为断言“结果用了哪个预算”（`test_the_memory_share_is_nominal_and_the_burst_needs_an_alert`）：它原本用顺序代理那条规则，顺序正是本次改掉的实现细节，而调用方依赖的是**结果预算**（`actual_memory_used` 与上游 budget）。契约未变。
+
+**按用户要求，本轮不引入本地嵌入模型。** 这是唯一能撬动 p50 中 76% 网络占比与整条 p90/p99 尾巴的动作，但它会移动检索语义，必须走判定卡 + 全量重嵌，属于单独一次决定。
+
+本轮新增/调整测试：P0 10 项、P2 9 项、P3 1 项（含一个改写）。全量 **1645 passed**。
+
 ## 核心版本 0.1.0 → 0.2.0：让“部署的是哪个构建”在 `doctor` 里可见
 
 动机不是体面：`0.1.0` 同时描述了**两个语义不同的构建**（parity 前 / parity 后），而 `doctor` 只打印 `version()`，
