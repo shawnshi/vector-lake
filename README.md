@@ -398,6 +398,12 @@ python cli.py delete "<raw-source-path>"
 
 ```powershell
 python cli.py projection-report --limit 20
+# 派生投影健康（八条：memory_gram / vectors / page_projection / fts_index / tantivy_mirror /
+# claim_index / timeline_events / governance_queue）与它们的修复入口：默认只报告；
+# `--reconcile` 预览会修什么，`--reconcile --apply` 才真修；`--only NAME` 限定一条。
+python cli.py projections
+python cli.py projections --reconcile --only fts_index
+python cli.py projections --reconcile --apply
 python cli.py canonical-backfill --limit 100
 python cli.py canonical-backfill --apply --limit 100
 python cli.py timeline-rebuild --apply

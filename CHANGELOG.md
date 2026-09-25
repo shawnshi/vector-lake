@@ -1,5 +1,30 @@
 # Unreleased
 
+## 生成式命令补位：七条投影各自有了修复入口，一条 `cli.py projections` 驱动八条
+
+之前 `fts_index` 与 `claim_index` 是“没有独立入口”、只能共用一次全量 `projection-rebuild`。两条都找到了现成机器，不需要新造机制：
+
+- **`tool_projection.repair_search_projection()`**：只调和 `wiki_search_index`。复用全量重建用的同一个增量调和器
+  `indexer._sync_search_index`（内容哈希账本、每个变动节点一个事务、删陈行），但传**空的 embeddings map**——
+  那个参数存在时它还会写向量，而一个词法修复不应该顺手重嵌。不调用全量路径的原因很具体：后者还会重生 index.json 与
+  claim_topology 并做一次维护备份。
+- **`claim_index`**：`db_store.ensure_claim_index(force=False)` 就是现成的增量补口（触发器仍是日常写入方，重建只是兜底）。
+
+结果：**8 条里 7 条可自动修复**，只有 `governance_queue` 是设计性人工（清一条是判断，不是重建）。新增一条命令作为统一操作面：
+
+```powershell
+python cli.py projections                        # 八条的状态 + 修复类别 + authority
+python cli.py projections --reconcile            # 预览会修什么（默认 dry-run）
+python cli.py projections --reconcile --apply    # 真修
+python cli.py projections --reconcile --only fts_index
+```
+
+注册表测试 16 → 19 项：新增“词法修复必须传空 embeddings map”（防止将来顺手接上向量写入成为副作用）、
+“claim 修复报告调和结果”，以及“**只有人工队列没有自动修复**”——后一条把这次的结论钉住：现在再说某条投影“没有入口”，
+必须同时说清楚为何它不该有。
+
+线上：`python cli.py projections` 输出 8 行（7 auto / 1 manual），全部 healthy；`--reconcile` 预览全为 `none`（无待修）。
+
 ## 投影注册表迁到全 8 条；过程中撞到一个 271 秒的「健康检查」
 
 把剩下六条也迁进注册表，每条都接**已有的**信号与修复入口，不自造语义：

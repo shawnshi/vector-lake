@@ -72,6 +72,18 @@ def _gram_repair() -> str:
     return memory_gram_index.maybe_rebuild_memory_gram_index()
 
 
+def _fts_repair() -> str:
+    from vector_lake.tool_projection import repair_search_projection
+
+    return repair_search_projection(dry_run=False)
+
+
+def _claim_index_repair() -> str:
+    from vector_lake import db_store
+
+    return f"claim_index reconciled: {db_store.ensure_claim_index(force=False)}"
+
+
 def _tantivy_repair() -> str:
     from vector_lake import tantivy_index
 
@@ -251,11 +263,10 @@ PILOTS: tuple[Projection, ...] = (
     Projection(
         name="fts_index",
         authority="page_index_nodes",
-        cost="no routine repair: a missing row is rebuilt by `cli.py projection-rebuild --apply`",
+        cost="incremental: content-hash ledger, one transaction per changed node (near-free when current)",
         health=_fts_health,
-        repair=None,
+        repair=_fts_repair,
         degrades="the lexical half of hybrid retrieval for the pages that have no row",
-        manual_entry="python cli.py projection-rebuild --apply",
     ),
     Projection(
         name="tantivy_mirror",
@@ -268,11 +279,10 @@ PILOTS: tuple[Projection, ...] = (
     Projection(
         name="claim_index",
         authority="claims",
-        cost="no routine repair: rows are written by the extractor's finalize path",
+        cost="incremental gap-fill from claims (`ensure_claim_index`); `force` re-derives every row",
         health=_claim_index_health,
-        repair=None,
+        repair=_claim_index_repair,
         degrades="claim search for the unindexed claims",
-        manual_entry="re-extract the affected pages (`cli.py ingest-tasks`) -- there is no rebuild entry point",
     ),
     Projection(
         name="timeline_events",

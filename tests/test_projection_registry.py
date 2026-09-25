@@ -12,6 +12,51 @@ import pytest
 from vector_lake import db_store, periodic_catch_up, projection_registry
 
 
+def test_fts_repair_reuses_the_incremental_reconciler_without_embeddings(isolated_memory, monkeypatch):
+    """The narrow repair must not re-embed: an empty embeddings map is what guarantees that."""
+    import json
+
+    from vector_lake import indexer
+    from vector_lake.wiki_utils import get_index_path
+
+    db_store.init_db()
+    get_index_path().write_text(
+        json.dumps({"nodes": {"Concept_One": {"title": "one"}}}), encoding="utf-8"
+    )
+    seen = {}
+
+    def fake_sync(index_data, bodies, embeddings_map):
+        seen["index_data"] = index_data
+        seen["embeddings"] = embeddings_map
+        return {"total": 1, "tokenized": 1, "reused": 0, "removed": 0}
+
+    monkeypatch.setattr(indexer, "_sync_search_index", fake_sync)
+
+    message = projection_registry._fts_repair()
+
+    assert seen["embeddings"] == {}, "a lexical repair must not carry vectors into the sync"
+    assert seen["index_data"]["nodes"].keys() == {"Concept_One"}
+    assert "reconciled" in message and "tokenized" in message
+
+
+def test_claim_index_repair_reports_the_reconcile(monkeypatch):
+    from vector_lake import db_store
+
+    monkeypatch.setattr(db_store, "ensure_claim_index", lambda conn=None, force=False: {"rebuilt": 3})
+
+    message = projection_registry._claim_index_repair()
+
+    assert "claim_index reconciled" in message and "3" in message
+
+
+def test_only_the_human_queue_lacks_an_automatic_repair():
+    manual = [p.name for p in projection_registry.registry() if p.repair is None]
+
+    assert manual == ["governance_queue"], (
+        "every projection that can be rebuilt has one now; a human queue is the only by-design exception"
+    )
+
+
 def test_every_projection_declares_its_contract():
     pilots = projection_registry.registry()
 

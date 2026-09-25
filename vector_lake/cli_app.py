@@ -91,6 +91,11 @@ Usage Examples:
     projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
     projection_report_parser.add_argument("--limit", type=int, default=20, help="Sample size per drift bucket.")
 
+    projections_parser = subparsers.add_parser("projections", help="[MAINTENANCE] Report derived-projection health; optionally reconcile.")
+    projections_parser.add_argument("--reconcile", action="store_true", help="Repair the degraded projections. Defaults to a dry-run preview.")
+    projections_parser.add_argument("--apply", action="store_true", help="With --reconcile, actually repair (default is dry-run).")
+    projections_parser.add_argument("--only", default="", metavar="NAME", help="Restrict to one projection by name.")
+
     canonical_backfill_parser = subparsers.add_parser("canonical-backfill", help="[MAINTENANCE] Backfill missing canonical rows from Wiki pages.")
     canonical_backfill_parser.add_argument("--apply", action="store_true", help="Persist the backfill. Defaults to dry-run.")
     canonical_backfill_parser.add_argument("--limit", type=int, default=50, help="Maximum number of missing pages to process.")
@@ -275,6 +280,28 @@ def main() -> int:
                 print(tools.rebuild_memory_gram_index(dry_run=False))
             else:
                 print(tools.rebuild_memory_gram_index(dry_run=True))
+        elif args.command == "projections":
+            from vector_lake import projection_registry
+
+            if getattr(args, "reconcile", False):
+                results = projection_registry.reconcile(
+                    only=getattr(args, "only", "") or None,
+                    dry_run=not getattr(args, "apply", False),
+                )
+                for name, entry in results.items():
+                    line = f"{name}: {entry['action']} -- {str(entry.get('detail'))[:90]}"
+                    if entry.get("entry"):
+                        line += f" -> {entry['entry']}"
+                    if entry.get("error"):
+                        line += f" !! {entry['error']}"
+                    print(line)
+            else:
+                for name, entry in projection_registry.status().items():
+                    kind = "auto" if entry["repairable"] else "manual"
+                    print(
+                        f"{name:18s} {entry['state']:9s} [{kind:6s}] {entry['detail']}"
+                        f"   (authority: {entry['authority']})"
+                    )
         elif args.command == "projection-report":
             print(tools.projection_diff_report(limit=getattr(args, "limit", 20)))
         elif args.command == "canonical-backfill":

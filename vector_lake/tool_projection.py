@@ -202,6 +202,34 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
     )
 
 
+def repair_search_projection(dry_run: bool = False) -> str:
+    """Reconcile ``wiki_search_index`` with the canonical node set -- and nothing else.
+
+    The narrow entry point the projection registry needs.  ``rebuild_index_projection`` also
+    regenerates index.json and claim_topology and takes a maintenance backup, which is far more than
+    a missing lexical row requires, so this reuses the same incremental reconciler the full rebuild
+    calls -- content-hash ledger, one transaction per changed node, stale rows deleted -- with an
+    **empty embeddings map** so it cannot re-embed anything on the way.
+    """
+    from vector_lake import db_store, indexer
+    from vector_lake.embedding_scheduler import page_bodies_for_keys
+
+    index_path = get_index_path()
+    if not index_path.exists():
+        return "index.json not found; run projection-rebuild-index first"
+    index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    keys = list((index_data.get("nodes") or {}).keys())
+    if dry_run:
+        materialised = db_store.search_index_keys()
+        return (
+            f"[DRY RUN] would reconcile {len(keys)} node(s); "
+            f"{len(set(keys) - materialised)} missing, {len(materialised - set(keys))} stale row(s)"
+        )
+    bodies = page_bodies_for_keys(keys)
+    stats = indexer._sync_search_index(index_data, bodies, {})
+    return f"lexical projection reconciled: {stats}"
+
+
 def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None, include_existing: bool = False) -> str:
     """Backfill vectors that are missing, or that were built from input that has since changed.
 
