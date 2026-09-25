@@ -1,5 +1,28 @@
 # Unreleased
 
+## 运行态：守护进程从临时 shell 搬到计划任务（强杀后可自愈）
+
+守护进程一直由临时 shell `Start-Process` 拉起，于是它的寿命绑在那个 shell 上。2026-09-25 上一代
+watchdog（pid 28516）与其 Runner service（7796）先后被外部终止（后者退出码 `0x40010004`），此后没有任何
+定时维护在跑——而 README 早已写明“没有守护进程时没有任何定时维护会触发”。
+
+常驻形态现在是计划任务 `VectorLake-Watchdog`（`scripts/register_watchdog_task.ps1` 注册，
+`scripts/watchdog_service.ps1` 执行入口）：登录 + 开机 + 每 5 分钟三个触发器，`MultipleInstances=IgnoreNew`、
+`ExecutionTimeLimit=PT0S`、`RestartOnFailure 3×PT1M`、主体 `S4U`。实测两点：
+
+- 祖先链是 `python ← powershell ← svchost.exe(Task Scheduler) ← services.exe ← wininit.exe`，`SessionId=0`，
+  与本机任何交互会话无关；强杀后 **225 秒**（下一个 5 分钟边界）自动重启。
+- 强杀子进程留下的 `LastTaskResult=0xFFFFFFFF` **不触发** `RestartOnFailure`——真正兜底的是重复触发器，
+  所以两者都要留。
+
+交接而不是重建：停掉 shell 启动的 watchdog 后，Runner service 与其 Runner 进程身份逐位保留，新守护进程走
+adopt 路径（状态行 `Ingest runner supervised by an existing supervisor (pid N)`），3 个在途摄取未被中断。
+杀 Runner 换代码是错的——它可能正在模型调用中。
+
+顺手记下一个读数陷阱：`cli.py embedding-backfill` 的 dry-run 只看缺失向量与孤儿向量，**看不见**
+`stale_inputs`（已存在但输入摘要不一致的向量）——后者只在兜底的 `Catch-up:` 行里露头，而它每次都在修
+（`vectors=+1 ... stale_inputs=1` 是修复前的读数，不是积压）。
+
 ## 合并只落在状态字段上：`1 028` 条「未落盘」里只有 23 条是真的，而被删的键没有回到别名表
 
 `gov_bb04b7a3e920`（`Synthesis_WiNEX-Concurrency` <> `Synthesis_WiNEX_Concurrency_Model`）在 2026-06-24 被置为
