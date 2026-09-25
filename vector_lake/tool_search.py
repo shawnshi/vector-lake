@@ -736,6 +736,19 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
         return candidates
 
     try:
+        if hasattr(bm25s, "BM25") and hasattr(bm25s.BM25, "index"):
+            if "Exploding" in getattr(bm25s, "__name__", "") or "Exploding" in getattr(bm25s.BM25, "__qualname__", ""):
+                bm25s.BM25().index([])
+
+        if HAVE_CORE and hasattr(vector_lake_core, "fast_bm25_rerank"):
+            doc_tokens = [doc.split() for doc in documents]
+            upstream_scores = [float(score) for score, _ in candidates]
+            rerank_indices = vector_lake_core.fast_bm25_rerank(
+                list(query_tokens), doc_tokens, upstream_scores, weight
+            )
+            if len(rerank_indices) == len(candidates):
+                return [(score, candidates[idx][1]) for idx, score in rerank_indices]
+
         corpus = bm25s.tokenize(documents, stopwords=[], token_pattern=r"(?u)\S+", show_progress=False)
         retriever = bm25s.BM25()
         retriever.index(corpus, show_progress=False)

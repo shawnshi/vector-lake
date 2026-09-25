@@ -3,6 +3,9 @@ use pyo3::prelude::*;
 mod gram_index;
 mod markdown;
 mod graph_fusion;
+mod graph_topology;
+mod text_similarity;
+mod local_bm25;
 
 #[pyfunction]
 fn version() -> &'static str {
@@ -30,6 +33,16 @@ fn vector_lake_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 模块 3: 图遍历与召回融合
     m.add_function(wrap_pyfunction!(graph_fusion::fast_personalized_pagerank, m)?)?;
     m.add_function(wrap_pyfunction!(graph_fusion::fast_reciprocal_rank_fusion, m)?)?;
+
+    // 模块 4: 图拓扑加权边计算
+    m.add_function(wrap_pyfunction!(graph_topology::fast_calculate_weighted_edges, m)?)?;
+
+    // 模块 5: 实体相似度与名称碰撞审查
+    m.add_function(wrap_pyfunction!(text_similarity::fast_sequence_matcher_ratio, m)?)?;
+    m.add_function(wrap_pyfunction!(text_similarity::fast_batch_sequence_matcher_ratios, m)?)?;
+
+    // 模块 6: 候选池局部 BM25 内存重排
+    m.add_function(wrap_pyfunction!(local_bm25::fast_bm25_rerank, m)?)?;
 
     Ok(())
 }

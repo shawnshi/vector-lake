@@ -38,6 +38,13 @@ from vector_lake.node_vocabulary import (
     strip_prefix,
 )
 
+try:
+    import vector_lake_core
+    HAVE_CORE = True
+except ImportError:
+    vector_lake_core = None
+    HAVE_CORE = False
+
 
 # ``VALID_STATUS`` is capitalised while the check below lowercases the page value,
 # so the comparison view is normalised once here instead of restating the set.
@@ -707,7 +714,10 @@ def lint_vector_lake(auto_fix: bool = False):
                             )
                             if 2.0 * common / (length_a + length_b) <= SIMILARITY_MERGE_THRESHOLD:
                                 continue
-                            ratio = SequenceMatcher(None, core_names[key_a], core_names[key_b]).ratio()
+                            if HAVE_CORE and hasattr(vector_lake_core, "fast_sequence_matcher_ratio"):
+                                ratio = vector_lake_core.fast_sequence_matcher_ratio(core_names[key_a], core_names[key_b])
+                            else:
+                                ratio = SequenceMatcher(None, core_names[key_a], core_names[key_b]).ratio()
                         else:
                             # Two empty stems.  ``ratio()`` is 1.0 by definition, and the length
                             # filters would divide by zero, so the answer is stated rather than

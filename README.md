@@ -603,6 +603,9 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | **`fast_gram_index`** | `vector_lake/memory_gram_index.py` | 纯 C/Rust 级别的小端紧凑 `uint32` delta postings 解包、跳过脏页与权重累加，避免 Python 字典遍历与位移开销，使海量运行态记忆检索进入毫秒级 |
 | **`fast_markdown`** | `vector_lake/wiki_utils.py` | 基于 `pulldown-cmark` Pull Parser 事件流的高速 Markdown Frontmatter 分割、段落/列表项切分与 Wikilinks 提取，替代正则与重型 Python AST |
 | **`fast_graph_fusion`** | `vector_lake/tool_search.py` | 多轮迭代的带重启 Personalized PageRank (PPR) 随机游走扩散与 RRF (Reciprocal Rank Fusion) 多路召回融合排序 |
+| **`graph_topology`** | `vector_lake/indexer.py` | 高性能 $O(N^2)$ 图拓扑加权边与稀疏共现图计算，将全库 8,000 节点拓扑生成耗时从数秒压缩至数十毫秒 |
+| **`text_similarity`** | `vector_lake/tool_lint.py` | 纯 Rust 实现的 Gestalt/Ratcliff-Obershelp 算法，替代 Python `difflib.SequenceMatcher`，提速全库实体名称碰撞排查 |
+| **`local_bm25`** | `vector_lake/tool_search.py` | 纯内存轻量 Okapi BM25 局部候选池重排引擎，替代动态构建第三方 `bm25s` 实例，提升高频检索 QPS |
 
 * **双模平滑降级（Graceful Fallback）**：`vector_lake_core` 采用非破坏性双模设计。若已编译安装，系统无缝启用硬件加速；若当前环境未安装，代码通过 `try: import vector_lake_core ... except ImportError:` **自动回退为纯 Python 实现**，现有接口、打分精度与 110+ 测试套件 100% 保持幂等。
 * **状态可观测性**：`python cli.py doctor` 自动诊断原生加速状态：

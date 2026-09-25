@@ -33,6 +33,13 @@ from vector_lake.link_resolution import (
 from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
+try:
+    import vector_lake_core
+    HAVE_CORE = True
+except ImportError:
+    vector_lake_core = None
+    HAVE_CORE = False
+
 # Community detection moved to Leiden (igraph + leidenalg) and lives in
 # scripts/community_clustering_daemon.py; this module never clustered anything.
 
@@ -843,6 +850,23 @@ def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -
             _temp_reverse_links.setdefault(link, []).append(key)
 
     reverse_links = {k: frozenset(v) for k, v in _temp_reverse_links.items()}
+
+    if HAVE_CORE and hasattr(vector_lake_core, "fast_calculate_weighted_edges"):
+        payload = {}
+        for key in node_keys:
+            payload[key] = {
+                "type": node_types[key],
+                "links": list(node_links[key]),
+                "sources": list(node_sources[key]),
+                "triples": node_triples[key],
+                "multiplier": node_multipliers[key],
+                "degree_weight": node_degrees.get(key, 0.0),
+            }
+        for node in nodes_dict.values():
+            node.pop("_key", None)
+        return vector_lake_core.fast_calculate_weighted_edges(
+            payload, type_affinity_precomputed, overlap_weight, 1.5, 50
+        )
 
     for key_a in node_keys:
         links_a = node_links[key_a]
