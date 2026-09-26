@@ -182,6 +182,32 @@ def test_the_prompt_names_the_shapes_that_are_refused():
     assert "multi-element list" in template
 
 
+def test_both_prompts_state_the_tag_rules_the_validator_enforces():
+    """Same invariant as the category rule above, for ``tags``.
+
+    The tag gate has two halves the prompt has to name or the model cannot avoid either: the cap
+    (``MAX_TAGS``) and the collision with an existing node's ``title`` or ``aliases``.  Measured
+    2026-09-26: ``raw/research/刘海一先生的历史定位…`` spent its whole three-attempt budget failing
+    on the collision alone -- the model tagged the source's own subject (EMR grading) twice over,
+    as ``电子病历评级`` and then ``EMR评级``, and ``Policy_电子病历系统功能应用水平分级评价`` claims
+    both as aliases.  The earlier wording ("NOT entity names") stated the intent and gave the
+    model no way to check it: the refusing name is an alias, so it appears in neither the title
+    of the page that owns it nor the filename the model was reading from.
+    """
+    from vector_lake.ingest_worker import _subagent_ingest_prompt
+    from vector_lake.schema_validator import MAX_TAGS
+
+    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    handoff = _subagent_ingest_prompt("base")
+
+    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+        lowered = text.lower()
+        assert "tag collision" in lowered, label
+        assert "alias" in lowered, label
+        assert str(MAX_TAGS) in text, label
+        assert "related_to" in text, label
+
+
 @pytest.fixture
 def source(isolated_memory):
     db_store.init_db()

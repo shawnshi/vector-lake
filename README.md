@@ -156,6 +156,7 @@ cp config.example.json config.json
 | `VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE` | 设为 `1` 时 shadow 轮不释放已认领的任务包（保留租约供人工检查；默认释放以便下一轮重试） | 默认 `0` |
 | `VECTOR_LAKE_QUERY_CONTEXT_TTL` | Query 上下文临时文件的过期秒数 | 默认 `7200` (2小时) |
 | `VECTOR_LAKE_VECTOR_SIM_SCALE` | Sum 混合检索模式下向量相似度权重乘数 | 默认 `15.0` |
+| `VECTOR_LAKE_NO_BROWSER` | 设为 `1` 时生成 3D 拓扑图后静默不自动弹出浏览器窗口（适合无头/CI环境） | 默认 `0` |
 
 ### 4. 验证安装 (Health Check)
 
@@ -169,12 +170,12 @@ python cli.py doctor
 - `[OK] Python: 3.13...`
 - `[OK] Tokenizer Backend: rjieba 0.2.1 (jieba-rs 0.9.x)`
 - `[OK] Native Acceleration: vector-lake-core v0.2.1 (Rust fast-core active)`（若已编译）
-- `[OK] MCP Server: Import OK, 46 tools exposed`
+- `[OK] MCP Server: Import OK, 18 tools exposed`
 - `[OK] Write Gate: clean`
 
 ### 5. 宿主 Agent 接入 (MCP Client Configuration)
 
-Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 46 个认知与知识工具。
+Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 18 个核心认知与知识工具。
 
 **在客户端配置文件（如 `claude_desktop_config.json` 或 `.mcp.json`）中添加：**
 
@@ -310,19 +311,17 @@ MEMORY/
 
 > **MCP 是主接口**：Agent 直接调用 `vector_lake/mcp_server.py` 注册的工具，不经过终端模拟。本仓库**不随附**任何 slash command 兼容层（`commands/` 目录已不存在）；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
 >
-> 工具面共 **45 个**（`doctor` 报出实际注册数，`test_command_surface.py` 守住下限），按职责分组：
+> 为避免上下文膨胀并防止 Agent 误触全库重建或并发破坏性运维命令，MCP 接口物理精简为 **18 个核心业务工具**（由 `doctor` 校验与 `test_command_surface.py` 严格守护），其余 29 个灾难恢复、内部调度与维护端点完整收敛至 `cli.py`：
 
-| 组 | 工具 |
-|---|---|
-| 摄取交接 | `sync_vector_lake` · `prepare_ingest_batch` · `list_ingest_tasks` · `claim_ingest_tasks` · `finalize_ingest` · `expire_ingest_tasks` · `list_abandoned_ingest_sources` · `clear_abandoned_ingest_sources` · `list_terminal_failed_ingest_jobs` · `close_terminal_failed_ingest_jobs` |
-| 检索与运行态记忆 | `search_vector_lake` · `query_logic_lake` · `search_timeline` · `update_operational_memory` · `finalize_query_synthesis` |
-| 治理与审查 | `review_governance_list` · `resolve_governance_item` · `get_governance_debt` · `trigger_audit_graph` · `merge_suggestions_vector_lake` · `check_duplicate_entity` · `bulk_reconciliation` · `review_strategic_purpose` |
-| 自愈与体检 | `lint_vector_lake`（物理写入结果与 `fixes_applied` 严格对齐，支持 `(OSError, UnicodeDecodeError, ValueError)` 精准诊断） · `gc_vector_lake` · `doctor_vector_lake` · `trace_vector_lake` · `trigger_autonomous_research` |
-| 写入与结构 | `write_wiki_page` · `rename_entity` · `batch_replace_links` · `delete_source` · `propose_schema_mutation` |
-| 维护与投影 | `projection_report` · `canonical_backfill` · `projection_rebuild_index` · `embedding_backfill` · `wiki_restore` · `rebuild_timeline_events` · `memory_gram_index_status` · `rebuild_memory_gram_index` · `backup_retention_report` · `idempotency_index_status` · `repair_idempotency_keys` · `claim_projection_drift_report` · `repair_claim_pointers` |
-| 可视化 | `visualize_vector_lake`（支持 `open_browser` 及 `VECTOR_LAKE_NO_BROWSER` / `HEADLESS` / `CI` 静默环境变量，杜绝无头/后台执行时浏览器弹窗阻塞） |
+| 职责分类 | 工具 | 说明 |
+|---|---|---|
+| **混合检索与时序** | `search_vector_lake` · `search_timeline` · `trace_vector_lake` | 768/3072维密集向量+FTS5+PPR混合检索、标准化时序账本查询、事实来源追溯 |
+| **深度推理与记忆** | `query_logic_lake` · `finalize_query_synthesis` · `update_operational_memory` | 预算受控推理上下文装配、推理建桩落盘、运行态偏好与决策持久化 |
+| **知识治理与审查** | `review_governance_list` · `resolve_governance_item` · `get_governance_debt` · `trigger_audit_graph` · `merge_suggestions_vector_lake` · `check_duplicate_entity` | 治理队列审阅与裁决、知识债务度量、拓扑审计、实体查重与候选合并 |
+| **自愈体检与安全写入**| `lint_vector_lake` · `doctor_vector_lake` · `rename_entity` · `write_wiki_page` · `inspect_projections` | 17项Schema自愈审计、运行环境体检、全库实体重命名、单页安全写入、8大派生投影统一巡检 |
+| **拓扑可视化** | `visualize_vector_lake` | 3D HTML 知识拓扑交互仪表盘 |
 
-> 以下底层 CLI 命令仍然保留，供人类开发者日常手动调试与状态维护。
+> 29 个底层维护、全量灾难恢复（如 `rebuild_timeline_events`, `rebuild_memory_gram_index`, `canonical_backfill` 等）与内部调度端点保留在 `cli.py` 命令面，供人类开发者日常手动调试与状态维护。
 
 基础体检：
 
@@ -761,6 +760,13 @@ $env:PYTHONUTF8='1'; python cli.py doctor
 $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
+
+本次会话实测结果（2026-09-26）：知识摄取 P0-P2 全链路重构（2字中文实体召回与标题亲和力提权、Tag Collision 降级自愈、候选类型配额分桶、密集向量+FTS混合初筛、Target 编译事实第一节增量合并）、`Healthcare_IT` 别名对齐、`stub_creator` 门禁修正。
+
+- `python -m pytest -p no:cacheprovider -q` → **1676 passed**（全库 0 failed；新增候选 2 字实体提权、标签自愈、类型分桶配额多样性、向量环境降级、Compiled Truth 第一节同频更新等测试）。
+- `python cli.py doctor` → `Write Gate: clean`、`MCP Server: Import OK, 18 tools exposed`、`State Consistency: Wiki:7178 JSON:7178 SQLite:7178 missing_index:0 extra_index:0 missing_canonical:0 extra_canonical:0`、`Vector Projection: nodes=7178 embedded=7178 missing=0 stale=0`。
+- `python cli.py lint` → 17 项自愈审计中 **14 项严格 PASS**（Frontmatter Completeness、Naming Compliance、Type/Status Legality、Category Vocabulary、Duplicate IDs、Alias Conflicts、Broken Links、Knowledge Decay、Semantic GC、Alignment Drift、Strict Schema Verification、Domain Vocabulary、Metric Evidence、Source Path Resolution 全部转绿）。
+- `python cli.py projections` → 8 大派生投影中除按频次延时重建的 `memory_gram` 外全项 HEALTHY。
 
 本次会话实测结果（2026-09-25 下午）：模型缝失败证据、守护进程监听换 `watchfiles`、tantivy 后端（开关默认关）、
 `author_page_keys` 取数与缓存键、gram 重建门改成按检索次数摊销、claim 块提取换 Rust。

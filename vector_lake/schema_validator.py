@@ -146,9 +146,47 @@ DOMAIN_VERTICALS = frozenset({
 })
 
 
+#: Spellings that name a subject a macro domain already names, mapped to that macro value.
+#:
+#: ``Healthcare_IT`` is the *categories* macro value for exactly what the domain facet calls
+#: ``Medical_IT`` -- ``SCHEMA_CATEGORIES.md`` defines it as "Digital health systems, hospital
+#: implementations, electronic health records" -- so the two axes offer one subject under two
+#: names, and an author reaching for the spelling they just read on the other axis is not inventing
+#: a subject, they are reading the wrong field's vocabulary.  Measured 2026-09-26: the Source page
+#: for ``raw/research/刘海一先生的历史定位、生平贡献与思想体系深度解析20260926.md`` was refused
+#: with ``domain: Healthcare_IT`` while its two siblings in the same batch happened to emit
+#: ``Medical_IT`` -- a deterministic schema violation that abandoned the source.
+#:
+#: These are **aliases, not verticals**.  The registration criterion for ``DOMAIN_VERTICALS`` is
+#: that no macro domain can faithfully express the subject, and ``Medical_IT`` does express this
+#: one.  Registering it as a vertical would put two values for a single subject into the facet,
+#: which is what ``tool_search._passes_filters`` compares by equality to decide a match.
+DOMAIN_ALIASES = {
+    "Healthcare_IT": "Medical_IT",
+}
+
+
+def canonical_domain(domain: str | None) -> str:
+    """The canonical spelling of a ``domain`` value: an alias resolved, anything else unchanged.
+
+    The single owner for the mapping.  Readers that compare ``domain`` for equality call this
+    instead of carrying a second copy of the table -- ``tool_search._passes_filters`` is the one
+    that decides whether a search returns a page, and a copy there is how a vocabulary splits.
+    """
+    value = str(domain or "").strip()
+    return DOMAIN_ALIASES.get(value, value)
+
+
 def is_registered_domain(domain: str) -> bool:
-    """A macro domain or a registered vertical: the two tiers of the ``domain`` facet."""
-    return domain in VALID_DOMAINS or domain in DOMAIN_VERTICALS
+    """A macro domain or a registered vertical: the two tiers of the ``domain`` facet.
+
+    An alias of a macro domain passes: it names that macro domain, and its page is accepted under
+    the spelling it was authored with.  Rewriting the stored value would mean rewriting page
+    content from inside a validator that ``mutation_coordinator`` documents as pure, and the
+    legacy-field migration is a separate reviewable pass (see ``VALID_DOMAINS``).
+    """
+    canonical = canonical_domain(domain)
+    return canonical in VALID_DOMAINS or canonical in DOMAIN_VERTICALS
 
 
 def category_shape_violation(frontmatter: dict, filename: str) -> str | None:

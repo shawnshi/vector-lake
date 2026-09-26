@@ -378,3 +378,177 @@ def test_the_prompt_does_not_promise_a_finalizer_that_never_reads_the_source():
 
     assert "Never return or ask the finalizer to read a `filepath`" not in template
     assert "verify `source_projection_hash`" in template
+
+
+def test_two_character_chinese_entity_and_title_affinity_boost(isolated_memory):
+    """Two-character Chinese entities (e.g. Person, Vendor) and title matches receive priority boost."""
+    db_store.init_db()
+    _write_purpose_contract(isolated_memory)
+
+    # 1. Author an existing 2-character person node
+    content = (
+        "---\nid: 20260101_zhou\ntitle: 周炜\ntype: person\ndomain: Medical_IT\n"
+        "status: Active\nepistemic-status: seed\ncategories: [Healthcare_IT]\n"
+        "strategic_scope: core\nupdated: 2026-01-01T00:00:00Z\nsources: []\n---\n\n"
+        "# 周炜\n\n## 1. 编译事实\n*[System Directive]*\n\n### 核心权责与控制域 (Mandates & Domain of Control)\n"
+        "- 周炜是医疗IT领军专家。\n\n---\n\n## 2. 证据时间线\n- [2026-01-01] [Observation] 生平记录。\n"
+    )
+    execute_mutation_plan("Person_周炜.md", content=content)
+    index_path = isolated_memory / "wiki" / "index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps({
+            "nodes": {
+                "Person_周炜": {
+                    "type": "person",
+                    "title": "周炜",
+                    "summary": "周炜是医疗IT领军专家。",
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    # 2. Raw source whose filename/stem explicitly mentions 周炜
+    raw = isolated_memory / "raw" / "research" / "周炜_历史定位与核心观点20260926.md"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_text("周炜在医疗信息化领域拥有重要历史地位与贡献。\n", encoding="utf-8")
+
+    candidates = tool_ingest.select_ingest_candidates(str(raw))
+    assert len(candidates) >= 1
+    top = candidates[0]
+    assert top["target"] == "Person_周炜.md"
+    assert top["match_score"] >= 280  # 180 + len(2) + 100 title affinity boost
+    assert any("title_affinity" in r for r in top["match_reasons"])
+    assert any("exact_chinese" in r for r in top["match_reasons"])
+
+
+def test_auto_heal_tag_collisions(isolated_memory):
+    """A tag colliding with an existing node's title or alias is auto-healed into a semantic link."""
+    index_path = isolated_memory / "wiki" / "index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps({
+            "nodes": {
+                "Policy_电子病历系统功能应用水平分级评价": {
+                    "type": "policy",
+                    "title": "电子病历系统功能应用水平分级评价",
+                    "aliases": ["电子病历评级", "EMR评级"],
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    sample_content = (
+        "---\nid: 20260101_test\ntitle: 测试节点\ntype: concept\ndomain: Medical_IT\n"
+        "status: Active\nepistemic-status: seed\ncategories: [Healthcare_IT]\n"
+        "tags: [电子病历评级, 院内系统替换]\n"
+        "strategic_scope: core\nupdated: 2026-01-01T00:00:00Z\nsources: []\n---\n\n"
+        "# 测试节点\n\n## 1. 编译事实\n*[System Directive]*\n\n### 物理机制 (Mechanism)\n"
+        "- 描述。\n\n---\n\n## 2. 证据时间线\n- [2026-01-01] [Observation] 记录。\n"
+    )
+
+    files = [{"filename": "Concept_Test.md", "content": sample_content}]
+    healed = tool_ingest.auto_heal_tag_collisions(files, index_path=index_path)
+
+    assert len(healed) == 1
+    healed_content = healed[0]["content"]
+    assert "电子病历评级" not in healed_content.split("---")[1]  # removed from frontmatter tags
+    assert "院内系统替换" in healed_content.split("---")[1]      # clean tag preserved
+    assert "[[Policy_电子病历系统功能应用水平分级评价]]" in healed_content  # converted to semantic link
+
+
+def test_stratify_candidates_preserves_type_diversity():
+    """Stratified sampling prevents concept domination and reserves floor quotas for entities."""
+    from vector_lake.tool_ingest import _stratify_candidates
+
+    scored_items = []
+    # 50 concepts with high scores
+    for i in range(50):
+        scored_items.append((250 - i, f"Concept_{i}", {"type": "concept"}, "hash", ["overlap"]))
+    # 5 persons with lower scores
+    for i in range(5):
+        scored_items.append((170 - i, f"Person_{i}", {"type": "person"}, "hash", ["overlap"]))
+    # 5 vendors with lower scores
+    for i in range(5):
+        scored_items.append((160 - i, f"Vendor_{i}", {"type": "vendor"}, "hash", ["overlap"]))
+
+    scored_items.sort(key=lambda x: -x[0])
+    # Without stratification, top 40 would be 100% concepts (Concept_0 to Concept_39).
+    result = _stratify_candidates(scored_items, candidate_limit=40)
+    assert len(result) == 40
+    types = [item[2]["type"] for item in result]
+    assert types.count("person") >= 4
+    assert types.count("vendor") >= 3
+    assert types.count("concept") >= 25
+    # Strict score order maintained in output
+    scores = [item[0] for item in result]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_hybrid_candidate_scoring_tolerates_missing_vector_environment(isolated_memory):
+    """Hybrid candidate search falls back gracefully without exception when vector env is absent."""
+    raw = _raw_and_candidate(isolated_memory)
+    # Even when GEMINI_API_KEY is unset or vector DB has no embeddings, candidate selection works smoothly
+    candidates = tool_ingest.select_ingest_candidates(str(raw))
+    assert isinstance(candidates, list)
+    assert len(candidates) >= 1
+
+
+def test_target_compiled_truth_slot_updated_with_timeline(isolated_memory):
+    """Integrated relations update both Section 1 Compiled Truth slot and Section 2 Timeline."""
+    _write_purpose_contract(isolated_memory)
+    raw = _raw_and_candidate(isolated_memory)
+
+    # Re-author Concept_Target.md to include the mechanism slot
+    target_content = (
+        "---\nid: concept_target\ntitle: Target Concept\ntype: concept\ndomain: General\n"
+        "status: Active\nepistemic-status: seed\ncategories: [System_Architecture]\n"
+        "updated: 2026-07-13T00:00:00+00:00\nsources: [raw/original.md]\nstrategic_scope: core\n"
+        "evidence_tier: primary\n---\n## 1. 编译事实\n\n### 物理机制 (Mechanism)\n- 初始机制。\n\n"
+        "## 2. 证据时间线\n- [2026-01-01] [Observation] 初始记录。\n"
+    )
+    execute_mutation_plan("Concept_Target.md", content=target_content)
+
+    manifest = tool_ingest.select_ingest_candidates(str(raw))
+    target_rec = next(c for c in manifest if c["target"] == "Concept_Target.md")
+
+    files = [
+        {
+            "filename": "Source_manifest.md",
+            "content": "---\nid: 20260101_src\ntitle: Source_manifest\ntype: source\ndomain: General\nstatus: Active\nepistemic-status: seed\ncategories: [Uncategorized]\nstrategic_scope: core\nupdated: 2026-01-01T00:00:00Z\nsources: [raw/news/manifest.md]\n---\n\n# Source\n\n## 1. 编译事实\n*[System Directive]*\n\n- source content.\n\n## 2. 证据时间线\n- [2026-01-01] [Observation] event.\n",
+        }
+    ]
+    processed_data = {
+        "filepath": str(raw),
+        "hash": "test_hash",
+        "canonical_name": "Source_manifest.md",
+        "source_hash": "",
+        "source_projection_hash": tool_ingest.projection_hash(raw.read_text(encoding="utf-8")),
+        "integration_candidates": [target_rec],
+        "integration": {
+            "disposition": "integrated",
+            "relations": [
+                {
+                    "target": "Concept_Target.md",
+                    "target_hash": target_rec["target_hash"],
+                    "target_projection_hash": target_rec["target_projection_hash"],
+                    "predicate": "validates",
+                    "evidence": "详细验证了目标机制的完整性与有效性。",
+                    "confidence": 0.95,
+                    "event_date": "2026-01-01",
+                    "event_tag": "Validation",
+                }
+            ],
+        },
+    }
+
+    mutations, disposition = tool_ingest._apply_integration_disposition(files, processed_data)
+    target_mut = next(m for m in mutations if m["filename"] == "Concept_Target.md")
+    content = target_mut["content"]
+
+    # Both Section 1 slot (物理机制) and Section 2 timeline are populated!
+    assert "### 物理机制 (Mechanism)" in content
+    assert "- [validates:: [[Source_manifest]]] 详细验证了目标机制的完整性与有效性。" in content
+    assert "- [2026-01-01] [Validation] 详细验证了目标机制的完整性与有效性。" in content

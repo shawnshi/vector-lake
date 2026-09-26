@@ -210,7 +210,6 @@ def stub_frontmatter(page_stem: str, node_type: str, today: str) -> dict:
         "tags": [_STUB_MARKER_TAG],
         "sources": [],
         "strategic_scope": "edge",
-        "evidence_tier": "derived",
         "created": stamp,
         "updated": stamp,
     }

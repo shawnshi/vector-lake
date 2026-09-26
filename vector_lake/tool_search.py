@@ -14,6 +14,7 @@ import operator
 from vector_lake import governance_store, search_ledger
 from vector_lake import author_facet
 from vector_lake.node_vocabulary import strip_prefix
+from vector_lake.schema_validator import canonical_domain
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 try:
@@ -217,7 +218,7 @@ def _passes_filters(node: dict, domain: str | None, cluster: str | None, include
     Graph expansion and reranking must not bypass these; previously only the
     first scoring pass applied them, so ``domain=`` could return other domains.
     """
-    if domain and str(node.get("domain") or "").lower() != domain.lower():
+    if domain and canonical_domain(node.get("domain")).lower() != canonical_domain(domain).lower():
         return False
     if cluster and str(node.get("topic_cluster") or "").lower() != cluster.lower():
         return False

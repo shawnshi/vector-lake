@@ -14,7 +14,7 @@ import datetime
 
 import pytest
 
-from vector_lake import tool_lint
+from vector_lake import schema_validator, tool_lint
 from vector_lake.defense_hook import DefenseHookException
 from vector_lake.mutation_coordinator import execute_mutation_batch
 from vector_lake.node_vocabulary import STUB_MARKER_TAG
@@ -107,6 +107,49 @@ def test_a_registered_vertical_is_accepted_on_a_new_node(isolated_memory):
 
     assert _write("Concept_Media.md", domain="Media").exists()
     assert _write("Concept_Macro.md", domain="Medical_IT").exists()
+
+
+def test_a_macro_domain_alias_is_accepted_on_a_new_node(isolated_memory):
+    """``Healthcare_IT`` names ``Medical_IT``: the two axes spell one subject two ways.
+
+    The live failure this closes: the Source page for
+    ``raw/research/刘海一先生的历史定位、生平贡献与思想体系深度解析20260926.md`` finalized with
+    ``domain: Healthcare_IT`` and was refused as unregistered, while its two siblings in the same
+    batch happened to emit ``Medical_IT``.  Both spellings name the subject the other axis calls
+    ``Healthcare_IT``, so the refusal was vocabulary drift between ``categories`` and ``domain``,
+    not an invented subject.
+    """
+    _write_purpose_contract(isolated_memory)
+
+    assert _write("Concept_Healthcare-IT.md", domain="Healthcare_IT").exists()
+
+
+def test_an_alias_is_not_a_vertical():
+    """The distinction the registration turns on, asserted where it decides behaviour.
+
+    A vertical is a subject no macro domain names, so it stays its own value.  An alias is a
+    second spelling of a macro domain, so it must resolve to one and must not enlarge the facet:
+    ``tool_search._passes_filters`` compares ``domain`` by equality, and a second value for one
+    subject is what splits a search.
+    """
+    assert "Healthcare_IT" not in schema_validator.DOMAIN_VERTICALS
+    assert "Healthcare_IT" not in schema_validator.VALID_DOMAINS
+    assert schema_validator.canonical_domain("Healthcare_IT") == "Medical_IT"
+    assert schema_validator.canonical_domain("Medical_IT") == "Medical_IT"
+    assert schema_validator.canonical_domain("Media") == "Media", "a vertical is not remapped"
+    assert schema_validator.canonical_domain("AI_Industry") == "AI_Industry"
+
+
+def test_search_matches_an_alias_spelling_on_either_side():
+    """A reader cannot be expected to know which spelling a page was stored under."""
+    from vector_lake import tool_search
+
+    node = {"domain": "Healthcare_IT"}
+    assert tool_search._passes_filters(node, "Medical_IT", None, False, None)
+    node = {"domain": "Medical_IT"}
+    assert tool_search._passes_filters(node, "Healthcare_IT", None, False, None)
+    node = {"domain": "Media"}
+    assert not tool_search._passes_filters(node, "Medical_IT", None, False, None)
 
 
 def test_a_new_node_cannot_enter_the_generated_namespace(isolated_memory):

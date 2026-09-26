@@ -6,7 +6,7 @@ import re
 import time
 
 import yaml
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -21,6 +21,7 @@ from vector_lake.wiki_utils import (
     read_ingest_item_content,
     resolve_ingest_source_path,
     split_frontmatter,
+    dump_yaml,
     get_raw_dir,
     get_wiki_dir,
     get_index_path,
@@ -621,6 +622,43 @@ INGEST_CONTRACT_VERSION = 2
 
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
 INTEGRATION_PREDICATES = {"validates", "falsifies", "depends-on", "mentions", "related_to"}
+
+DEFAULT_PREDICATE_SLOTS: dict[str, dict[str, str]] = {
+    "concept": {
+        "validates": "### 物理机制 (Mechanism)",
+        "depends-on": "### 物理机制 (Mechanism)",
+        "related_to": "### 产业落地与代表实例 (Implementations)",
+    },
+    "person": {
+        "validates": "### 关键造物与历史印记 (Key Artifacts & Legacy)",
+        "related_to": "### 关键造物与历史印记 (Key Artifacts & Legacy)",
+        "mentions": "### 利益纽带与权力拓扑 (Affiliations & Power Topology)",
+    },
+    "vendor": {
+        "validates": "### 核心护城河 (Moat)",
+        "related_to": "### 市场占位与竞争态势 (Market & Competition)",
+        "depends-on": "### 核心护城河 (Moat)",
+    },
+    "institution": {
+        "validates": "### 机构定位与核心诉求 (Positioning & Needs)",
+        "related_to": "### 机构定位与核心诉求 (Positioning & Needs)",
+    },
+    "product": {
+        "validates": "### 部署架构与底层依赖 (Architecture & Dependencies)",
+        "depends-on": "### 部署架构与底层依赖 (Architecture & Dependencies)",
+        "related_to": "### 临床与管理价值流 (Clinical & Admin Value)",
+    },
+    "policy": {
+        "validates": "### 核心约束与合规要求 (Compliance Mandates)",
+        "related_to": "### 核心约束与合规要求 (Compliance Mandates)",
+        "depends-on": "### 管辖范围与适用对象 (Jurisdiction & Applicability)",
+    },
+    "standard": {
+        "validates": "### 核心约束与合规要求 (Compliance Mandates)",
+        "related_to": "### 核心约束与合规要求 (Compliance Mandates)",
+        "depends-on": "### 管辖范围与适用对象 (Jurisdiction & Applicability)",
+    },
+}
 INTEGRATION_EVENT_TAGS = {
     "Release", "Pivot", "Conflict", "Validation", "Observation", "Decision", "Execution", "Outcome"
 }
@@ -639,7 +677,10 @@ INGEST_SEARCH_STOP_WORDS = {
 INGEST_CHINESE_STOP_TERMS = {
     "体系", "机制", "医疗", "系统", "平台", "医院", "数据", "管理", "治理", "国家", "智能", "人工智能",
     "评估", "实验", "资本", "架构", "推理", "物理", "生成式", "临床", "模型", "技术", "应用", "方案",
-    "服务", "项目", "流程",
+    "服务", "项目", "流程", "中国", "建设", "发展", "工作", "推进", "研究", "分析", "行业", "领域",
+    "报告", "实践", "探索", "创新", "现状", "未来", "全国", "卫生", "健康", "信息", "信息化", "深化",
+    "提升", "规范", "关于", "通知", "意见", "标准", "中心", "方法", "指标", "评价", "能力", "问题",
+    "协同", "模式", "要求", "实施", "重点", "关键", "全面", "持续",
 }
 
 
@@ -689,6 +730,81 @@ def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
     return ingest_context_and_candidates(filepath, max_nodes)[0]
 
 
+def _stratify_candidates(scored_items: list[tuple], candidate_limit: int = 40) -> list[tuple]:
+    """Balance candidate selection across core entity types to prevent concept domination."""
+    if len(scored_items) <= candidate_limit or candidate_limit <= 10:
+        return scored_items[:candidate_limit]
+
+    bucket_map = {
+        "person": "person",
+        "institution": "institution",
+        "vendor": "vendor",
+        "product": "product",
+        "policy": "norm",
+        "standard": "norm",
+        "concept": "concept",
+        "synthesis": "concept",
+        "event": "concept",
+    }
+    quotas = {
+        "person": 4,
+        "institution": 4,
+        "vendor": 3,
+        "product": 3,
+        "norm": 4,
+        "concept": 6,
+    }
+
+    selected = []
+    selected_keys = set()
+    bucket_counts: dict[str, int] = defaultdict(int)
+
+    def add_item(item):
+        key = item[1]
+        if key not in selected_keys:
+            selected.append(item)
+            selected_keys.add(key)
+            ntype = str(item[2].get("type") or "").lower()
+            b = bucket_map.get(ntype, "other")
+            bucket_counts[b] += 1
+            return True
+        return False
+
+    # Pass 1: Top N // 3 by absolute score (guarantee highest-scoring entities enter)
+    top_n = max(5, candidate_limit // 3)
+    for item in scored_items:
+        add_item(item)
+        if len(selected) >= top_n:
+            break
+
+    # Pass 2: Fulfill bucket minimum quotas
+    by_bucket = defaultdict(list)
+    for item in scored_items:
+        if item[1] not in selected_keys:
+            ntype = str(item[2].get("type") or "").lower()
+            b = bucket_map.get(ntype, "other")
+            by_bucket[b].append(item)
+
+    for b, target_quota in quotas.items():
+        needed = target_quota - bucket_counts[b]
+        if needed > 0 and b in by_bucket:
+            for item in by_bucket[b][:needed]:
+                add_item(item)
+                if len(selected) >= candidate_limit:
+                    break
+        if len(selected) >= candidate_limit:
+            break
+
+    # Pass 3: Fill remaining capacity with best overall
+    for item in scored_items:
+        if len(selected) >= candidate_limit:
+            break
+        add_item(item)
+
+    selected.sort(key=lambda item: (-item[0], item[1]))
+    return selected[:candidate_limit]
+
+
 def select_ingest_candidates(filepath: str, max_nodes: int = 40, _cache: dict | None = None) -> list[dict]:
     """Source-relevant candidates from the complete index, as dispatch-manifest records."""
     index_path = get_index_path()
@@ -702,8 +818,10 @@ def select_ingest_candidates(filepath: str, max_nodes: int = 40, _cache: dict | 
             if source_path is not None
             else ""
         )
+        source_stem = source_path.stem if source_path is not None else ""
+        source_stem_norm = _normalise_search_text(source_stem)
         source_norm = _normalise_search_text(
-            f"{source_path.stem if source_path is not None else ''} {source_text}"
+            f"{source_stem} {source_text}"
         )
         source_words = Counter(
             word for word in re.findall(r"\b[a-z0-9]{2,}\b", source_text.lower())
@@ -712,6 +830,24 @@ def select_ingest_candidates(filepath: str, max_nodes: int = 40, _cache: dict | 
         source_acronyms = {
             token.lower() for token in re.findall(r"\b[A-Z][A-Z0-9]{1,7}\b", source_text)
         }
+
+        # Hybrid pass: pre-fetch FTS and dense vector search hits for the source stem/title
+        vector_sim_map: dict[str, float] = {}
+        fts_match_set: set[str] = set()
+        if source_stem:
+            try:
+                from vector_lake.tool_search import _get_fts_search_results, _get_vector_search_results, _get_query_embedding
+                fts_hits = _get_fts_search_results(source_stem, limit=30)
+                for h in fts_hits:
+                    if h.get("node_key"):
+                        fts_match_set.add(h["node_key"])
+
+                qvec, _ = _get_query_embedding(source_stem)
+                if qvec:
+                    vhits, _ = _get_vector_search_results(qvec, limit=50)
+                    vector_sim_map = vhits
+            except Exception as exc:
+                log.debug("Hybrid candidate search pass skipped: %s", exc)
 
         if _cache is not None and "nodes" in _cache and "canonical_versions" in _cache:
             nodes = _cache["nodes"]
@@ -743,28 +879,42 @@ def select_ingest_candidates(filepath: str, max_nodes: int = 40, _cache: dict | 
             aliases = node.get("aliases") or []
             if isinstance(aliases, str):
                 aliases = [aliases]
+            node_type = str(node.get("type") or "").lower()
             labels = [key.split("_", 1)[-1], node.get("title", ""), *aliases]
             score = 0
             match_reasons = set()
+            title_boosted = False
             for label in labels:
                 chinese_label = "".join(re.findall(r"[\u4e00-\u9fff]", str(label)))
-                if (
-                    len(chinese_label) >= 3
-                    and chinese_label not in INGEST_CHINESE_STOP_TERMS
-                    and chinese_label in source_norm
-                ):
-                    score = max(score, 180 + len(chinese_label))
-                    match_reasons.add(f"exact_chinese:{chinese_label}")
+                if chinese_label and chinese_label not in INGEST_CHINESE_STOP_TERMS:
+                    is_valid_len = len(chinese_label) >= 3 or (
+                        len(chinese_label) == 2 and (
+                            node_type in {"person", "vendor", "institution", "product", "standard", "policy"}
+                            or (source_stem_norm and chinese_label in source_stem_norm)
+                        )
+                    )
+                    if is_valid_len and chinese_label in source_norm:
+                        base_score = 180 + len(chinese_label)
+                        if not title_boosted and source_stem_norm and chinese_label in source_stem_norm:
+                            base_score += 100
+                            match_reasons.add(f"title_affinity:{chinese_label}")
+                            title_boosted = True
+                        score = max(score, base_score)
+                        match_reasons.add(f"exact_chinese:{chinese_label}")
                 label_words = [
                     word for word in re.findall(r"\b[a-z0-9]{2,}\b", str(label).lower())
                     if word not in INGEST_SEARCH_STOP_WORDS and word not in {"concept", "vendor", "institution"}
                 ]
                 if not chinese_label and label_words and all(word in source_words for word in label_words):
-                    score = max(
-                        score,
+                    term_score = (
                         160 + sum(min(len(word), 12) for word in label_words)
-                        + sum(min(source_words[word], 5) for word in label_words),
+                        + sum(min(source_words[word], 5) for word in label_words)
                     )
+                    if not title_boosted and source_stem_norm and any(w in source_stem_norm for w in label_words):
+                        term_score += 100
+                        match_reasons.add(f"title_affinity:{'+'.join(label_words)}")
+                        title_boosted = True
+                    score = max(score, term_score)
                     match_reasons.add(f"exact_terms:{'+'.join(label_words)}")
             candidate_words = {
                 word for word in re.findall(
@@ -776,12 +926,21 @@ def select_ingest_candidates(filepath: str, max_nodes: int = 40, _cache: dict | 
             for word in source_words.keys() & candidate_words:
                 score += 45 if word in source_acronyms else min(len(word), 12)
                 match_reasons.add(f"overlap:{word}")
+            if key in fts_match_set:
+                score += 35
+                match_reasons.add("fts_match")
+            if key in vector_sim_map:
+                sim = vector_sim_map[key]
+                if sim > 0.50:
+                    score += int(sim * 100)
+                    match_reasons.add(f"vector_sim:{sim:.2f}")
             if score <= 0:
                 continue
             scored.append((score, key, node, target_hash, sorted(match_reasons)))
         scored.sort(key=lambda item: (-item[0], item[1]))
-        candidates = []
         candidate_limit = max(1, int(max_nodes))
+        scored = _stratify_candidates(scored, candidate_limit=candidate_limit)
+        candidates = []
         scan_limit = max(100, candidate_limit * 5)
         for score, key, node, target_hash, match_reasons in scored[:scan_limit]:
             try:
@@ -868,7 +1027,8 @@ def _upsert_section_relation(
     if start < 0:
         raise ValueError(f"Integration target is missing the required section: {heading}")
     section_start = start + len(heading)
-    next_heading = re.search(r"(?m)^##\s+", content[section_start:])
+    next_pattern = r"(?m)^(?:##|###|---)\s*" if heading.startswith("###") else r"(?m)^##\s+"
+    next_heading = re.search(next_pattern, content[section_start:])
     section_end = section_start + (next_heading.start() if next_heading else len(content[section_start:]))
     section = content[section_start:section_end]
     matches = []
@@ -1105,6 +1265,26 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
             if target.startswith("Synthesis_")
             else f"- [{event_date}] [{event_tag}] {evidence} {source_anchor} {marker}"
         )
+
+        # Section 1 Compiled Truth slot integration (P2)
+        target_type = str(manifest[target].get("type") or "").lower()
+        requested_slot = str(relation.get("target_slot") or "").strip()
+        from vector_lake.schema_validator import VALID_H3_SLOTS
+        if requested_slot and requested_slot in VALID_H3_SLOTS.get(target_type, []):
+            slot = requested_slot
+        else:
+            slot = DEFAULT_PREDICATE_SLOTS.get(target_type, {}).get(predicate)
+
+        if slot and slot in target_content:
+            slot_line = f"- [{predicate}:: [[{source_key}]]] {evidence} {source_anchor} {marker}"
+            target_content = _upsert_section_relation(
+                target_content,
+                slot,
+                marker,
+                slot_line,
+                legacy_tokens=(source_anchor,),
+            )
+
         target_content = _upsert_section_relation(
             target_content,
             target_heading,
@@ -1583,6 +1763,100 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
         f"{abandoned_note}{reconciled_note}"
     )
 
+def auto_heal_tag_collisions(files: list[dict], index_path: Path | None = None) -> list[dict]:
+    """Auto-heal tag collisions in submitted ingest files by converting colliding tags into semantic links.
+
+    When an author or subagent model emits a tag that matches an existing entity's title or alias
+    (e.g. `tags: [电子病历评级]` when `Policy_电子病历系统功能应用水平分级评价` declares that alias),
+    the schema validator's tag collision gate would normally fail the ingest.
+    Instead of hard-failing the job, this step removes the colliding tag from frontmatter
+    and appends `[related_to:: [[Target_Key]]]` to Section 1 if not already present.
+    """
+    index_path = index_path or get_index_path()
+    if not index_path.exists():
+        return files
+
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        nodes = index_data.get("nodes", {})
+        if not nodes:
+            return files
+
+        collision_map: dict[str, str] = {}
+        for node_id, node_data in nodes.items():
+            title = str(node_data.get("title") or "").strip().lower()
+            if title:
+                collision_map[title] = node_id
+            for alias in node_data.get("aliases") or []:
+                al = str(alias).strip().lower()
+                if al:
+                    collision_map[al] = node_id
+    except Exception as exc:
+        log.warning("Could not build tag collision map for auto-healing: %s", exc)
+        return files
+
+    healed_files = []
+    for item in files:
+        record = dict(item)
+        content = record.get("content")
+        if not content and "filepath" in record:
+            content = read_ingest_item_content(record)
+        if not content:
+            healed_files.append(record)
+            continue
+
+        try:
+            frontmatter, body = split_frontmatter(content)
+        except Exception:
+            healed_files.append(record)
+            continue
+
+        tags = frontmatter.get("tags")
+        if not isinstance(tags, list) or not tags:
+            healed_files.append(record)
+            continue
+
+        colliding_entries = []
+        clean_tags = []
+        for tag in tags:
+            clean_tag = str(tag).strip().lstrip("#").lower()
+            if clean_tag in collision_map:
+                colliding_entries.append((tag, collision_map[clean_tag]))
+            else:
+                clean_tags.append(tag)
+
+        if not colliding_entries:
+            healed_files.append(record)
+            continue
+
+        frontmatter["tags"] = clean_tags
+        # Append semantic links to Section 1 if not already present
+        for tag_str, target_key in colliding_entries:
+            target_link = f"[[{target_key}]]"
+            if target_link not in body:
+                sec1_match = re.search(r"(## 1\. 编译事实.*?\n)(### |\Z|---)", body, re.DOTALL)
+                if sec1_match:
+                    link_line = f"- [related_to:: {target_link}] (converted from tag #{str(tag_str).strip().lstrip('#')})\n"
+                    insert_pos = sec1_match.start(2)
+                    body = body[:insert_pos].rstrip() + f"\n{link_line}\n" + body[insert_pos:]
+                else:
+                    body = body.rstrip() + f"\n\n- [related_to:: {target_link}]\n"
+
+            log.info(
+                "Auto-healed tag collision in %s: converted tag [%s] into semantic link to %s",
+                record.get("filename"),
+                tag_str,
+                target_key,
+            )
+
+        yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        record["content"] = f"---\n{yaml_block}---\n{body.lstrip()}"
+        healed_files.append(record)
+
+    return healed_files
+
+
 def finalize_ingest(files_written: list, processed_data: dict) -> str:
     """Finalizes an ingest operation from a subagent using direct data."""
     from vector_lake.wiki_utils import SafeWriteError
@@ -1616,7 +1890,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             if isinstance(inner, dict):
                 processed_data = inner
 
-        files = files_written
+        files = auto_heal_tag_collisions(files_written)
         job_id = processed_data.get("job_id")
         if not job_id:
             raise ValueError("finalize_ingest requires a claimed job_id")

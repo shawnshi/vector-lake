@@ -1,5 +1,27 @@
 # Unreleased
 
+## 知识摄取实体识别与图谱关联算法增强（Ingestion Entity Linking & Resilience）
+
+针对内容摄取过程中的实体漏召回、标题主体被概念挤占、Tag Collision 阻断弃置、流水账更新与编译事实脱节等结构性缺陷，完成 P0 到 P2 全链路优化重构：
+
+- **中文 2 字实体支持与文件名/标题亲和力提权 (P0-1)**：
+  - 突破原算法 `len(chinese_label) >= 3` 限制，结合实体类型白名单允许 2 字高频人物（如周炜、舒婷、葛航等）及核心实体召回；
+  - 引入 **Title/Filename Affinity Boost**：凡出现在 raw 文件名或标题中的实体直接赋予 **+100 分** 与 `title_affinity` 标记，确保核心主题实体稳居候选清单 Top 1，消除了因漏召回导致模型违规新建并触发 `Canonical version conflict` 的循环。
+- **Tag Collision 拦截降级自愈为语义链接 (P0-2)**：
+  - 在 `finalize_ingest` 引入 `auto_heal_tag_collisions`：当提取的 tag 命中全库实体标题或别名黑名单时，自动从 frontmatter 剥离冲突 tag，并在 Section 1 增量转化为 `[related_to:: [[Target_Key]]]` 语义链接，避免因上下文未暴露别名表导致整个摄取任务被拒弃置。
+- **候选实体类型配额分桶 (Type-Stratified Quotas) (P1-1)**：
+  - 在 `select_ingest_candidates` 引入三阶段分桶机制（Top 绝对择优 $\to$ 实体类型保底分桶 $\to$ 贪心补齐），为 `Person` (4)、`Institution` (4)、`Vendor` (3)、`Product` (3)、`Norm` (4)、`Concept` (6) 分配结构性席位，彻底终结单一 Concept 类型垄断候选清单。
+- **候选召回密集向量 (Embedding) 与 FTS5 混合初筛 (P1-2)**：
+  - 将 768/3072 维语义向量相似度（$\text{sim} > 0.50$ 赋予 $+ \text{int}(\text{sim} \times 100)$）与本地 FTS5 标题检索（$+35$）融入候选打分，有效解决术语表述差异带来的零召回，且在无向量环境时平滑降级。
+- **Target 节点第一节编译事实增量属性合并机制 (P2)**：
+  - 建立标准 `DEFAULT_PREDICATE_SLOTS` 语义谓词到特定 H3 槽位（如关键造物、部署架构、核心约束等）的映射，并扩展 `_upsert_section_relation` 支持 H3 槽位定位；
+  - 实现了 Target 节点的 **Section 1 核心编译事实与 Section 2 证据时间线同频原子更新**，终结新知识只以时间线流水账追加的问题。
+- **Schema 与别名机制对齐**：
+  - 注册 `Healthcare_IT -> Medical_IT` Domain 别名；
+  - 修复 `stub_creator` 移除非合法层级 `"derived"`；
+  - 全库测试套件扩展至 **1676 passed** 全部通过。
+
+
 ## MCP 工具表面物理精简（Strict 18 Core Tools Surface）
 
 将 `vector-lake-mcp` 暴露的工具从 47 个物理精简为高信噪比的 **18 个核心业务工具**，消除 60%+ 的 System Prompt Token 开销，杜绝大模型在交互对话中误触全库重建或并发破坏性运维命令：

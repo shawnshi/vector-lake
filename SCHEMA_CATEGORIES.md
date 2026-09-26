@@ -51,6 +51,18 @@ Proposed categories will be logged in the governance queue for review. Once appr
 
 （原值 `Media_IT`、`Manufacturing_IT`、`Financial_IT` 不在登记表内：它们是**行业里的 IT**，归 `Enterprise_Software`；`Robotics`、`AGI` 归 `Artificial_Intelligence`；`HCI` 归 `Cognitive_Science`；`中医药` 归 `Biomedicine`。）
 
+#### 别名登记（`DOMAIN_ALIASES`，2026-09-26）
+
+与纵向不同，**别名**指“该 subject 已被某个宏观域忠实命名，只是写法不同”。登记后该写法被接受，且检索按规范化值匹配；它**不是**第三个域值，所以既不进入上面 9 个宏观值，也不进入纵向表。
+
+| 别名 | 规范化到 | 为什么是别名而不是纵向 |
+|---|---|---|
+| `Healthcare_IT` | `Medical_IT` | `Healthcare_IT` 是 `categories` 轴对同一 subject 的写法（本文件第 10 行：Digital health systems, hospital implementations, EHR/HIS/Epic），`domain` 轴已有 `Medical_IT` 忠实表达它。登记为纵向会让同一个 subject 在 facets 里有两个值，而 `tool_search._passes_filters` 是按值相等判定命中的。 |
+
+与上一条排除表的区别：`Media_IT` / `Manufacturing_IT` / `Financial_IT` 所在行业没有同名宏观域，所以它们归 `Enterprise_Software`；`Healthcare_IT` 所在行业有（`Medical_IT`），所以它是别名。
+
+触发来源：2026-09-26 一批四人（任连仲/刘海一/李包罗/薛万国）源文件中，三条随机写了对 `Medical_IT`，刘海一那条写了 `Healthcare_IT`，被 `domain is neither a macro domain nor a registered vertical` 确定性拒写并弃置（`ingest_abandoned_sources`）。两侧 `categories` 与 `domain` 用不同词汇表称呼同一个主题，才是真正的触发因。
+
 ### 迁移现状（2026-09-23）
 
 存量曾携带 **192 个不同 domain 值**，其中 67 个只用在 1 个页面上，近义并存是明摆着的（同一个主题有 `AI_Industry` / `AI_Research` / `General_AI` / `AI_Architecture` / `AI` / `Artificial_Intelligence` 六个值）。已完成：宏观值收敛 2 086 页 + 第二批 69 页（IT/商业/地缘/医疗类的纵向，有忠实宏观归属）；登记的纵向值保留原值不动；`auto-stub` 占位页与生成物不参与域报告（前者还没有主题，后者是 wiki 自己生成的索引）。
