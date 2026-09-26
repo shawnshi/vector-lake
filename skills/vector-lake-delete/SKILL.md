@@ -27,15 +27,16 @@ triggers: 'When the user requests to cascade-delete a raw source or remove a sou
 <execution_workflow>
   <workflow>
     1. **Target Identification:** Extract the `raw_path` argument from the user's request.
-    2. **Blast Radius Preview:** Call the `delete_source` MCP tool with `dry_run=True` to determine the exact impact (nodes and edges to be deleted).
+    2. **Blast Radius Preview:** Run `python cli.py delete-source <raw_path>` (defaults to dry-run) via bash to determine the exact impact (nodes and edges to be deleted).
     3. **Sandbox Registration:** Log the previewed blast radius into the `scratch/` sandbox isolation area for safe human review.
     4. **[FABLE 5 CHECKPOINT]:** Halt operations. Present the deletion blast radius to the human user and request explicit authorization to proceed.
-    5. **Destructive Execution:** Upon receiving human approval, call the `delete_source` MCP tool with `dry_run=False`.
-    6. **Knowledge Registry Sync:** Update the `vector-lake-mcp` knowledge registry to reflect the successful severing of graph edges.
+    5. **Destructive Execution:** Upon receiving human approval, execute `python cli.py delete-source <raw_path> --apply` via bash.
+    6. **Knowledge Registry Sync:** Run `python cli.py projections` to verify all projections remain healthy.
   </workflow>
 
   <tool_dispatch>
-    - `vector-lake-mcp`: `delete_source` (Requires `raw_path`, supports `dry_run` flag) and knowledge registry interactions.
+    - `bash`: `python cli.py delete-source <raw_path> [--apply]` for safe preview and destructive deletion.
+    - `vector-lake-mcp`: `inspect_projections` to verify projection health after deletion.
     - `invoke_subagent`: Mandatory for concurrent tasks or validation sweeps if needed.
   </tool_dispatch>
 

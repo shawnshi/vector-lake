@@ -26,14 +26,15 @@ triggers: 'When the user requests to clean up, garbage collect, prune, or remove
 <execution_workflow>
   <workflow>
     1. Parse user constraints (e.g., `days` specifying the age threshold).
-    2. Invoke the garbage collection tool with `dry_run=True` to preview what would be deleted without making changes.
+    2. Run preview: execute `python cli.py gc` (defaults to dry-run; optionally `--days N`) via bash to preview what would be deleted without making changes.
     3. Temporarily store large results in the `scratch/` directory for Sandbox Isolation if the list of orphaned entities is extensive.
     4. [FABLE 5 CHECKPOINT] Present the preview to the user. Stop and await human approval.
-    5. Upon receiving explicit human approval, execute the garbage collection tool with `dry_run=False` to finalize the deletion.
+    5. Upon receiving explicit human approval, execute `python cli.py gc --apply` via bash to finalize the pruning.
   </workflow>
 
   <tool_dispatch>
-    - `call_mcp_tool`: Use to invoke the `gc_vector_lake` tool from the `vector-lake-mcp` server. This is strictly required for interacting with the knowledge registry.
+    - `bash`: `python cli.py gc [--days N] [--apply]` for safe preview and execution.
+    - `vector-lake-mcp`: `inspect_projections` to verify projection health after pruning.
     - `invoke_subagent`: Use if concurrent tasks or deep structural audits are needed before triggering the deletion.
   </tool_dispatch>
 

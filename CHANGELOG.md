@@ -1,5 +1,37 @@
 # Unreleased
 
+## MCP 工具表面物理精简（Strict 18 Core Tools Surface）
+
+将 `vector-lake-mcp` 暴露的工具从 47 个物理精简为高信噪比的 **18 个核心业务工具**，消除 60%+ 的 System Prompt Token 开销，杜绝大模型在交互对话中误触全库重建或并发破坏性运维命令：
+
+- **保留的 18 个核心工具**：
+  1. `search_vector_lake` (混合检索)
+  2. `search_timeline` (时序分析)
+  3. `trace_vector_lake` (事实溯源)
+  4. `query_logic_lake` (深度推理上下文装配)
+  5. `finalize_query_synthesis` (推理结果验证与建桩闭环)
+  6. `write_wiki_page` (单页安全写入)
+  7. `update_operational_memory` (运行态记忆持久化)
+  8. `check_duplicate_entity` (实体防撞查重)
+  9. `rename_entity` (实体重命名与全库链接重写)
+  10. `merge_suggestions_vector_lake` (实体合并建议)
+  11. `review_governance_list` (治理队列审阅)
+  12. `resolve_governance_item` (治理项决策执行)
+  13. `get_governance_debt` (知识债务指标)
+  14. `lint_vector_lake` (知识自愈审计)
+  15. `trigger_audit_graph` (图拓扑架构审计)
+  16. `doctor_vector_lake` (运行依赖与系统诊断)
+  17. `inspect_projections` (8大派生投影统一巡检)
+  18. `visualize_vector_lake` (3D HTML 拓扑可视化)
+- **从 MCP 注销的 29 个非核心/底层运维端点**：
+  - 纯全量灾难恢复（`rebuild_timeline_events`, `rebuild_memory_gram_index`, `projection_rebuild_index`, `canonical_backfill`, `embedding_backfill`, `wiki_restore`）完整收敛至 `cli.py` 宿主命令；
+  - 内部调度状态与队列管理（`list_terminal_failed_ingest_jobs`, `close_terminal_failed_ingest_jobs`, `list_abandoned_ingest_sources`, `clear_abandoned_ingest_sources`, `expire_ingest_tasks`）交由守护进程与内部脚本管理；
+  - 历史修复与碎片状态（`backup_retention_report`, `repair_idempotency_keys`, `idempotency_index_status`, `memory_gram_index_status`, `projection_report`, `sync_vector_lake` 等）由 `inspect_projections` 和对应 CLI 全面接管；
+  - 函数本体保留为 Python 普通函数，不破坏内部 import 与测试调用；
+  - 相关技能（`vector-lake-delete`, `vector-lake-gc`, `vector-lake-research`）对齐改造为调用 `python cli.py <cmd>`。
+- **工程门禁对齐**：更新 `tests/test_command_surface.py` 严格校验 `assert len(names) == 18`，更新 `tests/test_maintenance_surface.py`，doctor 报告明确显示 `Import OK, 18 tools exposed`。全库测试维持 **1667 passed** 全部通过。
+
+
 ## 技能体系重构与命名空间统一（Skills Refactoring & `vector-lake-*` Unification）
 
 针对项目 Skills 原先使用纯通用英语名词（`search`, `lint`, `doctor`, `review` 等）引发的全局环境命名空间污染与误触发风险，完成全量体系重构：

@@ -90,7 +90,7 @@ def search_timeline(entity_name: str = "", action: str = "", limit: int = 10) ->
         limit=limit
     )
 
-@mcp.tool()
+# [CLI-only / Internal]
 def rebuild_timeline_events(dry_run: bool = True, limit: int = 0) -> str:
     """[MAINTENANCE / REPAIR] Rebuild the timeline_events projection from timeline-event claims. Prefer CLI 'cli.py projections --reconcile --only timeline_events'."""
     return tools.rebuild_timeline_events_from_claims(
@@ -98,7 +98,7 @@ def rebuild_timeline_events(dry_run: bool = True, limit: int = 0) -> str:
         limit=limit if limit and limit > 0 else None,
     )
 
-@mcp.tool()
+# [CLI-only / Internal]
 def memory_gram_index_status() -> str:
     """Report the exact n-gram index used by operational-memory search.
 
@@ -108,12 +108,12 @@ def memory_gram_index_status() -> str:
     """
     return tools.memory_gram_index_report()
 
-@mcp.tool()
+# [CLI-only / Internal]
 def rebuild_memory_gram_index(dry_run: bool = True) -> str:
     """[MAINTENANCE / HEAVY] Bulk-rebuild the operational-memory n-gram index (minutes on a large corpus). Prefer CLI 'cli.py gram-index --apply' or background daemon."""
     return tools.rebuild_memory_gram_index(dry_run=dry_run)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def backup_retention_report(keep: int = 0, max_bytes: int = 0, dry_run: bool = True) -> str:
     """Report the .meta/backups footprint against its retention bound.
 
@@ -130,7 +130,7 @@ def backup_retention_report(keep: int = 0, max_bytes: int = 0, dry_run: bool = T
     """
     return tools.backup_retention_report(keep=keep, max_bytes=max_bytes, dry_run=dry_run)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def idempotency_index_status() -> str:
     """Report the uniqueness guarantee each idempotency table actually has.
 
@@ -141,7 +141,7 @@ def idempotency_index_status() -> str:
     """
     return tools.idempotency_index_report()
 
-@mcp.tool()
+# [CLI-only / Internal]
 def repair_idempotency_keys(table: str = "mutation_outbox", dry_run: bool = True) -> str:
     """[MAINTENANCE / REPAIR] Clear redundant idempotency keys so the full unique index can be created. Prefer CLI 'cli.py repair-idempotency'.
 
@@ -174,22 +174,22 @@ def inspect_projections() -> str:
         lines.append(line)
     return "\n".join(lines)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def projection_report(limit: int = 20) -> str:
     """Report drift between Wiki pages, SQLite canonical entities, and index.json."""
     return tools.projection_diff_report(limit=limit)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def canonical_backfill(dry_run: bool = True, limit: int = 50) -> str:
     """[MAINTENANCE / DISASTER RECOVERY] Backfill missing SQLite canonical rows from existing Wiki pages. Prefer CLI 'cli.py canonical-backfill'."""
     return tools.canonical_backfill_missing_wiki(dry_run=dry_run, limit=limit)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def projection_rebuild_index(dry_run: bool = True) -> str:
     """[MAINTENANCE / DISASTER RECOVERY] Rebuild index.json, FTS, embeddings, and claim_topology from SQLite canonical state. Prefer CLI 'cli.py projection-rebuild-index'."""
     return tools.rebuild_index_projection(dry_run=dry_run)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def embedding_backfill(dry_run: bool = True, limit: int = 0, include_existing: bool = False) -> str:
     """[MAINTENANCE / HEAVY] Backfill missing vector embeddings under RPM/TPM rate limits. Prefer CLI 'cli.py embedding-backfill'."""
     return tools.embedding_backfill_projection(
@@ -198,7 +198,7 @@ def embedding_backfill(dry_run: bool = True, limit: int = 0, include_existing: b
         include_existing=include_existing,
     )
 
-@mcp.tool()
+# [CLI-only / Internal]
 def wiki_restore(dry_run: bool = True, limit: int = 10) -> str:
     """[MAINTENANCE / DISASTER RECOVERY] Restore missing Wiki Markdown pages from canonical metadata. Prefer CLI 'cli.py wiki-restore'."""
     return tools.restore_missing_wiki_from_canonical(dry_run=dry_run, limit=limit)
@@ -297,7 +297,7 @@ def update_operational_memory(memory_type: str, payload_file: str = "", content:
             return str(e)
     return tool_memory.update_operational_memory(memory_type, text_content)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def sync_vector_lake() -> str:
     """(Legacy Alias) Trigger an ingestion batch scan. Replaced by the asynchronous Subagent pipeline, now wraps prepare_ingest_batch."""
     try:
@@ -307,7 +307,7 @@ def sync_vector_lake() -> str:
         logging.error(f"MCP Tool Exception (sync_vector_lake): {e}\n{traceback.format_exc()}")
         return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
 
-@mcp.tool()
+# [CLI-only / Internal]
 def claim_evidence_queue(
     apply: bool = False,
     group: str = "prefix",
@@ -408,7 +408,7 @@ def resolve_governance_item(
         except Exception as e:
             return str(e)
     return tools.review_vector_lake(action="resolve", index=item_id, resolution=resolution, change_manifest=manifest)
-@mcp.tool()
+# [CLI-only / Internal]
 def trigger_autonomous_research(dry_run: bool = False) -> str:
     """Autonomously scan graph gaps and governance queue to formulate web research directives.
     
@@ -417,7 +417,7 @@ def trigger_autonomous_research(dry_run: bool = False) -> str:
     """
     return tools.research_vector_lake(dry_run=dry_run)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def review_strategic_purpose(as_of: str = "") -> str:
     """Review due Standing Intelligence Requirements without changing the Wiki.
 
@@ -440,7 +440,7 @@ def trigger_audit_graph() -> str:
     """Synthesize graph topology insights into the unified review surface."""
     return tools.audit_graph()
 
-@mcp.tool()
+# [CLI-only / Internal]
 def delete_source(raw_path: str, dry_run: bool = True) -> str:
     """Cascade-delete a raw source and all related wiki pages.
     
@@ -486,7 +486,7 @@ def merge_suggestions_vector_lake(limit: int = 20, enqueue: bool = False) -> str
     """
     return tools.merge_suggestions_vector_lake(limit=limit, enqueue=enqueue)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def gc_vector_lake(days: int = 30, dry_run: bool = True, force: bool = False) -> str:
     """Automatically prune isolated or orphaned entities.
 
@@ -498,7 +498,7 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True, force: bool = False) ->
     """
     return tools.gc_vector_lake(days=days, dry_run=dry_run, force=force)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def prepare_ingest_batch(batch_size: int = 5) -> str:
     """Scan for unprocessed raw sources and prepare subagent ingestion instructions.
     
@@ -507,46 +507,46 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     """
     return tools.prepare_ingest_batch(batch_size=batch_size)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def list_ingest_tasks(limit: int = 20, include_queued: bool = True) -> str:
     """List queued or awaiting-subagent ingest jobs."""
     return tools.list_ingest_tasks(limit=limit, include_queued=include_queued)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     """Lease awaiting ingest task packets to the current-environment subagent host."""
     return tools.claim_ingest_tasks(limit=limit, lease_seconds=lease_seconds)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def list_terminal_failed_ingest_jobs() -> str:
     """[SCHEDULER / INTERNAL] List ingest jobs that spent their attempt budget, with the source each names."""
     return tools.list_terminal_failed_ingest_jobs()
 
 
-@mcp.tool()
+# [CLI-only / Internal]
 def close_terminal_failed_ingest_jobs(source_ingested_only: bool = True) -> str:
     """[SCHEDULER / INTERNAL] Mark terminal-failed jobs superseded once their source has been ingested."""
     return tools.close_terminal_failed_ingest_jobs(source_ingested_only=source_ingested_only)
 
 
-@mcp.tool()
+# [CLI-only / Internal]
 def list_abandoned_ingest_sources() -> str:
     """[SCHEDULER / INTERNAL] List raw sources withheld from dispatch after repeated deterministic failures."""
     return tools.list_abandoned_ingest_sources()
 
 
-@mcp.tool()
+# [CLI-only / Internal]
 def clear_abandoned_ingest_sources(filepath: str = "") -> str:
     """[SCHEDULER / INTERNAL] Allow abandoned ingest source(s) to be dispatched again (empty filepath = all)."""
     return tools.clear_abandoned_ingest_sources(filepath or None)
 
 
-@mcp.tool()
+# [CLI-only / Internal]
 def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     """[SCHEDULER / INTERNAL] Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
     return tools.expire_ingest_tasks(max_age_seconds=max_age_seconds)
 
-@mcp.tool()
+# [CLI-only / Internal]
 def finalize_ingest(
     files_written: list = None,
     processed_data: dict = None,
@@ -632,7 +632,7 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
 import uuid
 from vector_lake.governance_store import load_governance_queue, save_governance_queue, _utc_now
 
-@mcp.tool()
+# [CLI-only / Internal]
 def propose_schema_mutation(new_category: str, payload_file: str, parent_category: str = "Uncategorized") -> str:
     """Propose a new taxonomy category to the ontology team.
     
@@ -667,7 +667,7 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
 
 
 
-@mcp.tool()
+# [CLI-only / Internal]
 def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> str:
     """Batch replace occurrences of a string (usually a link) across all wiki pages.
     Use this when an entity's name changes but `rename_entity` failed to cover all cases.
@@ -710,7 +710,7 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
         execute_mutation_batch(mutations)
     return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files and queued projections."
 
-@mcp.tool()
+# [CLI-only / Internal]
 def bulk_reconciliation(payload_file: str, dry_run: bool = True) -> str:
     """Execute a batch of graph reconciliation operations (merge, replace_only, alias).
     

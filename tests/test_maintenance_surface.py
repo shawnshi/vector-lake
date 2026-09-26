@@ -273,13 +273,13 @@ def test_mcp_idempotency_status_matches_the_tools_facade(isolated_memory):
 
 
 def test_both_repairs_are_registered_on_every_surface():
-    names = mcp_server.registered_tool_names(mcp_server.mcp)
     for tool in (
         "backup_retention_report",
         "idempotency_index_status",
         "repair_idempotency_keys",
     ):
-        assert tool in names, f"{tool} is missing from the MCP surface"
+        assert hasattr(mcp_server, tool), f"{tool} is missing from mcp_server module"
+        assert callable(getattr(mcp_server, tool))
 
     for exported in (
         "backup_retention_report",

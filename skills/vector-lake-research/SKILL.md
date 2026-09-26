@@ -25,20 +25,20 @@ triggers: 'Triggered when the user asks to research graph gaps, explore knowledg
 
 <execution_workflow>
   <workflow>
-    1. **Scan for Gaps**: Call `trigger_autonomous_research` MCP tool from the `vector-lake-mcp` server. If asked to dry-run, set `dry_run=True`.
+    1. **Scan for Gaps**: Run `python cli.py research` (or `--dry-run`) via bash, or call `review_governance_list` MCP tool to inspect pending gaps.
     2. **[Fable 5 Checkpoint]**: 必须在此定义强制阻断点，要求人类 Approve。Before invoking a subagent for heavy background research, pause and await human confirmation of the research directives.
     3. **Subagent Delegation**: You (the Main Agent) MUST use the `invoke_subagent` tool to delegate this heavy background operation to a `research` subagent (Role: `Autonomous Researcher`).
     4. **Subagent Execution**: Pass the directive into the subagent's Prompt and instruct it to:
        - Execute required web searches using `search_web`.
        - Write intermediate validation data to `scratch/` for Sandbox Isolation.
-       - Save final results to `C:\Users\shich\.gemini\MEMORY\raw\research\`.
-    5. **Ingestion**: The subagent must use the `sync_vector_lake` MCP tool to ingest the findings into the Vector Lake Registry.
+       - Save final results to raw research storage.
+    5. **Ingestion**: The subagent triggers background ingestion via `python cli.py ingest`.
   </workflow>
 
   <tool_dispatch>
-    - `call_mcp_tool`: invoke `trigger_autonomous_research` (from `vector-lake-mcp`) to generate directives.
+    - `bash`: `python cli.py research [--dry-run]` to scan gaps; `python cli.py ingest` to ingest.
+    - `vector-lake-mcp`: `review_governance_list` to inspect pending gaps.
     - `invoke_subagent`: MUST be used to orchestrate heavy background operations for the actual research.
-    - `call_mcp_tool`: invoke `sync_vector_lake` (from `vector-lake-mcp`) via subagent for Vector Lake Registry.
   </tool_dispatch>
 
   <checkpoint_rules>

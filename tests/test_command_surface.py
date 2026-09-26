@@ -96,15 +96,10 @@ def test_no_slash_command_compat_layer_ships():
 
 
 def test_mcp_server_registers_its_tool_surface():
-    """The server must import and register tools on the installed SDK.
-
-    A CI red run came from exactly this surface disappearing: the declared mcp
-    floor resolved to 2.x while the module still imported the 1.x FastMCP name,
-    so every MCP-touching test module failed at import time.
-    """
+    """The server must register exactly the 18 core tools."""
     names = mcp_server.registered_tool_names(mcp_server.mcp)
 
-    assert len(names) >= 30, f"tool surface shrank unexpectedly: {len(names)}"
+    assert len(names) == 18, f"expected exactly 18 core tools, got {len(names)}: {names}"
     assert "search_vector_lake" in names
-    assert "finalize_ingest" in names
+    assert "query_logic_lake" in names
     assert "doctor_vector_lake" in names
