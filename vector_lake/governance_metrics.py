@@ -1,4 +1,5 @@
 import re
+import collections
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
@@ -350,7 +351,7 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         governance_store.rebuild_operational_memory()
         memory_total, memory_states, memory_types = _memory_projection_aggregates()
 
-    validity_state_counts = {}
+    validity_state_counts = collections.defaultdict(int)
     unsupported_claim_count = 0
     #: Unsupported claims whose page's provenance is recorded as never having existed (the
     #: acceptance ledger).  Reported apart from the open count: "no evidence attached" and "no
@@ -371,7 +372,7 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
     accepted_legacy_pages = accepted_pages()
     for claim in claims:
         state = claim.get("validity_state", "active")
-        validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
+        validity_state_counts[state] += 1
         if state == "unsupported":
             # The two-way split stays a breakdown of the *open* count, so
             # ``unsupported == unsourced + ambiguous_source`` keeps holding wherever it is read.
@@ -396,7 +397,11 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         if float(claim.get("confidence", 0)) < 0.5 and len(claim.get("subject_entity_ids", [])) > 0:
             high_centrality_low_confidence += 1
 
-    source_ids_with_claims = {source_id for claim in claims for source_id in claim.get("source_ids", [])}
+    source_ids_with_claims = set()
+    for claim in claims:
+        source_ids = claim.get("source_ids")
+        if source_ids:
+            source_ids_with_claims.update(source_ids)
     orphan_source_count = len([source for source in sources if source["source_id"] not in source_ids_with_claims])
     pending_items = [item for item in queue if item.get("status") == "pending"]
     if skip_heavy:
@@ -424,7 +429,7 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         "superseded_memory_count": memory_states.get("superseded", 0),
         "conflicted_memory_count": memory_states.get("conflicted", 0),
         "memory_type_counts": memory_types,
-        "validity_state_counts": validity_state_counts,
+        "validity_state_counts": dict(validity_state_counts),
         "legacy_acceptance_ledger": str(ledger_path()) if accepted_legacy_pages else "",
     }
 
