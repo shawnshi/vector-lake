@@ -134,6 +134,15 @@ GENERATED_ARTIFACT_MARKERS: tuple[str, ...] = ("community_id", "level")
 #: ``# L0 Comm: ...`` and carries the generated-index note.
 GENERATED_ARTIFACT_H2: tuple[str, ...] = ("## 核心节点 (Hubs)", "## 社区成员 (Members)")
 
+#: The *second* generator's shape.  Domain overviews are written as ``# Domain Overview: <DOMAIN>``
+#: and carry a ``## 📌 核心实体排行 (Top Entities by Network Relevance)`` section.  They have no
+#: frontmatter marker and no name the community rule recognises.  Measured 2026-09-28: six live
+#: ``Concept_Overview-*`` pages were reported as knowledge orphans, and they are indexes the wiki
+#: writes about itself -- the same "an index is not a page about the thing it indexes" case this
+#: module already owns for community indexes.
+DOMAIN_OVERVIEW_H1: str = "# Domain Overview:"
+DOMAIN_OVERVIEW_H2: str = "核心实体排行"
+
 
 def is_generated_artifact_name(filename: str) -> bool:
     """True for a name in the daemon's own naming family, without looking at the page."""
@@ -143,11 +152,11 @@ def is_generated_artifact_name(filename: str) -> bool:
 def is_generated_artifact(frontmatter: dict | None, filename: str, body: str | None = None) -> bool:
     """True for a page the wiki generates *about itself*, not a knowledge node.
 
-    Any one of three signals is enough: the ``System_Community_*`` name family, the markers the
-    daemon leaves in frontmatter, or the artifact's own two H2 sections.  A caller holding the
-    body should pass it, because the generator has not always written the markers -- and the
-    cost of guessing wrong is a knowledge rule applied to a generated index, or a generated
-    index reported as a duplicate of the page it was named after.
+    Any one of the signals is enough: the ``System_Community_*`` name family, the markers the
+    daemon leaves in frontmatter, the community artifact's own two H2 sections, or the domain
+    overview's H1/section shape.  A caller holding the body should pass it, because the generators
+    have not always written the markers -- and the cost of guessing wrong is a knowledge rule
+    applied to a generated index, or a generated index reported as a duplicate or as an orphan.
     """
     if is_generated_artifact_name(filename):
         return True
@@ -156,6 +165,12 @@ def is_generated_artifact(frontmatter: dict | None, filename: str, body: str | N
     ):
         return True
     if body and all(section in body for section in GENERATED_ARTIFACT_H2):
+        return True
+    # The H1 is the reliable half: it is the first thing the overview generator writes, while a
+    # section heading is localised prose that an edit could remove.
+    if body and DOMAIN_OVERVIEW_H1 in body[:400]:
+        return True
+    if body and DOMAIN_OVERVIEW_H2 in body:
         return True
     return False
 
