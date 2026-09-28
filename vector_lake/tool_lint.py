@@ -20,7 +20,6 @@ from vector_lake.wiki_utils import (
 from vector_lake import stub_creator
 from vector_lake.link_resolution import build_link_map, resolve_link_target
 from vector_lake.schema_validator import (
-    REQUIRED_FIELDS,
     VALID_EPISTEMIC_STATUS,
     VALID_STATUS,
     VALID_TYPES,
@@ -247,7 +246,6 @@ def lint_vector_lake(auto_fix: bool = False):
     valid_status = _LOWERCASE_STATUS
     valid_epistemic = VALID_EPISTEMIC_STATUS
     valid_prefixes = VALID_PREFIXES
-    required_fields = list(REQUIRED_FIELDS)
 
     files = [name for name in listed if name not in NON_NODE_WIKI_FILES]
     issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "domain", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment", "evidence", "source_path"]}
@@ -447,7 +445,8 @@ def lint_vector_lake(auto_fix: bool = False):
                 for fname in filenames[1:]:
                     if fname in parsed:
                         aliases = parsed[fname]["fm"].get("aliases", [])
-                        if isinstance(aliases, str): aliases = [aliases]
+                        if isinstance(aliases, str):
+                            aliases = [aliases]
                         if alias in aliases:
                             aliases.remove(alias)
                             parsed[fname]["fm"]["aliases"] = aliases
@@ -538,11 +537,16 @@ def lint_vector_lake(auto_fix: bool = False):
                 # ``evidence_tier="derived"`` was worse than the others: ``derived`` is not one
                 # of the five tiers ``purpose.md`` declares, so the write this repair produced
                 # was refused by the purpose gate and never landed at all.
-                if not frontmatter.get("id"): frontmatter["id"] = _generate_id(node_key)
-                if not frontmatter.get("title"): frontmatter["title"] = filename[:-3]
-                if not frontmatter.get("type"): frontmatter["type"] = _type_from_filename(filename)
-                if not frontmatter.get("updated"): frontmatter["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                if "sources" not in frontmatter: frontmatter["sources"] = []
+                if not frontmatter.get("id"):
+                    frontmatter["id"] = _generate_id(node_key)
+                if not frontmatter.get("title"):
+                    frontmatter["title"] = filename[:-3]
+                if not frontmatter.get("type"):
+                    frontmatter["type"] = _type_from_filename(filename)
+                if not frontmatter.get("updated"):
+                    frontmatter["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                if "sources" not in frontmatter:
+                    frontmatter["sources"] = []
                 changed = True
 
         file_type = str(frontmatter.get("type", "")).lower()
