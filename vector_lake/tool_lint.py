@@ -62,6 +62,10 @@ SIMILARITY_MERGE_THRESHOLD = 0.91
 #: folding digits before drawing the distinction is what separates the two cases.
 _NUMERIC_RUN = re.compile(r"\d+")
 
+#: A second frontmatter block where body text should start.  Written by the lint when a page ends
+#: up carrying two, which is how a placeholder block came to sit above a page's real fields.
+_EMBEDDED_FRONTMATTER = re.compile(r"^\ufeff?\s*---\r?\n")
+
 
 def _naming_series_key(key: str) -> str:
     """``Source_intelligence-20260219-briefing`` -> ``intelligence-#-briefing``.
@@ -310,6 +314,18 @@ def lint_vector_lake(auto_fix: bool = False):
         if not content.startswith("---"):
             issues["frontmatter"].append(f"{filename}: Missing YAML frontmatter entirely")
             continue
+
+        # A second frontmatter block inside the body means the file carries two of them: a write
+        # appended new frontmatter on top of a page whose own frontmatter then became body text.
+        # ``Concept_Full-Stack-Builder`` sat that way (real title, domain and sources stranded below
+        # a placeholder block) and no check reported it -- this pass read the first block, found it
+        # well formed, and moved on.  The consequence is not cosmetic: the page is classified by the
+        # placeholder (``Uncategorized``, ``sources: []``) while its actual provenance is unreachable.
+        if _EMBEDDED_FRONTMATTER.match(body):
+            issues["frontmatter"].append(
+                f"{filename}: contains a second YAML frontmatter block in the body "
+                "(the page was written twice; its real fields may be below the first block)"
+            )
 
         links = set()
         for match in re.finditer(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", content):
