@@ -1,5 +1,11 @@
 # Unreleased
 
+## 摄取 Runner 整合判断回传与任务包协议 v3
+
+- 模型接缝改为单个 JSON 对象，显式返回 `files_written` 和 `integration`；Runner 仅从可信任务包继承租约、源哈希与候选清单，缺失判断或旧数组输出失败关闭，不再静默回退为 standalone。
+- v3 在认领前重建旧版 queued、failed 与 awaiting_subagent 提示词；保留 queued/failed 尝试次数，避免迁移竞态误删已被领取的任务包。已领取任务必须在切换前排空。
+- 增加隔离端到端 Source→目标页整合测试、旧包迁移与输出协议拒绝用例；常驻 Runner 仍需受控重载才能使用磁盘新代码。
+
 ## 知识摄取实体识别与图谱关联算法增强（Ingestion Entity Linking & Resilience）
 
 针对内容摄取过程中的实体漏召回、标题主体被概念挤占、Tag Collision 阻断弃置、流水账更新与编译事实脱节等结构性缺陷，完成 P0 到 P2 全链路优化重构：

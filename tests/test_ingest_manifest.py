@@ -1,10 +1,8 @@
 """The ingest task packet's dispatch manifest.
 
-The prompt tells the model to preserve ``source_projection_hash`` and
-``ingest_contract_version`` verbatim and to use only relations listed in
-``integration_candidates``.  None of those fields existed in the packet the producer built, so the
-prompt described a manifest that was never there.  These tests pin the producer side: the manifest
-is emitted, and the candidate list in it is the *same* list the prompt shows.
+The host retains ``source_projection_hash`` and ``ingest_contract_version`` and gives the model
+only bounded relation candidates. These tests pin the producer side: the manifest is emitted,
+and the candidate list in it is the *same* list the prompt shows.
 """
 
 import json
@@ -252,7 +250,7 @@ def test_a_packet_without_a_manifest_is_fine_when_it_declares_no_relation(isolat
     assert [item["filename"] for item in files] == [_SOURCE_PAGE]
 
 
-def test_the_legacy_requeue_rebuilds_a_packet_for_an_older_contract(isolated_memory):
+def test_the_legacy_requeue_rebuilds_a_packet_for_an_older_contract(isolated_memory, monkeypatch):
     """The recovery path M1 depends on: a packet below the contract version is rebuilt.
 
     Observed on the live queue: 1730 ``jobs`` rows carry a payload written before the manifest,
@@ -265,17 +263,80 @@ def test_the_legacy_requeue_rebuilds_a_packet_for_an_older_contract(isolated_mem
         "canonical_name": _SOURCE_PAGE,
         "instructions": "legacy",
     }
+    from vector_lake import native_llm
+
     db_store.enqueue_job("ingest", payload)
     for row in db_store.get_connection().execute("SELECT job_id FROM jobs"):
-        db_store.mark_job_awaiting_subagent(row["job_id"], "")
+        db_store.mark_job_awaiting_subagent(row["job_id"], "synthetic-packet.json")
+    removed = []
+    monkeypatch.setattr(native_llm, "remove_subagent_task", lambda path: removed.append(path))
 
     assert tool_ingest.requeue_legacy_ingest_jobs() == 1
-    rebuilt = json.loads(
-        db_store.get_connection().execute("SELECT payload FROM jobs").fetchone()[0]
-    )
+    row = db_store.get_connection().execute("SELECT payload, status, task_packet_path FROM jobs").fetchone()
+    rebuilt = json.loads(row["payload"])
+    assert row["status"] == "queued" and row["task_packet_path"] is None
+    assert removed == ["synthetic-packet.json"]
     assert rebuilt["ingest_contract_version"] == tool_ingest.INGEST_CONTRACT_VERSION
     assert rebuilt["integration_candidates"], "the rebuilt packet still has no manifest"
     assert rebuilt["source_projection_hash"]
+
+
+@pytest.mark.parametrize("status", ["queued", "failed"])
+def test_legacy_output_prompt_rebuilt_without_resetting_queued_attempts(isolated_memory, monkeypatch, status):
+    from vector_lake import native_llm
+
+    raw = _raw_and_candidate(isolated_memory)
+    payload = {
+        "filepath": str(raw), "hash": "legacy-v2-hash", "canonical_name": _SOURCE_PAGE,
+        "ingest_contract_version": 2, "instructions": "Return only a JSON array",
+    }
+    job_id = db_store.enqueue_job("ingest", payload)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("UPDATE jobs SET status = ?, retries = 2, task_packet_path = ? WHERE job_id = ?",
+                     (status, "legacy-packet.json", job_id))
+    removed = []
+    monkeypatch.setattr(native_llm, "remove_subagent_task", lambda path: removed.append(path))
+
+    assert tool_ingest.requeue_legacy_ingest_jobs() == 1
+    row = conn.execute("SELECT payload, status, retries, task_packet_path FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    assert row["task_packet_path"] is None and removed == ["legacy-packet.json"]
+    rebuilt = json.loads(row["payload"])
+    assert row["status"] == status and row["retries"] == 2
+    assert rebuilt["ingest_contract_version"] == tool_ingest.INGEST_CONTRACT_VERSION == 3
+    assert "Return one JSON object" in rebuilt["instructions"]
+    assert rebuilt["integration_candidates"]
+    assert tool_ingest.requeue_legacy_ingest_jobs() == 0
+
+
+def test_legacy_requeue_does_not_delete_a_packet_claimed_during_rebuild(isolated_memory, monkeypatch):
+    from vector_lake import native_llm
+
+    raw = _raw_and_candidate(isolated_memory)
+    payload = {
+        "filepath": str(raw), "hash": "legacy-v2-hash", "canonical_name": _SOURCE_PAGE,
+        "ingest_contract_version": 2, "instructions": "Return only a JSON array",
+    }
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "synthetic-packet.json")
+    real_render = tool_ingest._build_ingest_instructions
+    removed = []
+
+    def claim_while_rebuilding(*args, **kwargs):
+        db_store.update_job_status(job_id, "subagent_processing")
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(tool_ingest, "_build_ingest_instructions", claim_while_rebuilding)
+    monkeypatch.setattr(native_llm, "remove_subagent_task", lambda path: removed.append(path))
+
+    assert tool_ingest.requeue_legacy_ingest_jobs() == 0
+    row = db_store.get_connection().execute(
+        "SELECT payload, status, task_packet_path FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    assert row["status"] == "subagent_processing"
+    assert row["task_packet_path"] == "synthetic-packet.json"
+    assert json.loads(row["payload"])["ingest_contract_version"] == 2
+    assert removed == []
 
 
 def test_a_correct_manifest_relation_is_accepted(isolated_memory):
@@ -317,43 +378,76 @@ def test_a_source_edited_after_the_packet_was_built_is_refused(isolated_memory):
 # ---------------------------------------------------------------------------------------------
 
 
-def test_the_runner_stacks_its_fallback_under_the_models_disposition():
-    """The call site built ``{**processed, "integration": {...}}`` and silently dropped relations."""
-    from scripts.ingest_runner import _with_disposition
+def test_runner_merges_model_decision_without_trusting_model_packet_fields():
+    from scripts.ingest_runner import _merge_model_integration
 
     relations = [{"target": "Concept_Target.md", "target_hash": "version-token"}]
-    merged = _with_disposition({
-        "filepath": "raw/x.md",
-        "integration": {"disposition": "integrated", "relations": relations},
-    })
+    packet = {"filepath": "raw/x.md", "lease_token": "host-token", "source_hash": "host-version"}
+    merged = _merge_model_integration(packet, {"disposition": "integrated", "relations": relations})
 
-    assert merged["integration"]["disposition"] == "integrated"
-    assert merged["integration"]["relations"] == relations
-    assert merged["filepath"] == "raw/x.md", "stacking must not drop the packet fields"
+    assert merged["integration"] == {"disposition": "integrated", "relations": relations}
+    assert merged["lease_token"] == "host-token"
+    assert merged["source_hash"] == "host-version"
+    assert "integration" not in packet
 
 
-def test_the_runner_supplies_its_fallback_only_when_the_model_declared_none():
-    from scripts.ingest_runner import STANDALONE_FALLBACK_REASON, _with_disposition
+@pytest.mark.parametrize("integration", [None, "integrated", {}, {"reason": "not decided"}])
+def test_runner_refuses_a_missing_model_decision(integration):
+    from scripts.ingest_runner import _merge_model_integration
 
-    merged = _with_disposition({"filepath": "raw/x.md"})
-    assert merged["integration"] == {
-        "disposition": "standalone",
-        "reason": STANDALONE_FALLBACK_REASON,
+    with pytest.raises(ValueError, match="explicit integration disposition"):
+        _merge_model_integration({"filepath": "raw/x.md"}, integration)
+
+
+def test_runner_preserves_standalone_reason_for_finalizer_validation():
+    from scripts.ingest_runner import _merge_model_integration
+
+    merged = _merge_model_integration({"filepath": "raw/x.md"}, {"disposition": "standalone", "reason": "short"})
+    assert merged["integration"]["reason"] == "short"
+
+
+def test_default_runner_integrates_a_source_through_real_finalizer(isolated_memory, monkeypatch):
+    """Only the model call is simulated; leases, version gates and Wiki writes use the temp root."""
+    import subprocess
+    from scripts import ingest_runner as runner
+    from vector_lake.ingest_worker import process_jobs
+    from vector_lake.tool_ingest import claim_ingest_tasks
+
+    raw = _raw_and_candidate(isolated_memory)
+    assert json.loads(tool_ingest.prepare_ingest_batch(batch_size=1))["filepath"] == str(raw)
+    process_jobs()
+    task = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+    processed = task["task_packet"]["metadata"]["processed_data"]
+    candidate = processed["integration_candidates"][0]
+    canonical = processed["canonical_name"]
+    model_result = {
+        "files_written": [{"filename": canonical, "content": _source_content()}],
+        "integration": {"disposition": "integrated", "relations": [
+            _relation(candidate["target"], candidate["target_hash"],
+                      projection=candidate["target_projection_hash"])
+        ]},
     }
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda *args, **kwargs:
+        subprocess.CompletedProcess(["model"], 0, json.dumps(model_result), ""),
+    )
 
+    stats, error = runner._process_task(task, False, "synthetic-model", runner.raw_publication_index())
 
-def test_the_runner_repairs_a_standalone_that_carries_no_auditable_reason():
-    """The finalizer enforces a 12-character reason floor; the runner fills it rather than fail."""
-    from scripts.ingest_runner import STANDALONE_FALLBACK_REASON, _with_disposition
-
-    merged = _with_disposition({"integration": {"disposition": "standalone", "reason": "short"}})
-    assert merged["integration"]["reason"] == STANDALONE_FALLBACK_REASON
-
-
-def test_the_runner_overrides_a_disposition_that_is_not_an_object():
-    from scripts.ingest_runner import _with_disposition
-
-    assert _with_disposition({"integration": "integrated"})["integration"]["disposition"] == "standalone"
+    assert not error and stats["finalized"] == 1
+    assert "[validates:: [[Concept_Target]]]" in (
+        isolated_memory / "wiki" / canonical
+    ).read_text(encoding="utf-8")
+    assert f"(Source: [[{canonical.removesuffix('.md')}]])" in (
+        isolated_memory / "wiki" / candidate["target"]
+    ).read_text(encoding="utf-8")
+    row = db_store.get_connection().execute(
+        "SELECT result_json FROM jobs WHERE job_id = ?", (task["job_id"],)
+    ).fetchone()
+    assert json.loads(row["result_json"])["integration"]["disposition"] == "integrated"
+    assert db_store.get_connection().execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?", (str(raw),)
+    ).fetchone() is not None
 
 
 # ---------------------------------------------------------------------------------------------

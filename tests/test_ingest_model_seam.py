@@ -96,12 +96,13 @@ def test_unwritable_scratch_is_not_a_new_failure_mode(seam, monkeypatch, capsys,
     blocker = tmp_path / "blocked"
     blocker.write_text("not a directory", encoding="utf-8")
     monkeypatch.setattr(seam, "SESSION_DIR", blocker / "runner_sessions")
-    payload = json.dumps([{"filename": "Source_x.md", "content": "# x"}])
+    payload = json.dumps({"files_written": [{"filename": "Source_x.md", "content": "# x"}],
+                          "integration": {"disposition": "standalone", "reason": "No existing matching node."}})
     fake_run = _run(seam, monkeypatch, result=subprocess.CompletedProcess(["pi"], 0, payload, ""))
 
     assert seam.main() == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out)[0]["filename"] == "Source_x.md"
+    assert json.loads(captured.out)["files_written"][0]["filename"] == "Source_x.md"
     assert captured.err == "", "a succeeding run must not spend the runner's stderr budget"
     assert "--session-dir" in fake_run.argv
     assert fake_run.argv[fake_run.argv.index("--session-dir") + 1] != str(seam.SESSION_DIR)
@@ -124,12 +125,87 @@ def test_failed_child_is_reported_by_log_path_inside_the_runners_budget(seam, mo
 
 
 def test_successful_child_writes_no_failure_log(seam, monkeypatch, capsys):
-    payload = json.dumps([{"filename": "Source_x.md", "content": "# x"}])
-    _run(seam, monkeypatch, result=subprocess.CompletedProcess(["pi"], 0, payload, ""))
+    payload = {"files_written": [{"filename": "Source_x.md", "content": "# x"}],
+               "integration": {"disposition": "standalone", "reason": "No existing matching node."}}
+    _run(seam, monkeypatch, result=subprocess.CompletedProcess(["pi"], 0, json.dumps(payload), ""))
 
     assert seam.main() == 0
-    assert json.loads(capsys.readouterr().out) == [{"filename": "Source_x.md", "content": "# x"}]
+    assert json.loads(capsys.readouterr().out) == payload
     assert _logs(seam) == []
+
+
+@pytest.mark.parametrize("payload", [
+    [{"filename": "Source_x.md", "content": "# x"}],
+    {"files_written": [{"filename": "Source_x.md", "content": "# x"}]},
+    {"files_written": [], "integration": {"disposition": "standalone", "reason": "No match."}},
+    {"files_written": [{"filename": "Source_x.md", "content": "# x", "processed_data": {}}],
+     "integration": {"disposition": "standalone", "reason": "No match."}},
+    {"files_written": [{"filename": "Source_x.md", "content": "# x"}],
+     "integration": {"disposition": "integrated"}, "processed_data": {"lease_token": "forged"}},
+])
+def test_seam_rejects_old_or_untrusted_output(seam, payload):
+    parsed, error = seam._extract_result(json.dumps(payload))
+    assert parsed is None and error
+
+
+@pytest.mark.parametrize("disposition", ["rejected", "Rejected", " rejected "])
+def test_seam_accepts_explicit_rejection(seam, disposition):
+    payload = {"files_written": [], "integration": {"disposition": disposition, "reason": "The source is out of scope."}}
+    assert seam._extract_result(json.dumps(payload)) == (payload, "")
+
+
+@pytest.mark.parametrize("disposition,files", [
+    ("integrated", [{"filename": "Source_x.md", "content": "# x"}]),
+    ("standalone", [{"filename": "Source_x.md", "content": "# x"}]),
+    ("Rejected", []),
+])
+def test_runner_passes_model_decision_without_replacing_host_versions(monkeypatch, disposition, files):
+    from scripts import ingest_runner as runner
+
+    integration = {"disposition": disposition}
+    integration.update(
+        {"relations": [{"target": "Concept_Target.md", "target_hash": "host-candidate"}]}
+        if disposition == "integrated" else {"reason": "A complete auditable reason."}
+    )
+    result = {"files_written": files, "integration": integration}
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(["model"], 0, json.dumps(result), ""))
+    monkeypatch.setattr(runner, "classify", lambda *_: "needs-model")
+    submitted = []
+    monkeypatch.setattr(runner, "finalize_ingest", lambda f, p:
+                        submitted.append((f, p)) or "Successfully finalized (isolated test)")
+    processed = {"job_id": "synthetic", "lease_token": "host-lease", "source_hash": "host-source",
+                 "integration_candidates": [{"target": "Concept_Target.md", "target_hash": "host-candidate"}]}
+    task = {"job_id": "synthetic", "task_packet": {"metadata": {"processed_data": processed}}}
+
+    stats, error = runner._process_task(task, False, "fake-model", {})
+
+    assert not error and stats["finalized"] == 1
+    assert submitted == [(files, {**processed, "integration": integration})]
+    assert submitted[0][1]["lease_token"] == "host-lease"
+
+
+@pytest.mark.parametrize("output", [
+    json.dumps([{"filename": "Source_x.md", "content": "# x"}]),
+    json.dumps({"files_written": [{"filename": "Source_x.md", "content": "# x"}]}),
+    json.dumps({"files_written": [], "integration": {"disposition": "standalone"}}),
+    "model timed out",
+])
+def test_runner_fails_closed_on_missing_or_malformed_decision(monkeypatch, output):
+    from scripts import ingest_runner as runner
+
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(["model"], 0, output, ""))
+    monkeypatch.setattr(runner, "classify", lambda *_: "needs-model")
+    failures = []
+    monkeypatch.setattr(runner, "record_ingest_failure", lambda job, reason: failures.append((job, reason)))
+    monkeypatch.setattr(runner, "finalize_ingest", lambda *_: pytest.fail("failed output reached finalizer"))
+    task = {"job_id": "synthetic", "task_packet": {"metadata": {"processed_data": {"job_id": "synthetic"}}}}
+
+    stats, error = runner._process_task(task, False, "fake-model", {})
+
+    assert error and stats["model-failed"] == 1
+    assert failures[0][0] == "synthetic"
 
 
 def test_parse_failure_keeps_both_streams(seam, monkeypatch, capsys):

@@ -24,9 +24,9 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + "\n\n[CURRENT-ENVIRONMENT SUBAGENT HANDOFF]\n"
         + "You are the host environment subagent completing this Vector Lake ingest task.\n"
         + "Do not use external model APIs from Vector Lake library code.\n"
-        + "Return or persist ONLY a JSON array. Each item must be an object with exactly these keys:\n"
-        + "- filename: target wiki filename\n"
-        + "- content: complete Markdown content, including YAML frontmatter\n"
+        + "Return ONLY one JSON object with exactly two keys:\n"
+        + "- files_written: array of filename/content objects (complete Markdown with YAML frontmatter)\n"
+        + "- integration: explicit disposition with auditable reason or validated relations\n"
         + "Frontmatter rules the validator enforces (violating one refuses the whole ingest):\n"
         + "- categories: a YAML list with EXACTLY one element, one of the SCHEMA_CATEGORIES domains"
         + ' (e.g. categories: ["Healthcare_IT"]); never a bare string, never two elements\n'
@@ -41,9 +41,9 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + " as a typed link instead, e.g. `[related_to:: [[Standard_电子病历评级]]]` in Section 1.\n"
         + "- every typed link must be [predicate:: [[Target]]] with a predicate from this closed"
         + f" vocabulary: {', '.join(sorted(VALID_PREDICATES))}\n"
-        + "Add processed_data.integration with disposition integrated, standalone, or rejected.\n"
-        + "Preserve the task packet source_hash. Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
-        + "After producing both payloads, call the Vector Lake finalize_ingest tool or CLI-compatible finalize path with the processed_data object from this task packet.\n"
+        + "Do not echo or alter processed_data; the host retains the task packet's lease and source_hash.\n"
+        + "Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
+        + "Do not call finalize_ingest: the host validates and submits the returned object.\n"
     )
 
 
@@ -96,7 +96,7 @@ def process_jobs():
                 task_path = create_subagent_task(
                     "ingest",
                     _subagent_ingest_prompt(instructions),
-                    "JSON array consumable by finalize_ingest(files_written, processed_data)",
+                    "JSON object with files_written and integration; host calls finalize_ingest",
                     {
                         "job_id": job_id,
                         "processed_data": processed_data,

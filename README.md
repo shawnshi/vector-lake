@@ -83,7 +83,7 @@ graph TD
 - **`Event_*`**：重要会议、行业突发事件。
 - **`Concept_*`**：抽象架构、理论、业务机制。域总览页沿用 `Concept_Overview_<domain>.md` 形式（由 `scripts/compile_domain_overviews.py` 生成）。
 - **`Policy_*` / `Standard_*`**：政策法规、行业标准。
-- **`Source_*`**：`raw/` 原始信源的一对一摘要节点。页面名由**唯一一条规则**生成（`wiki_utils.canonical_source_name` = `Source_<消毒后的 stem>.md`，消毒是因为 arXiv 式 stem 里的点号过不了严格命名校验）；而“这一页对应哪份 raw”靠 frontmatter 的 `sources:` **声明**判定，不靠页名——历史上有 443 个页沿用旧约定命名为 `Source_<目录>-<stem>-<hash8>`，它们仍然有效，重命名会打断所有指向它们的链接。
+- **`Source_*`**：`raw/` 原始信源的一对一摘要节点。新页面名由 `wiki_utils.canonical_source_name` 生成（`Source_<消毒后的 stem>.md`）；与 raw 的对应关系靠 frontmatter 的 `sources:` 声明，不靠页名。旧格式 `Source_<目录>-<stem>-<hash8>` 的页面仍有效，不要批量重命名打断已有链接。
 - **`Synthesis_*`**：推演、跨界比较与调研长文。
 - **`System_*`**：系统投影页（社区页、总览等）。前缀校验直接放行，且不参与 purpose 契约门。
 
@@ -126,9 +126,8 @@ cd vector-lake
 # 2. 安装 Python 核心运行时依赖
 pip install -r requirements.txt
 
-# 3. (强烈推荐) 编译并安装 Rust 原生加速核心 (vector_lake_core)
-#    提供内存倒排解码、Markdown AST 解析与 PPR 图遍历的硬件级加速 (提升 50x)
-#    若跳过此步，系统会自动以纯 Python 模式运行，无破坏性影响
+# 3. 可选：首次安装原生核心需要 Rust 与 maturin（详见“原生性能加速”）
+pip install maturin
 python scripts/build_core.py
 ```
 
@@ -141,16 +140,16 @@ cp config.example.json config.json
 
 `config.json` 核心字段说明：
 - `memory_dir`: 自定义 `MEMORY` 根目录路径（留空时默认查找环境约定的 `MEMORY/` 目录）；
-- `target_directories`: 外部额外 raw 文件扫描目录；
+- `target_directories`: 摄入扫描目录；留空时扫描当前 `MEMORY/raw`，非空时替代默认目录（相对路径基于项目根目录，注意勿指向私密资料）；
 - `supported_extensions`: 允许编译的原始资料后缀（默认 `[".md", ".txt"]`）。
 
-**关键环境变量推荐（可配置于 `.env` 或系统环境）：**
+**关键环境变量（由宿主环境注入；项目不会自动加载 `.env`）：**
 
 | 环境变量 | 作用 | 推荐值 |
 |---|---|---|
 | `PYTHONUTF8` | 强制 Python 运行时使用 UTF-8 编码（Windows 强烈推荐） | `1` |
-| `GEMINI_API_KEY` | 向量嵌入模型 API Key（Gemini Embedding） | `AIzaSy...` |
-| `VECTOR_LAKE_MEMORY_DIR` | 显式指定 MEMORY 根路径（优先级高于 `config.json`） | 例如 `C:/Users/shich/MEMORY` |
+| `GEMINI_API_KEY` | 向量嵌入模型 API Key（Gemini Embedding）；通过本机环境或私有配置提供，不要提交凭据 | 不在仓库填写 |
+| `VECTOR_LAKE_MEMORY_DIR` | 显式指定 MEMORY 根路径（优先级高于 `config.json`） | 例如 `C:/path/to/MEMORY` |
 | `VECTOR_LAKE_RUNNER_SHADOW` | 设为 `1` 时摄取 Runner 仅模拟评估而不真实写页 | 默认 `0` |
 | `VECTOR_LAKE_RUNNER_CONCURRENCY` | 摄取 Runner 并发模型调用线程数（批量摄取加速） | 推荐 `3` ~ `5` |
 | `VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE` | 设为 `1` 时 shadow 轮不释放已认领的任务包（保留租约供人工检查；默认释放以便下一轮重试） | 默认 `0` |
@@ -166,12 +165,7 @@ cp config.example.json config.json
 python cli.py doctor
 ```
 
-若配置正确，输出中会呈现全项健康状态：
-- `[OK] Python: 3.13...`
-- `[OK] Tokenizer Backend: rjieba 0.2.1 (jieba-rs 0.9.x)`
-- `[OK] Native Acceleration: vector-lake-core v0.2.1 (Rust fast-core active)`（若已编译）
-- `[OK] MCP Server: Import OK, 18 tools exposed`
-- `[OK] Write Gate: clean`
+逐项核对输出中的 Python、分词后端、原生核心、MCP 工具及写入门；原生核心是可选项，索引或写入门异常时按实际诊断处理，不以固定版本号或工具数量判定成功。
 
 ### 5. 宿主 Agent 接入 (MCP Client Configuration)
 
@@ -215,7 +209,6 @@ python watchdog_sync.py
    - **双轨看门狗 (Two-Track Watchdog)**：除增量文件外还捕获 `on_deleted` / `on_moved`，因此重命名或删除页面不会在图谱里留下幽灵节点。
    - **写入健康门 (Write Health Gate)**：写入只在**硬故障**下被阻断（数据库不可用、存在 hard-failed 的 `mutation_outbox` 行）。outbox 积压超过 `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`、投影漂移、心跳过期、终态失败作业、时间线 parity 漂移都属于**可修复降级**，只记录告警并继续写入——阻断它们会同时阻断唯一的修复通道。需要严格模式的运维方可分别用 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING` / `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING` 把这些降级提升为阻断。
    - **I/O 批处理防抖 (I/O Debouncing)**：同批次修改合并为一次 `index.json` 写盘；`index.json` 不再保存完整正文（每个节点保留至多 320 字符的摘要，摘要与 `weighted_edges` 各占文件的一部分——具体比例取决于实例），投影写入使用短事务，全量重建不再冻结数据库。
-   - **两步思维链摄入 (Payload-Based MCP)**：Agent 先输出分析缓冲（Tension / Consensus / Unknowns），长文本经 `payload_file` 落盘后入湖，规避 CLI 传参截断与 JSON 解析失败。
    - **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges`，把争议与矛盾结构化为冲突边，Query 时可直接展示领域盲区。
    - **跨类型本体拦截 (PIEA)**：入口级跨类型查重，避免同一名称多态共存；内置正则清洗违规嵌套前缀（如 `Concept_Synthesis_`），并由 schema gate 校验受控前缀与类型。
    - **持久化增量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台变更先写 durable outbox，Watchdog 合并批次后更新索引；`_calculate_weighted_edges` 使用稀疏遍历并限制每节点投影边数。
@@ -233,9 +226,9 @@ python watchdog_sync.py
 
 1. **常驻守护**：`python watchdog_sync.py`（outbox 消费、增量索引、定时 lint 与 WAL checkpoint 都在这里；只跑 MCP server 会让写入持续积压）。守护进程同时**拉起并看护摄取 Runner**，因此“只启动守护”不会再留下半个流水线：不传任何开关时，观测到的就是本机原本常驻的配置（模型接缝 `python scripts/ingest_model_pi_subagents.py`、真实写页）。用 `VECTOR_LAKE_RUNNER_AUTOSTART=0` 关闭该行为，用 `VECTOR_LAKE_RUNNER_SHADOW=1` 改成只报告。
    Windows 上的常驻形态是计划任务 **`VectorLake-Watchdog`**：`scripts/register_watchdog_task.ps1` 幂等注册（含反转命令），`scripts/watchdog_service.ps1` 是执行入口（钉仓库根与 UTF-8，日志落 `scratch/watchdog_service-*-{out,err}.log` 并只保留最新 10 份）。触发器 = 登录 + 开机 + 每 5 分钟，`MultipleInstances=IgnoreNew`、`ExecutionTimeLimit=PT0S`（不能被 72 小时默认值掐死）、`RestartOnFailure 3×PT1M`、主体 `S4U`（会话 0，与任何交互 shell 解耦）。5 分钟重复只在上一轮包装器返回后才启动，所以**强杀后会在下一个 5 分钟边界自愈，运行中的实例不会被叠加**；而强杀子进程留下的 `LastTaskResult=0xFFFFFFFF` 并不触发 `RestartOnFailure`，真正兜底的就是这条重复触发器，两者都留。**换代码或换启动路径时不要 kill 摄取 Runner**：新守护进程会 adopt 已在运行的 Runner（状态行 `Ingest runner supervised by an existing supervisor (pid N)`），在途摄取不受影响；手工 `python watchdog_sync.py` 仍可用，但会被实例锁 `.meta/.watchdog.instance.lock` 挡成单写者。
-2. **摄取 Runner（可选的手工形式）**：`python scripts/ingest_runner_service.py --limit 2 --interval 120 --model-cmd "python scripts/ingest_model_pi_subagents.py"`。Runner 认领任务包、支持通过 `--concurrency / -c`（或 `VECTOR_LAKE_RUNNER_CONCURRENCY`）多线程并发调用宿主模型，再经 `finalize_ingest` 提交。**注意两条路径的默认值相反**：这条手工命令默认只报告 `needs-model`（要真实写入需加 `--no-shadow`），而守护进程自动拉起的 Runner 默认写入（复现本机原本常驻的配置），要改成只报告用 `VECTOR_LAKE_RUNNER_SHADOW=1`。脚本自身持有单实例锁（`<meta>/runtime/.runner_service.lock`），所以手工启动与守护进程启动不会叠成两个消费者；模型调用始终发生在本进程之外的子进程里，运行时自己从不执行它。
+2. **摄取 Runner（可选的手工形式）**：`python scripts/ingest_runner_service.py --limit 2 --interval 120 --model-cmd "python scripts/ingest_model_pi_subagents.py"`。Runner 认领任务包、支持通过 `--concurrency / -c`（或 `VECTOR_LAKE_RUNNER_CONCURRENCY`）多线程并发调用宿主模型，再经 `finalize_ingest` 提交。**注意两条路径的默认值相反**：这条手工命令默认只报告 `needs-model`（要真实写入需加 `--no-shadow`），而守护进程自动拉起的 Runner 默认写入（复现本机原本常驻的配置），要改成只报告用 `VECTOR_LAKE_RUNNER_SHADOW=1`。脚本自身持有单实例锁（`<meta>/runtime/.runner_service.lock`），所以手工启动与守护进程启动不会叠成两个消费者；模型调用始终发生在本进程之外的子进程里，运行时自己从不执行它。自定义 `--model-cmd` 必须在 stdout 只返回 `{"files_written": [{"filename": "Source_*.md", "content": "..."}], "integration": {"disposition": "integrated|standalone|rejected", "relations": [...]}}`；standalone/rejected 用 `reason`，rejected 用空文件数组。旧的纯数组输出及缺失判断一律记为模型失败，不会再静默记作 standalone；租约、源哈希和候选清单由宿主任务包提供，不能由模型改写。任务包协议版本 3 会在认领前重建旧版 queued / failed / awaiting_subagent 提示词，保留 queued / failed 的原有尝试次数，不改动已领取的 subagent_processing 作业。升级正在运行的 Runner 前，先确认摄入队列无在途任务并保留旧版代码恢复点；磁盘改动不会热更新常驻 Runner。
 3. **检索**：`python cli.py search "<keyword>"`，或 `python cli.py query "<question>"` 走预算受控的上下文组装。
-4. **摄取队列**：`python cli.py ingest-tasks` 查看 queued / awaiting_subagent 作业；宿主 subagent 完成后经 `finalize_ingest` 入湖。
+4. **摄取队列**：`python cli.py ingest-tasks` 查看 queued / awaiting_subagent 作业；模型或 subagent 只返回包含 `files_written` 和 `integration` 的对象，宿主控制器验证后调用 `finalize_ingest` 入湖。
 5. **被废弃的源**：同一份内容反复确定性失败（例如 `categories` 不是单元素列表、命名或 schema 违规）时，第 3 次尝试后该源会被记为「废弃」并停止派发，避免每轮固定烧掉 3 次模型调用。`python cli.py ingest-tasks --abandoned` 查看清单与原因，`--clear-abandoned [FILE]` 恢复派发。键是 `(路径, 内容哈希)`：**改好源文件即自动恢复**，无需人工清理。`--terminal-failed` 列出耗尽尝试预算的作业，`--close-terminal-failed` 把其中**源已入账**的标记为 superseded（源未入账的会保留，因为那才是真正未完成的工作）。
 6. **周期治理**：`python cli.py review` 处理冲突与候选队列，`python cli.py doctor` 检查运行健康度。
 
@@ -298,7 +291,7 @@ MEMORY/
     index.json          <-- Page index projection: nodes (summary only) + weighted edges
     claim_topology.json <-- Claim topology projection (claim_graph_edges -> JSON)
     .meta/
-      purpose_vectors.json <-- Optional legacy fallback for intent weights
+      purpose_vectors.json <-- Legacy fallback for intent weights
       vector_lake.db       <-- Unified SQLite Store (entities, claims, graph, timeline,
                            <--   operational memory, page_index_* projection, vec_embeddings)
       backups/             <-- Bounded SQLite copies (.db.bak + -wal / -shm sidecars)
@@ -501,7 +494,6 @@ mutation 路径（每页的 schema 校验、`verify_asset`、canonical change se
 - `supported_extensions`：当前启用的输入扩展名。
 - `memory_dir`：MEMORY 根目录（机器相关，按安装填写）；可用 `VECTOR_LAKE_MEMORY_DIR` 覆盖。
 - 入账与去重：`processed_files` 记 `(路径, 内容哈希)`；finalize 时会在**规范 Source 页面**的 frontmatter 写入 `source_hash`，使「这份页面是按哪份内容编译的」可被证明而不是靠 mtime 推断。已发布但缺账目行的源由扫描按证据补齐（有 `source_hash` 则比对哈希，无则比对页面 `created` 与文件 mtime）；证据显示文件已变时**不补行**，而是让它重新摄入，避免修改被静默丢弃。
-- `processed_files_path`：**legacy 字段，当前代码不读取**。已处理 raw 文件记录存放在 SQLite `processed_files` 表。
 - `VECTOR_LAKE_DB_PATH`：覆盖 SQLite 数据库路径（默认 `<MEMORY>/wiki/.meta/vector_lake.db`）。
 - `VECTOR_LAKE_PAYLOAD_ROOT` / `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：MCP `payload_file` 沙箱的可读根与单文件字节上限（默认 5 MiB）。
 - `VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE=1`：跳过写入前健康门（仅用于受控维护，不建议常开）。
@@ -619,15 +611,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | **只含 CJK 的 token 流** | **500/500 相同（100%），差异位置 0** |
 
 即 0.9 → 0.11 改的是** ASCII/标点串的切分**（`Concept_1 - 0` → `Concept_1-0`、`1+5 + 2` → `1 + 5 + 2`），
-**中文词切分一字未变**。落地仍需三步：① 装新 `.pyd`（`site-packages/vector_lake_core/vector_lake_core.pyd`，
-被运行中的 MCP/守护进程占用时无法覆盖，必须等它们重启；备份在 `scratch/core_backup/`）；② 重建词法索引
-（FTS 的 `title/summary/text` 存的是预切结果，后端又是 FTS 缓存键的一部分，所以会自动失效而不是错服）；
-③ 因属于相关性变更，仍受本仓“一次一个开关 + 预注册判定集”的约束。
-
-**本机构建注意**：默认工具链 `stable-x86_64-pc-windows-gnu` 在本机能编译但**链接失败**
-（`unable to find library -lgcc/-lgcc_eh`），必须用 `cargo +stable-x86_64-pc-windows-msvc build --release`；
-`maturin build` 的打包步骤会去拉 MSVC CRT 清单（`aka.ms/vs/17/...`）而本机网络不可达，因此改用 cargo 产出的
-cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决定，文件名必须叫 `vector_lake_core.pyd`）。
+**中文词切分一字未变**。切换分词后端前先用判定集验证相关性；FTS 中的预切结果需要按新后端重建。已有原生 wheel 的增量升级使用下文的 `scripts/install_core.py`，不要覆盖运行中的 `.pyd`。
 
 #### 原生性能加速 (Rust Native Acceleration)
 
@@ -654,12 +638,9 @@ cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决�
   ```powershell
   python scripts/install_core.py            # 构建(MSVC) + 安装到版本目录 + 写 shim + 激活
   python scripts/install_core.py --list     # 已装版本 / 当前激活
-  python scripts/install_core.py --activate 0.1.0   # 回滚：只改指针
+  python scripts/install_core.py --activate <installed-version>   # 回滚：从 --list 中选择已安装版本
   ```
-  机制：PyO3 扩展的初始化符号由 lib 名决定（`PyInit_vector_lake_core`），所以文件名改不了；而 Windows 不允许覆盖已被加载的 DLL——今天两次升级都得 disable 计划任务 + 杀守护进程与 MCP 才换得动。现在每次构建放进**自己的版本目录**（`site-packages/vector_lake_core_0_2_0/vector_lake_core.pyd`，加载器只看路径最后一段，因而不要求文件名带版本），由 `vector_lake_core/__init__.py` 这个 shim 按 `VECTOR_LAKE_CORE_VERSION` → `_active_version.txt` 的顺序选一个。装新版本是**新增文件**，不动任何已被打开的文件，消费者在自身上次重启时接上新版本。实测：装 + 回滚演练全程 4 个服务 pid 未变。
-  ```
-  两个作业级注意：`maturin build` 在本机的打包步仍拉不到 MSVC CRT 清单，所以脚本直接用 cargo 产物；shim 会**接管 pip 管理的 `__init__.py`**（原件备份为 `__init__.py.pip-original`），因此以后重装 wheel 会让 shim 失效，需重跑一次 `install_core.py`。
-  ```
+  首次安装需先通过 `scripts/build_core.py` 安装 wheel（需要 `maturin` 和可用的 Rust 工具链，Windows 首次覆盖已加载 DLL 时须先安全停用消费者）；之后 `install_core.py` 用版本目录和指针激活新构建，无需覆盖已加载的 DLL。运行中的进程在自身重启后才会加载新版本。重装 wheel 可能覆盖版本选择 shim，需重新运行 `install_core.py` 检查。
 
 **已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。回退后端移除后这一点不再需要权衡：`add_word()` 一律返回 False，词表注册无法生效。
 
@@ -667,7 +648,7 @@ cdylib 直接充当扩展模块（PyO3 的初始化函数名由 lib target 决�
 
 **纯 Python `jieba` 回退已于 2026-09-18 移除**：abi3 wheel 覆盖本项目支持的全部平台，而第二套分词与 `rjieba` 的切分不同——这正是搜索索引内容哈希要防的事（`indexer._node_content_digest` 把后端身份纳入 key）。因此**没有 rjieba 的平台会变为 `unavailable`**：CJK 预分词被跳过、CJK 查询命中下降，`doctor` 与 `backend_name()` 会报出而不是掩盖；装回 rjieba 后下一次 `projection-rebuild-index --apply` 会按新身份重新分词。
 
-全量重建的剩余瓶颈不在分词，也不在序列化：**2026-09-25 py-spy 实测（2 遍、31 110 样本）87.2% 自耗在 FTS5 写入**（`upsert_search_index`），而 `json.dump` 只有 **0.2%**、`json.raw_decode` 2.0%、`tokenizer.cut`（jieba）0.7% —— 本节此前写的“warm 重建约 50% 是 `json.dump`”已被该测量推翻。同一轮把 FTS 写入的两个分支都修了（两者同一机制：**FTS5 服务不了列查找**，`WHERE node_key = ?` 会全扫整个虚拟索引）：行已存在时走 `fts_rowid` 记录的位置（同时校验 `node_key`，因位置在索引重建后可能被重号）**52.4 → 0.22 ms/行**；行不存在时由调用方声明 `replace_existing=False` 而**不做删除**（键集刚读过，知道没有行）**52.1 → 8.9 ms/行**。冷重建实测 **367 s**（7 039 缺失行），按此推 **~63 s**（该外推尚未再跑一次全量重写验证）。
+FTS5 写入的已知热点在 `vector_lake/indexer.py`；项目避免在虚拟表上按 `node_key` 做全表扫描，已有行使用 `fts_rowid` 定位并核对键，不存在时可由调用方指定 `replace_existing=False`。性能评测记录见 `CHANGELOG.md`；运行时间取决于语料与机器，不以旧快照外推。
 
 ## Module Map
 
@@ -761,56 +742,7 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-本次会话实测结果（2026-09-26）：知识摄取 P0-P2 全链路重构（2字中文实体召回与标题亲和力提权、Tag Collision 降级自愈、候选类型配额分桶、密集向量+FTS混合初筛、Target 编译事实第一节增量合并）、`Healthcare_IT` 别名对齐、`stub_creator` 门禁修正。
-
-- `python -m pytest -p no:cacheprovider -q` → **1676 passed**（全库 0 failed；新增候选 2 字实体提权、标签自愈、类型分桶配额多样性、向量环境降级、Compiled Truth 第一节同频更新等测试）。
-- `python cli.py doctor` → `Write Gate: clean`、`MCP Server: Import OK, 18 tools exposed`、`State Consistency: Wiki:7178 JSON:7178 SQLite:7178 missing_index:0 extra_index:0 missing_canonical:0 extra_canonical:0`、`Vector Projection: nodes=7178 embedded=7178 missing=0 stale=0`。
-- `python cli.py lint` → 17 项自愈审计中 **14 项严格 PASS**（Frontmatter Completeness、Naming Compliance、Type/Status Legality、Category Vocabulary、Duplicate IDs、Alias Conflicts、Broken Links、Knowledge Decay、Semantic GC、Alignment Drift、Strict Schema Verification、Domain Vocabulary、Metric Evidence、Source Path Resolution 全部转绿）。
-- `python cli.py projections` → 8 大派生投影中除按频次延时重建的 `memory_gram` 外全项 HEALTHY。
-
-本次会话实测结果（2026-09-25 下午）：模型缝失败证据、守护进程监听换 `watchfiles`、tantivy 后端（开关默认关）、
-`author_page_keys` 取数与缓存键、gram 重建门改成按检索次数摊销、claim 块提取换 Rust。
-
-- `python -m pytest -p no:cacheprovider -q` → **1667 passed**（本会话新增：模型缝 8、claim 块 parity 19、tantivy 后端 8、gram 重建政策 6、投影注册表 19、outbox 保留/台账 10、FTS 保留词转义 6、MCP 接口优化 4、Skills 命名空间统一 1、rerank 契约 16 等；
-  同时把 `tests/test_rerank_bm25s.py` 更名为 `test_rerank_candidates.py`）。
-- `python cli.py gram-index --apply` → 340 482 gram / 14 473 499 posting / 69 929 文档，phase `stage=58.0s, pack=16.5s, publish=2.0s`（比旧注释里的 ~430 s 快得多，语料也更小）；
-  重建后 `dirty=0`、`gram_index_usable()=True`，可用性检查 15.8 ms/次 → 0.1 ms/次。
-- **py-spy stage profile**（`assemble_context`，受守护进程 embedding 兜底争用，只引用阶段级差值）：`_indexed_memory_candidates` 自耗 61.8%、
-  sqlite-vec 10.7%、`gram_index_usable` 每查询 9 次共约 10%、`author_page_keys` 8.8%；记忆检索 1 240 → 782 ms/次，author facet 242 → 16.9 ms/查询。
-- **判定集评测**（`benchmarks/search_replay.py` + 规则卡 `search-eval-rule/1.2`，第三批 300 查询、`--vectors snapshot`）：
-  fts5 vs tantivy 主指标 nDCG@5 0.8350 → 0.8198（差值 −0.0152，CI [−0.028, −0.002]）→ **RULE NOT MET，默认保持 fts5**。
-  评测同时暴露出两个真缺陷并已修：`VECTOR_LAKE_FTS` 在真实检索路径（`tool_search._get_fts_search_results`）上是无效的；harness 的 config 指纹里没有词法后端。
-- **lint 堵点拆出两层**：`_find_page_file` 逐候选做 `Path.resolve()`（未命中与命中同价）→ 改一次目录清单；以及 `alias_registry` 只有主键索引而查询过滤 `value`（12 005 行全扫，**4.386 ms/次 × 2 805 次 = 63.5% 墙钟**）→ 加 `idx_alias_registry_value`。语句侧 4.386 → **0.012 ms**，**lint 墙钟 35.0 s → 7.2 s**（同机同语料）。
-- **记忆检索的成本拆分**（健康索引态，18 次调用）：**89% 在 SQL**（gram postings 325.9 ms、document frequencies 34.4 ms），Python 打分循环只有 **0.5 ms**、载荷解码 1.4 ms —— 那个模块的成本不是 Python。
-- **状态（写本文件当时）**：**FTS 投影完好**（7 139 行、键集与 `index.json` 节点集逐项相等、`fts_rowid` 全部已回填）；**向量投影回填中**（一次 profile 探针误删 7 039 行派生投影，已恢复 FTS，向量由 catch-up 每轮 +200 自愈），`python cli.py projections` 会直接给出这个判断。
-- Windows 工具链：默认 `stable-x86_64-pc-windows-gnu` 在本机**能编不能链**（缺 `-lgcc/-lgcc_eh`），构建核心须显式用 msvc；`maturin build` 的打包步因拉不到 MSVC CRT 清单而失败。
-
-上午实测结果（2026-09-25 上午，同样是当日完成的改动）：本轮只改三处判定——合并的落盘与可回放性（`governance_service`）、claim 提取的占位符/运行态过滤（`claim_extractor`）、Synthesis 骨架的文档与门禁对齐（`schema_validator` + `tool_lint`）。
-
-- `python -m pytest -p no:cacheprovider -q` → **1554 passed**（新增 9 个用例：合并 fail-closed、注册表名字回退、未落盘合并检测、占位符与运行态叙述过滤、骨架顺序与 lint 报告）。
-- `python cli.py doctor` → `Write Gate: clean`、`Page Edge Projection` 与已发布边一致、`Vector Projection` 无 missing/stale/unstamped、`Memory Gram Index` `usable=True` 且 `queued=0`。
-- `python cli.py projection-report` → Wiki / canonical / index 三侧逐项 0 差异。
-- `python cli.py lint` → 17 节中 11 节 PASS；已知 FAIL 为 7 Broken Links（85）、8 Orphan（10）、9 Name Collisions（22）、12 Governance Debt（2）、14 Strict Schema Verification（17）、17 Source Path Resolution（1154）。`unapplied_merge_items()` 为 **0**（本轮的合并全部落盘）；骨架顺序报告列出 15 页仍把骨架放在文末——那是报告该说的话，不是失败。
-- 本轮合并删除的 48 页，其被消费键已补回幸存页 `aliases`：lint 的断链 **370 → 85**，被删键作为目标的一条不剩（可见的 10 条全部是既存的 `raw/` 路径类；其余 75 条被 lint 输出截断，未单独分类）。
-
-上一轮实测结果（2026-09-24）：
-
-- `python -m pytest -p no:cacheprovider -q` → **1476 passed**。
-- `python cli.py lint` → 16 节中 13 节 PASS；已知 FAIL 为 8 Orphan（10）、9 Name Collisions（22）、12 Governance Debt（18,243 条无来源声明）。
-- **真实数据检索审计**（`benchmarks/audit_search_real_data.py`，r3 判定集 300 查询全量 + 100 查询逐页归因，冻结向量）：nDCG@5 **0.7512**、MRR **0.7652**、recall@5 **0.8224**、success@5 **0.8667**；标注相关页 **87.5%** 进 top-5、**12.0%** 进了候选池但被排到窗口外、0.5% 未召回 —— 瓶颈在**排序**而非召回。候选池来源构成：向量 69.4% / 图扩展 15.0% / FTS 10.2% / 两路同源 5.4%。
-- **排序不变量**（真实数据）：top-5 是更大窗口的前缀 **100/100**、同查询重复调用一致 **100/100**、`top_k=5` 满窗 **100/100**；500 条存储向量范数全为 **1.0000**（`1 − L2²/2` 当作余弦换算的前提成立）。
-- **`VECTOR_LAKE_SOURCE_RANK_PENALTY` 首次验收**（`audit` 提出假设 → 注册实验）：关闭（1.0）比默认（0.6）**低 0.0740 nDCG@5**（CI [−0.098, −0.051]）、recall −0.0530、MRR −0.0742、success −0.0226，四指标同向且 CI 全排除 0 → 默认成立。
-
-可复用的度量器件：`benchmarks/search_replay.py`（回放 + `--compare` 配对统计，冻结向量见 `--vectors snapshot`）、`benchmarks/criterion_satisfiability.py`（查询可满足性）、`benchmarks/verify_source_penalty_window.py`（窗口长度不变量）、`benchmarks/audit_search_cost_and_loss.py`（成本与损失归因）、`benchmarks/bench_hot_paths.py`（热点延迟）。判定与历史写在 `benchmarks/search_eval_decisions*.md`。
-
-上一轮实测结果（2026-09-20）：
-
-- `python -m pytest -p no:cacheprovider -q` → **1274 passed**。
-- `python -m compileall -q vector_lake tests` → OK。
-- `python cli.py doctor` → `Write Gate: clean`、`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)`、`Ingest Jobs: queued:0 awaiting_subagent:0 terminal_failed:0`、`MCP Server: Import OK, 45 tools exposed`；`Summary: healthy with degradation`，降级项为两类而非一类：① 设计内的 subagent 文本运行时委托；② 运行态记忆的精确 n-gram 索引落后（`due=True`）——基表落后时不带着它继续服务，搜索退回精确扫描，按 `doctor` 提示跑 `python cli.py gram-index --if-due --apply` 即恢复快速路径。
-- 端到端：raw 源 → `sync` → `ingest-tasks` → `finalize_ingest` → outbox 消费 → 索引 → `search` / `query` 全链路在隔离根上跑通。
-
-**本文件不记录语料规模类数字**（节点数、边数、memory 条数）。这类数值取决于运行实例，无法从仓库复现，容易在版本迭代后变成误导性基线；需要时以目标实例上的 `doctor` / `debt` / `projection-report` 实测输出为准。
+测试数量、语料规模和运行时健康度会随代码与实例变化；README 不保存运行态快照。需要时运行上述命令，并查阅 `CHANGELOG.md` 和 `benchmarks/search_eval_decisions*.md` 了解历史判定。
 
 ## Notes
 

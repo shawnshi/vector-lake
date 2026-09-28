@@ -18,7 +18,7 @@ What it implements from the contract in this session's design note:
 Shadow mode (default) never writes a page: tasks that would need real content are left
 leased and reported as ``needs-model``, so the pass rate can be measured before enabling
 writes.  The model seam is ``--model-cmd`` (receives the packet JSON on stdin, must emit
-the contract JSON array on stdout); it is unused unless supplied.
+``{"files_written": [...], "integration": {...}}`` on stdout); it is unused unless supplied.
 """
 import argparse
 import json
@@ -55,40 +55,13 @@ REJECT_DUPLICATE = (
     "此任务为重复准备；由 ingest runner 自动关闭以免重复入库。"
 )
 REJECT_MISSING_SOURCE = "原始文件在 raw 目录下已不存在，任务无法完成；由 ingest runner 自动关闭。"
-STANDALONE_FALLBACK_REASON = "ingest runner standalone ingest"
 
 
-def _with_disposition(processed: dict) -> dict:
-    """The packet's ``processed_data`` with the runner's fallback stacked *under* the model's.
-
-    The model's own disposition -- and above all its ``relations`` -- is the semantic output this
-    step exists to obtain.  The call site used to build ``{**processed, "integration": {...}}``,
-    which *replaced* the key: a model that returned ``integrated`` with relations had them
-    silently discarded, the source was recorded as standalone, and no target page ever received
-    its relation line.  Nothing failed, so the loss was invisible.
-
-    Only gaps are filled here.  A disposition the runner invents is a fallback for output that
-    declared none, never an override of judgement the model actually supplied.
-    """
-    integration = processed.get("integration")
-    if not isinstance(integration, dict):
-        return {
-            **processed,
-            "integration": {
-                "disposition": "standalone",
-                "reason": STANDALONE_FALLBACK_REASON,
-            },
-        }
-    merged = dict(integration)
-    disposition = str(merged.get("disposition") or "").strip().lower()
-    if not disposition:
-        disposition = "standalone"
-        merged["disposition"] = disposition
-    # ``standalone`` needs an auditable reason (the finalizer enforces a 12-character floor); the
-    # runner supplies its own rather than letting a missing reason fail an otherwise valid packet.
-    if disposition == "standalone" and len(str(merged.get("reason") or "").strip()) < 12:
-        merged["reason"] = STANDALONE_FALLBACK_REASON
-    return {**processed, "integration": merged}
+def _merge_model_integration(processed: dict, integration: dict) -> dict:
+    """Keep lease and source versions host-owned; accept only the model's semantic decision."""
+    if not isinstance(integration, dict) or not str(integration.get("disposition") or "").strip():
+        raise ValueError("model output requires an explicit integration disposition")
+    return {**processed, "integration": integration}
 
 
 def _utc_now() -> str:
@@ -119,7 +92,7 @@ def classify(processed: dict, index: dict) -> str:
 
 
 def run_model(packet: dict, model_cmd: str) -> tuple:
-    """Invoke the pluggable model seam; returns (files_written, error)."""
+    """Invoke the pluggable model seam; return its bounded semantic result or an error."""
     proc = subprocess.run(
         model_cmd, shell=True, input=json.dumps(packet, ensure_ascii=False),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -127,17 +100,24 @@ def run_model(packet: dict, model_cmd: str) -> tuple:
     )
     if proc.returncode != 0:
         return None, f"model runner exited {proc.returncode}: {proc.stderr.strip()[:300]}"
-    text = proc.stdout
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end <= start:
-        return None, f"model runner produced no JSON array: {text[:200]}"
     try:
-        files = json.loads(text[start:end + 1])
+        result = json.loads(proc.stdout.strip())
     except json.JSONDecodeError as exc:
         return None, f"model runner JSON invalid: {exc}"
-    if not isinstance(files, list) or not files:
-        return None, "model runner produced an empty payload"
-    return files, ""
+    if not isinstance(result, dict) or set(result) != {"files_written", "integration"}:
+        return None, "model runner must return files_written and integration only"
+    files = result["files_written"]
+    integration = result["integration"]
+    if not isinstance(files, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("filename"), str)
+        and isinstance(item.get("content"), str) for item in files
+    ):
+        return None, "model runner files_written must contain filename/content objects"
+    if not isinstance(integration, dict) or not str(integration.get("disposition") or "").strip():
+        return None, "model runner requires an explicit integration disposition"
+    if not files and str(integration["disposition"]).strip().lower() != "rejected":
+        return None, "model runner produced no files for a non-rejected disposition"
+    return result, ""
 
 
 def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: dict) -> tuple[dict, str]:
@@ -174,14 +154,17 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
                 from vector_lake.db_store import release_job_for_retry
                 release_job_for_retry(job_id, "shadow run: model call skipped")
         else:
-            files, error = run_model(packet, model_cmd)
+            model_result, error = run_model(packet, model_cmd)
             if error:
                 res["model-failed"] += 1
                 last_err = error
                 if job_id:
                     record_ingest_failure(job_id, f"model seam: {error}")
                 return res, last_err
-            result = finalize_ingest(files, _with_disposition(processed))
+            result = finalize_ingest(
+                model_result["files_written"],
+                _merge_model_integration(processed, model_result["integration"]),
+            )
             if "Successfully finalized" in result:
                 res["finalized"] += 1
             else:

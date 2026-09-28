@@ -3,7 +3,7 @@
 
 Contract with the runner (``scripts/ingest_runner.py --model-cmd``):
   stdin   one task packet JSON (as emitted by ``claim_ingest_tasks``)
-  stdout  the contract JSON array: ``[{"filename": ..., "content": ...}, ...]``
+  stdout  ``{"files_written": [{"filename": ..., "content": ...}], "integration": {...}}``
   exit 0  success; non-zero means "model failed" and the runner records it
 
 Why a read-only pi-subagents profile: the runtime is the only writer (the runner submits
@@ -14,7 +14,7 @@ never write wiki files itself.  ``reviewer`` (read/grep/find/ls) satisfies that;
 
 The child is a headless Pi session (``pi --print --session-dir <scratch/runner_sessions>``)
 whose system prompt tells it to delegate the ingest to the configured subagent and to print
-only the JSON array.
+only the JSON object.
 
 ``--no-session`` used to be what made the child ephemeral, but it also removes the session
 root that two extensions derive their own paths from.  Measured 2026-09-25: every child then
@@ -58,47 +58,47 @@ Rules that are not negotiable:
 - You must delegate the actual ingest to the subagent tool: subagent({agent: "%(agent)s", task: <the ingest brief>}).
 - Do NOT write, edit or delete any file. The host commits the result through
   finalize_ingest; a file you write yourself would bypass validation.
-- Your entire final answer must be the JSON array the brief asks for: no prose, no
-  markdown fence, no commentary before or after it.
-- If the subagent's answer is not a valid JSON array, repair it into one yourself from the
-  same evidence instead of returning an error.
-- Keep the output small: ONE Source page, and the whole JSON array under 5000 characters.
-  A compact page that closes properly is required; a truncated one is discarded and the
-  task is wasted.  Aim for a 3-5 sentence summary plus 4-6 short bullets with inline
-  (Source: [[...]]) anchors, and do not restate the source document.
+- Your entire final answer must be one JSON object with exactly `files_written` (array of
+  filename/content objects) and `integration` (explicit disposition and its reason or relations).
+  No prose, markdown fence, or extra fields such as processed_data. Do not call finalize_ingest.
+- If the subagent returns invalid JSON or omits the semantic decision, report the failure;
+  never invent a standalone disposition to make a malformed output pass.
+- Keep the output compact: one canonical Source page is mandatory unless rejected. Aim for a
+  3-5 sentence summary plus 4-6 short bullets with inline (Source: [[...]]) anchors, and do
+  not restate the source document.
 """ % {"agent": AGENT}
 
 
-def _extract_array(text: str):
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end <= start:
-        return None, "no JSON array in child output"
+def _extract_result(text: str):
     try:
-        payload = json.loads(text[start:end + 1])
+        payload = json.loads(text.strip())
     except json.JSONDecodeError as exc:
         return None, f"child JSON invalid: {exc}"
-    if not isinstance(payload, list) or not payload:
-        return None, "child produced an empty payload"
-    # The contract is [{filename, content}].  Children often also echo the packet's
-    # ``processed_data`` as an extra element; that is discarded here (the host supplies
-    # processed_data to finalize_ingest itself) instead of failing the whole task.
-    files = [
-        entry for entry in payload
-        if isinstance(entry, dict) and "filename" in entry and "content" in entry
-    ]
-    if not files:
-        return None, f"payload has no filename/content entry: {str(payload)[:160]}"
-    return files, ""
+    if not isinstance(payload, dict) or set(payload) != {"files_written", "integration"}:
+        return None, "child must return files_written and integration only"
+    files = payload["files_written"]
+    integration = payload["integration"]
+    if not isinstance(files, list) or not all(
+        isinstance(item, dict) and set(item) == {"filename", "content"}
+        and isinstance(item["filename"], str) and isinstance(item["content"], str)
+        for item in files
+    ):
+        return None, "child files_written must contain filename/content objects only"
+    if not isinstance(integration, dict) or not str(integration.get("disposition") or "").strip():
+        return None, "child requires an explicit integration disposition"
+    if not files and str(integration["disposition"]).strip().lower() != "rejected":
+        return None, "child returned no files for a non-rejected disposition"
+    return payload, ""
 
 
 def _brief(packet: dict) -> str:
     metadata = (packet.get("metadata") or {}).get("processed_data") or {}
     return (
         f"{packet.get('prompt', '')}\n\n"
-        f"---\nExpected output: {packet.get('expected_output', 'JSON array of {filename, content}')}\n"
+        f"---\nExpected output: JSON object with files_written and integration.\n"
         f"The raw file to ingest is: {metadata.get('filepath')}\n"
         f"The page that MUST exist in your payload is: {metadata.get('canonical_name')}\n"
-        "Return only the JSON array.\n"
+        "Return only the JSON object. Do not return processed_data or call finalize_ingest.\n"
     )
 
 
@@ -271,7 +271,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 4
-    payload, error = _extract_array(proc.stdout)
+    payload, error = _extract_result(proc.stdout)
     if payload is None:
         # Pi can exit 0 while explaining the problem on stderr, so surface both streams.
         print(

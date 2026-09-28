@@ -615,10 +615,9 @@ def _read_purpose() -> str:
         log.error("Strategic purpose contract is unavailable: %s", exc)
         return "[STRATEGIC PURPOSE CONTRACT UNAVAILABLE: halt and repair purpose.md before ingesting.]"
 
-# Bumped when the task-packet dispatch manifest changes shape.  A packet carries the version it
-# was built with, so a consumer can tell a rebuilt packet from a stale one instead of inferring it
-# from whichever fields happen to be present.
-INGEST_CONTRACT_VERSION = 2
+# Bumped when the task-packet manifest or model-output protocol changes. The version forces
+# queued/awaiting packets to rebuild their rendered prompt before the host claims model work.
+INGEST_CONTRACT_VERSION = 3
 
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
 INTEGRATION_PREDICATES = {"validates", "falsifies", "depends-on", "mentions", "related_to"}
@@ -1336,14 +1335,14 @@ def _build_ingest_instructions(
 
 
 def requeue_legacy_ingest_jobs() -> int:
-    """Rebuild pre-integration-contract awaiting packets before they are claimed."""
+    """Rebuild old prompts before claim; never rewrite a leased or finalized job."""
     from vector_lake import db_store
 
     db_store.init_db()
     conn = db_store.get_connection()
     rows = conn.execute(
-        "SELECT job_id, payload, task_packet_path FROM jobs "
-        "WHERE task_type = 'ingest' AND status = 'awaiting_subagent'"
+        "SELECT job_id, payload, task_packet_path, status FROM jobs "
+        "WHERE task_type = 'ingest' AND status IN ('queued', 'failed', 'awaiting_subagent')"
     ).fetchall()
     migrations = []
     for row in rows:
@@ -1371,30 +1370,42 @@ def requeue_legacy_ingest_jobs() -> int:
         payload["ingest_contract_version"] = INGEST_CONTRACT_VERSION
         payload["source_projection_hash"] = projection_hash(source_text) if source_text else ""
         payload["integration_candidates"] = candidates
-        migrations.append((str(row["job_id"]), payload, str(row["task_packet_path"] or "")))
+        migrations.append((str(row["job_id"]), payload, str(row["task_packet_path"] or ""), row["status"]))
 
     if not migrations:
         return 0
     now = datetime.now(timezone.utc).isoformat()
+    applied = []
     with db_store.transaction():
-        for job_id, payload, _packet_path in migrations:
-            conn.execute(
-                "UPDATE jobs SET payload = ?, status = 'queued', retries = 0, "
-                "error_msg = 'Legacy ingest packet rebuilt for the integration contract', "
-                "available_at = ?, updated_at = ?, task_packet_path = NULL, "
-                "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
-                "WHERE job_id = ? AND status = 'awaiting_subagent'",
-                (json.dumps(payload, ensure_ascii=False), now, now, job_id),
-            )
+        for job_id, payload, packet_path, status in migrations:
+            # Awaiting work resets its handoff lease. Queued/failed keeps its state and attempts,
+            # but an old packet path can survive a previous release or failure and must be retired.
+            if status == "awaiting_subagent":
+                cursor = conn.execute(
+                    "UPDATE jobs SET payload = ?, status = 'queued', retries = 0, "
+                    "error_msg = 'Legacy ingest packet rebuilt for the integration contract', "
+                    "available_at = ?, updated_at = ?, task_packet_path = NULL, "
+                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+                    "WHERE job_id = ? AND status = 'awaiting_subagent'",
+                    (json.dumps(payload, ensure_ascii=False), now, now, job_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE jobs SET payload = ?, updated_at = ?, task_packet_path = NULL "
+                    "WHERE job_id = ? AND status = ?",
+                    (json.dumps(payload, ensure_ascii=False), now, job_id, status),
+                )
+            if cursor.rowcount == 1:
+                applied.append((packet_path, status))
     from vector_lake.native_llm import remove_subagent_task
 
-    for _job_id, _payload, packet_path in migrations:
+    for packet_path, _status in applied:
         if packet_path:
             try:
                 remove_subagent_task(packet_path)
             except OSError:
                 log.warning("Could not remove superseded ingest packet: %s", packet_path)
-    return len(migrations)
+    return len(applied)
 
 INGEST_IN_FLIGHT_TTL_SECONDS = 3600
 
