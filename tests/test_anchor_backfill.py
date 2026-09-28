@@ -195,3 +195,28 @@ def test_drafting_then_applying_clears_the_gap_and_keeps_the_claim(prepared):
     # it is the only id allowed to move (the live run of 240 anchors moved none).
     moved = set(before) - set(after)
     assert all(before[cid]["claim_text"].startswith("## 1. 编译事实") for cid in moved), moved
+
+
+def test_an_h3_slot_heading_is_scaffolding_not_a_claim():
+    """A slot heading arrives as a block, but a heading is structure, not a statement.
+
+    Measured 2026-09-28: ``物理机制 (Mechanism)`` and ``核心约束与合规要求 (Compliance Mandates)``
+    were both proposed for an anchor -- the wrong answer to a question nobody should be asked.  The
+    vocabulary is read from ``VALID_H3_SLOTS`` rather than listed again, so a slot added there is
+    filtered too.
+    """
+    assert _is_scaffolding("物理机制 (Mechanism)") == "page_scaffolding"
+    assert _is_scaffolding("### 核心护城河 (Moat)") == "page_scaffolding"
+    assert _is_scaffolding("机构定位与核心诉求 (Positioning & Needs)") == "page_scaffolding"
+
+
+def test_a_merge_record_is_scaffolding_not_a_claim():
+    """The sentence a merge writes describes the page's own construction, not its subject."""
+    line = "本页由 UI Agent 合并而来；其编译事实与时间线条目已并入上文对应分节。"
+    assert _is_scaffolding(line) == "page_scaffolding"
+
+
+def test_a_real_claim_is_still_not_scaffolding():
+    """Guard against the filter widening: these are statements about their subject."""
+    assert _is_scaffolding("上下文腐烂在泛型子代理面对高密度的业务流时极易发生。[^2]") is None
+    assert _is_scaffolding("Concept_EHR 集中汇总和存储医疗机构内及跨机构的患者临床数据，构建完整健康视图。") is None

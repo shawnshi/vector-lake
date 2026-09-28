@@ -62,6 +62,26 @@ NOT_A_CLAIM = (
     "node auto-migrated to v11 schema",
 )
 
+#: Every H3 slot heading any node type may carry, in the two forms a block can arrive in: with the
+#: ``###`` marker the extractor strips, and without it.  A heading is structure, not a statement
+#: about the subject, but it arrives as a block like any other and the two markers above do not
+#: catch it: measured 2026-09-28, ``物理机制 (Mechanism)`` and ``核心约束与合规要求 (Compliance
+#: Mandates)`` were both proposed for an anchor, which is the wrong answer to a question nobody
+#: should be asked.  The vocabulary is imported rather than listed again so a new slot cannot slip
+#: past this filter.
+from vector_lake.schema_validator import VALID_H3_SLOTS as _VALID_H3_SLOTS
+
+_H3_HEADINGS: frozenset[str] = frozenset(
+    slot.strip() for slots in _VALID_H3_SLOTS.values() for slot in slots
+)
+_H3_TITLES: frozenset[str] = frozenset(
+    heading.lstrip("#").strip() for heading in _H3_HEADINGS
+)
+
+#: The sentence a merge writes at the foot of the survivor page.  It is a note about the page's own
+#: construction, not knowledge about its subject.
+_MERGE_RECORD = re.compile(r"^本页由.+合并而来")
+
 
 def _is_scaffolding(text: str) -> str | None:
     """``page_scaffolding`` / ``not_a_claim`` when the block is not about the subject, else None.
@@ -75,6 +95,11 @@ def _is_scaffolding(text: str) -> str | None:
     if any(marker in normalized for marker in NOT_A_CLAIM):
         return "not_a_claim"
     if any(marker in text for marker in PAGE_SELF_DESCRIPTION):
+        return "page_scaffolding"
+    stripped = str(text or "").strip()
+    if stripped in _H3_HEADINGS or stripped in _H3_TITLES:
+        return "page_scaffolding"
+    if _MERGE_RECORD.match(stripped):
         return "page_scaffolding"
     return None
 

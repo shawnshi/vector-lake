@@ -410,3 +410,23 @@ def test_a_contested_alias_is_not_reported_as_contested_in_the_same_run(isolated
     assert not any("2 pages declare that name" in l for l in lines), [
         l for l in lines if "Atrium" in l
     ]
+
+
+def test_a_raw_source_annotation_is_not_a_broken_link(isolated_memory):
+    """``(Source: [[raw/…]])`` is provenance, not a page link.
+
+    Measured 2026-09-28: converting ``sources`` declarations from page names to raw paths turned
+    154 provenance annotations into reported broken links, because this resolver treats every
+    ``[[…]]`` target as a wiki page.  ``claim_extractor`` writes exactly that form and
+    ``anchor_backfill`` appends it, so a raw target is expected in the corpus -- and a raw path is
+    not a page and never will be.
+    """
+    page = _VENDOR_PAGE.replace(
+        "- x\n\n---", "- x\n[^1]: (Source: [[raw/youtube/report-2026.md]])\n\n---"
+    )
+    _wiki("Vendor_Annotation", {"Vendor_Annotation": page})
+
+    report = _report()
+
+    assert "[[raw/youtube/report-2026.md]]" not in report, _broken_lines(report)
+    assert "7. Broken Links: [PASS]" in report

@@ -332,6 +332,14 @@ def lint_vector_lake(auto_fix: bool = False):
             links.add(match.group(1).strip().replace(".md", ""))
         for match in re.finditer(r"\[[^\[\]]+?::\s*\[\[([^\]]+?)\]\]\]", content):
             links.add(match.group(1).strip().split("|")[0].strip().replace(".md", ""))
+        # ``[[raw/…]]`` is a provenance annotation, not a page link: ``claim_extractor`` writes
+        # ``(Source: [[<declared file>]])`` and ``anchor_backfill`` appends exactly that, so the
+        # target is a path under ``raw/`` that no wiki page will ever answer.  Counting them as
+        # broken links reported 154 of them the moment the ``sources`` declarations were converted
+        # from page names to raw paths -- the same annotation, now resolvable by the extractor and
+        # unresolvable by a page index.  Filtered here rather than at the reporting end so the
+        # inbound/outbound counts the other checks read are unaffected too.
+        links = {target for target in links if not target.startswith("raw/")}
         links.discard("")
 
         parsed[filename] = {"fm": frontmatter, "body": body, "links": links, "path": filepath}
