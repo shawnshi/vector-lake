@@ -2,9 +2,11 @@
 
 The rule is deliberately growth-only.  A census on 2026-09-19 found 2 267 live pages citing
 ``Source_Auto_Fixed`` (28.6% of the wiki) -- the anchor page exists precisely because those
-pages had no provenance to record.  A flat ban would make more than a quarter of the store
-unwritable and would freeze the pages the anchor was created for, so what is enforced is
-that the marker cannot spread, and that a repair which removes it is never blocked.
+pages had no provenance to record.  A flat ban would have made more than a quarter of the store
+unwritable and would have frozen the pages the anchor was created for, so what is enforced is
+that the marker cannot spread, and that a repair which removes it is never blocked.  A
+re-census on 2026-09-28 found no live page citing it, so the grandfather path is now untested
+by the corpus: the tests below keep it exercised.
 
 The two halves therefore need separate coverage: the pure rule, and the fact that the write
 path supplies the page's *current* sources so "already carried it" is decidable.
@@ -139,7 +141,8 @@ def test_adding_the_placeholder_to_a_page_that_lacked_it_is_refused():
 
 
 def test_a_page_that_already_carried_it_may_keep_it():
-    # The grandfather case: 2 267 pages depend on this being allowed.
+    # The grandfather case: a page that already carried it stays writable, however large the
+    # backlog is (2 267 pages at the 2026-09-19 census; none on 2026-09-28).
     check_placeholder_sources([PLACEHOLDER], [PLACEHOLDER])
 
 
@@ -188,7 +191,7 @@ def test_write_path_rejects_adding_the_placeholder_to_an_existing_page(isolated_
 
 
 def test_write_path_allows_rewriting_a_grandfathered_page(isolated_memory):
-    """The regression this rule could cause: the 2 267 pages must stay repairable."""
+    """The regression this rule could cause: a grandfathered page must stay repairable."""
     path = get_wiki_dir() / "Concept_Test.md"
     path.write_text(_page(sources=[PLACEHOLDER]), encoding="utf-8")
 

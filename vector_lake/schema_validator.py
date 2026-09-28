@@ -42,9 +42,11 @@ MAX_TAGS = 3
 # one therefore asserts that provenance is *unknown* -- it is a marker, not evidence.
 #
 # The size of the backlog decides the enforcement: a census on 2026-09-19 found 2 267
-# live pages citing it (28.6% of the wiki).  A flat ban would make more than a quarter of
-# the store unwritable and freeze the very pages the anchor was created for, so the rule
-# is about *growth* -- see ``check_placeholder_sources``.
+# live pages citing it (28.6% of the wiki), so a flat ban would have made more than a
+# quarter of the store unwritable and frozen the very pages the anchor was created for.
+# A re-census on 2026-09-28 found no live page citing it -- ``Source_Auto_Fixed.md`` is the
+# only file that still contains the string, and it does not cite itself -- so what remains
+# enforced is *growth*: see ``check_placeholder_sources``.
 PLACEHOLDER_SOURCES = frozenset({"source_auto_fixed"})
 
 VALID_CATEGORIES = {
