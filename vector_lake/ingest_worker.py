@@ -32,8 +32,10 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + "- categories: a YAML list with EXACTLY one element, one of the SCHEMA_CATEGORIES domains"
         + ' (e.g. categories: ["Healthcare_IT"]); never a bare string, never two elements\n'
         + "- strategic_scope: exactly `core` or `edge`; aliases: a list; epistemic-status is one of"
-        + " sprouting/evergreen/seed; and id/title/type/domain/topic_cluster/status/ttl/memory_type/"
-        + "memory_key/tags/evidence_tier present\n"
+        + " sprouting/evergreen/seed; and id/title/type/domain/status/updated/sources present"
+        + " -- the field list the schema gate itself requires. `topic_cluster` is optional (the"
+        + " gate defaults it to `General`), and `ttl`, `memory_type` and `memory_key` are not"
+        + " fields the gate requires of a wiki page\n"
         + "- tags: at most 3, and none may equal an existing node's `title` or any of its `aliases`"
         + " (compared lowercased). The gate calls that `Tag Collision` and refuses the whole ingest,"
         + " so do not tag a term that already has a page -- including under an alias rather than"

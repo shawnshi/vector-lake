@@ -354,8 +354,10 @@ def query_logic_lake(query_str: str, dry_run: bool = False) -> str:
         query_str: The topic or command for reasoning.
         dry_run: Return the provenance trace instead of the synthesis prompt.  The prompt
             template documents this switch (``dry_run: true`` stops after the context
-            envelope is written), but this wrapper dropped the argument while the CLI has
-            always passed it -- so the documented behaviour was unreachable from MCP.
+            envelope is written) and this wrapper passes it through to
+            ``prepare_query_context``.  An earlier revision of this docstring claimed the
+            wrapper dropped the argument; it does not, and the flag has been honoured since
+            the test in ``tests/test_query_payload_and_writes.py`` was added.
     """
     return tools.prepare_query_context(query_str, dry_run)
 

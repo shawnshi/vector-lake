@@ -4,11 +4,13 @@ Reference skeleton for the canonical source page. The ingest prompt points here;
 code reads this file, so it is a contract you can follow rather than one a gate enforces.
 
 Why it exists: `schema.md` §4.B declares `Source_*` free-form, and the corpus took that literally
-— 1 798 source pages carry **3 200 distinct H2 headings**, 2 810 of them used exactly once, with
-six competing names for the same section (`Source Summary`, `Raw Preview`, `来源核验`, `概要摘录`,
-`核心摘要`, `结构化摘录`). The three headings below are the ones the corpus already uses most
-(171 / 171 / 147 pages), so adopting them costs nothing and gives the retrieval layer something to
-depend on. Enforcing them would mean rewriting 1 798 pages, which is why it is not enforced yet.
+— 1 816 source pages carry **2 822 distinct H2 headings**, 2 421 of them used exactly once, with
+seven competing names for the same section (`Source Summary`, `Raw Preview`, `来源核验`, `概要摘录`,
+`核心摘要`, `结构化摘录`, `补充摘录`). The most used of them is `## Source Summary` (244 pages), which
+this skeleton deliberately does not adopt: the point of a declared shape is that it is declared, not
+that it wins a majority. The three headings below are the ones chosen, in their corpus order
+(237 / 237 / 213 pages), so adopting them costs nothing and gives the retrieval layer something to
+depend on. Enforcing them would mean rewriting 1 816 pages, which is why it is not enforced yet.
 
 ```markdown
 ---
@@ -19,7 +21,7 @@ type: source
 domain: Medical_IT            # one of the 9 canonical facets in SCHEMA_CATEGORIES.md
 status: Active
 epistemic-status: seed        # sprouting | evergreen | seed
-categories: [Healthcare_IT]   # exactly one macro-domain, never Uncategorized on a new page
+categories: [Healthcare_IT]   # exactly one category value, never Uncategorized on a new page
 tags: []
 sources: []
 strategic_scope: core
@@ -51,6 +53,7 @@ Rules that do apply to this page:
 
 1. The filename is the claimed `canonical_name` and is the only page that may carry this source's
    provenance; exactly one such page per ingest.
-2. `categories` must be a single macro-domain, and `domain` one of the 9 canonical facets.
+2. `categories` must be a single category value (nine allowed, see `SCHEMA_CATEGORIES.md`), and
+   `domain` one of the 9 macro domains or a registered vertical/alias.
 3. Heading budget: three H2 sections plus `Graph Integration`. If you need a fourth, the content
    probably belongs on the target entity page instead.

@@ -32,12 +32,12 @@ Bounded Vector Lake page candidates are generated or validated against this cont
   topic_cluster: "General" 
   status: "Active | Draft | Superseded | Deprecated | Archived | Contested"
   epistemic-status: "seed | sprouting | evergreen" 
-  ttl: 365 
-  memory_type: "fact | preference | decision | task_state" 
-  memory_key: "stable_runtime_key" 
+  ttl: 365 # optional; §7 gives the default that applies when it is absent 
+  memory_type: "fact | preference | decision | task_state" # SQLite `operational_memory` row, not page frontmatter 
+  memory_key: "stable_runtime_key" # SQLite `operational_memory` row, not page frontmatter 
   categories: ["System_Architecture"] 
   tags: ["tag1", "tag2"]
-  architecture_patterns: ["微服务", "数据飞轮"] # Allowed for technical traits
+  architecture_patterns: ["微服务", "数据飞轮"] # authoring convention only: no code reads this key
   created: "YYYY-MM-DD"
   updated: "YYYY-MM-DD"
   sources: ["raw/doc1.pdf", "raw/doc2.txt"]
@@ -68,7 +68,7 @@ Example: `- {Metric: EMR_Level} [[Institution_协和医院]] 7 (Source: [[Source
 Semantic Tension Quantification Model (STQM): When synthesizing documents that contradict or explicitly support existing knowledge, generate a tension_edges array in the YAML frontmatter. (Polarity: -1.0 to 1.0, Intensity: 0.0 to 1.0, Context: 1-sentence reason).
 Contradictions & Synthesis: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction in the text AND map the physical collision using tension_edges (or embed inline: [falsifies:: [[Target]] {intensity: 0.85}]).
 Temporal Rot Defense: Anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., [2024] The market is...).
-Epistemic Decay (TTL): Actively assign a shorter ttl for time-sensitive nodes. Default TTLs: Tie strictly to pistemic-status (seed: 90, sprouting: 365, evergreen: 1825). Synthesis: 730, Source: 365.
+Epistemic Decay (TTL): Actively assign a shorter ttl for time-sensitive nodes. The indexer reads an explicit `ttl` from the node and honours it only when it is a valid positive number; otherwise it falls back to `DEFAULT_TTL`, keyed by `type` (`source` 365, `synthesis` 730, `concept` 1825, and 1095 for `vendor` / `product` / `person` / `event` / `policy` / `standard`). No code derives a ttl from `epistemic-status`, and the `seed` / `sprouting` / `evergreen` numbers this line used to name are implemented nowhere. Decay is `0.5 ** (age_days / ttl)` against `updated`. `DEFAULT_TTL` has two copies (`indexer.py` and `tool_lint.py`) that must be kept in step.
 Operational Memory Split: Agent runtime state is stored in SQLite `operational_memory`. Use the governed memory-update tool to register durable state; do not edit derived rows directly.
 File Naming Policy & Ontology Lock:
 Strict Naming Protocol ([ControlledType]_[MainName]-[SubName].md).
@@ -91,10 +91,10 @@ Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" ph
 [Provide a concise 50-word ultimate definition. ELI5 style.] (Last Reshaped: YYYY-MM-DD)
 
 > **Date is not a link.** Write the reshape date bare, exactly as the live wiki does
-> (3 915 pages) and as ``stub_creator.stub_body`` explains: ``[[2026-06-02]]`` is a broken
+> (4 564 pages) and as ``stub_creator.stub_body`` explains: ``[[2026-06-02]]`` is a broken
 > link the moment it is written, and the next ``lint --auto-fix`` turns it into a junk
 > ``Concept_2026-06-02.md``. Three pages reached the corpus that way before this line said
-> so; the optional ``timeline anchor`` suffix is kept by 817 pages and is harmless.
+> so; the optional ``timeline anchor`` suffix is kept by 822 pages and is harmless.
 
 > **Chunking Rule (No-Pronoun & Metrics Constraint):**
 > Every bullet point in this section MUST restate the entity's explicit name (e.g., "[[Vendor_Acme]] 的底层架构是...", NOT "它的底层架构是..."). 
@@ -123,7 +123,7 @@ Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" ph
 
 ---
 
-## 2. 证据时间线 (Knowledge Evidence Timeline)
+## 2. 证据时间线 (Timeline - EVENT STORE)
 *[System Directive: This is a governed knowledge-evidence projection, not a business Event Store. Entries normally append, but governed correction and supersession remain possible. Claims in Section 1 SHOULD trace to source-backed evidence records.]*
 
 > **Syntax Constraint:** 
@@ -142,10 +142,13 @@ Target Files: Source_*.md, Synthesis_*.md.
 Constraint: DO NOT apply the Dual-Schema timeline format to these files.
 
 For Source_*.md: free-form summaries and extract lists remain allowed, and this exemption is why
-the corpus's `Source_*` pages carry 3 200 distinct H2 headings. A **recommended** skeleton is now
-declared in `templates/Source.md` (`## 来源核验`, `## 概要摘录`, `## 结构化摘录`), matching the
-three headings the corpus already uses most. It is not enforced, because enforcing it would
-require rewriting 1 798 existing pages; new sources should follow it, and the retrieval layer can
+the corpus's `Source_*` pages carry 2 822 distinct H2 headings. A **recommended** skeleton is now
+declared in `templates/Source.md` (`## 来源核验`, `## 概要摘录`, `## 结构化摘录`). These three are
+not the three the corpus uses most: `## Source Summary` (245 pages) is the most used and is
+deliberately not adopted, because the point of the skeleton is a declared shape rather than a
+majority vote.
+It is not enforced, because enforcing it would
+require rewriting 1 816 existing pages; new sources should follow it, and the retrieval layer can
 depend on those three names existing.
 
 For Synthesis_*.md: MUST instantiate a lightweight semantic skeleton. The document MUST contain:
@@ -155,7 +158,7 @@ Free-form markdown analysis follows. What `schema_validator.validate_schema` enf
 two sections are *present*. Opening the document with them is the recommended shape, not an enforced
 one: enforcing the order would reject the legacy synthesis pages that carry the skeleton last, so
 `lint` reports the position instead (`synthesis_skeleton_order_report`) and the difference between the
-documented rule and the enforced rule stays visible. All 22 live synthesis pages satisfy the rule
+documented rule and the enforced rule stays visible. All 21 live synthesis pages satisfy the rule
 that is actually enforced.
 
 C. Generated Artifacts (Not Authored)
@@ -164,13 +167,13 @@ Constraint: these are pages the wiki writes **about itself**, not knowledge node
 from `domain`, `epistemic-status` and `sources`, carry `categories: [System]`, and every other
 layer (indexer, link resolution, governance extraction) skips them.
 
-The namespace is not a knowledge namespace. 235 knowledge pages had been filed under `System_` by
+The namespace is not a knowledge namespace. 229 knowledge pages had been filed under `System_` by
 2026-09-23; because the whole system skips that prefix, they were absent from the index,
 unreachable by link, and exempt from three required fields. The authoring gate therefore refuses
 a **new** node whose filename starts with `System_` unless it is an artifact; existing ones are
 left for a rename pass. Use a knowledge prefix (`Concept_`, `Source_`, `Vendor_`, ...) instead.
 
-5. Workflows
+## 5. Workflows
 (Standard workflows for Ingestion, Query-to-Page, and Linting remain intact. Trigger MCP tools enqueue_governance_item for conflicts, and resolve_governance_item for node merges.)
 
 6. Entity Linking Contract (图谱硬连接规范)
@@ -184,10 +187,10 @@ Predicate-Slot Alignment: Semantic links must be placed within their business-in
 Merge Constraint: ABSOLUTELY NO manual file merging. Use resolve_governance_item.
 
 7. Metadata Decay and Taxonomy Tyranny (防腐与分类学暴政)
-Metadata Decay Mechanism: Handled by AST daemon TTL expiration. Nodes marked [⏳ 过期警告] bypass standard RAG context.
+Metadata Decay Mechanism: Handled by AST daemon TTL expiration, which recomputes the decay weight from `updated` and the node's ttl (§7). No marker text bypasses RAG context: the ``[⏳ 过期警告]`` label this line used to name appears nowhere in the code, so nothing sets it and nothing reads it.
 Taxonomy Tyranny:
 Rule 1: NEVER use an existing entity name as a tag.
-Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换). Use rchitecture_patterns in YAML for technical jargon.
+Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换). Use architecture_patterns in YAML for technical jargon (an authoring convention: nothing in the code reads this key).
 Rule 3: An entity MUST NOT have more than 3 tags.
 ***
 *(Schema V8.0 with Strategic Contract V12.1. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*

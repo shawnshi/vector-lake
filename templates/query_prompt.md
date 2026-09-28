@@ -6,9 +6,11 @@ operator had to enable it first, naming a condition no code ever checked -- wors
 gate, because a reviewer reads such a header as protection that exists. `dry_run: true` stops
 after the context envelope is written and returns a provenance trace instead of this prompt.
 
-What this prompt can rely on is the division of labour below. The trusted Vector Lake controller
-owns the query job, nonce, prepared projection/canonical baselines, content digests, atomic
-mutation batch, and final receipt. The synthesis model is a proposal-only worker.
+What this prompt can rely on is the division of labour below. The synthesis model is a
+proposal-only worker: it returns page content, and the caller is what writes it to disk. The
+enforcement that exists on this path is the list at the end of this prompt, and it is the whole
+of it. This paragraph used to name a nonce, prepared projection/canonical baselines, content
+digests, an atomic mutation batch and a final receipt; the controller has none of those.
 
 Context provenance: {{payload_path}}
 
