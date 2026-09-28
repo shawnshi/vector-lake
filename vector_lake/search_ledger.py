@@ -132,11 +132,11 @@ def summary() -> dict:
     """What the ledger says about production retrieval, for the doctor line and for readiness.
 
     Entries are operator traffic only: the evaluation harness turns the ledger off for the duration
-    of a replay (``benchmarks/search_replay.py``), and the rows written before that guard existed
-    were moved aside to ``search_ledger.eval-legacy.jsonl`` by
-    ``benchmarks/purge_eval_traffic_from_ledger.py``.  Measured before that split: 893 of 901
+    of a replay, and the rows written before that guard existed were moved aside to
+    ``search_ledger.eval-legacy.jsonl``.  Measured before that split: 893 of 901
     entries were evaluation traffic, so every reading taken from this file was describing the
-    evaluation sets rather than the lake in use.
+    evaluation sets rather than the lake in use.  That harness has since been retired from the
+    repository; the split is why this file no longer carries its traffic.
 
     The query text is not stored (see the module docstring), so this is a count of what happened --
     how often an answer was empty, how long it took, and which route produced the pages -- not a

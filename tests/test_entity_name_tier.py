@@ -93,19 +93,6 @@ def test_the_priority_is_read_from_the_environment_and_clamped(monkeypatch):
     assert tool_search._entity_name_priority() == tool_search.ENTITY_NAME_PRIORITY_DEFAULT
 
 
-def test_the_replay_records_the_switch_so_two_runs_can_be_compared():
-    """Without it in the config, ``--compare`` refuses the pair as one configuration.
-
-    Which is the honest reading -- and it also means two runs with different ranking behaviour
-    would otherwise be indistinguishable in the record.
-    """
-    source = (tool_search.__file__).replace("tool_search.py", "")  # noqa: F841 - clarity only
-    import pathlib
-
-    replay = pathlib.Path(__file__).resolve().parents[1] / "benchmarks" / "search_replay.py"
-    assert '"entity_name_priority"' in replay.read_text(encoding="utf-8")
-
-
 @pytest.mark.parametrize("raw,expected", [(" 师成 ", "师成"), ("WiNEX!", "winex"), ("A B-C", "abc")])
 def test_normalisation_ignores_case_space_and_punctuation(raw, expected):
     assert tool_search._normalize_entity_name(raw) == expected

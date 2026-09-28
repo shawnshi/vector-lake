@@ -8,7 +8,8 @@ both.
 
 The switch is **default ``fts5``** on purpose.  Candidate ordering inside the returned pool is
 relevance-affecting, and this repository's rule for retrieval changes is one switch at a time,
-measured against the pre-registered eval harness (``benchmarks/search_eval_decisions*.md``).
+measured against the pre-registered eval harness, whose records were retired from the repository
+with ``benchmarks/``).
 Nothing here changes behaviour until an operator sets ``VECTOR_LAKE_FTS=tantivy``.
 
 Contract preserved from the FTS5 path, because callers depend on each part:

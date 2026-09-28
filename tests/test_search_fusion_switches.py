@@ -9,7 +9,7 @@ measured before it is adopted.  Three properties matter:
 * a quota makes graph expansion a candidate source on a query whose recall paths already fill the
   pool -- which is exactly where it could not supply one before.
 
-Measured on the live lake with the 40-query set in ``benchmarks/search_eval_queries.jsonl``:
+Measured on the live lake with the 40-query set (retired from the repository with ``benchmarks/``):
 expansion supplied 2 of 200 returned pages unset, 0 of 200 on half the queries, and ``rrf`` as it
 stands is a *regression* (recall@5 0.75 -> 0.33) because the expansion stage's score is written in
 the old fusion's units.  That is why ``rrf`` is not the default and why the README says not to

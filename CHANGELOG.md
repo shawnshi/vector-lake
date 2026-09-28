@@ -1,5 +1,12 @@
 # Unreleased
 
+## 评测脚手架退役（`benchmarks/` 移出仓库）
+
+- 删除 `benchmarks/`：检索回放、判定集 / 标注集与复现脚本不再随仓库分发（27 个文件）。
+- 连带清理引用：`README.md`（FTS、融合、候选池、来源惩罚、检索台账、验证段落）、`CONTEXT.md` 仓库资产表、`search_ledger` 与 `tantivy_index` 的 docstring。
+- 依赖该目录的测试随之退役：`tests/test_search_eval_harness.py`、`tests/test_criterion_satisfiability.py` 整体删除，`test_entity_name_tier` 中「回放记录开关」一例删除。
+- 取舍：评测器的打分算术与预注册口径不再有回归测试覆盖；历史判定与标注集只存于 git 历史。
+
 ## 契约与文档纠偏（Schema / 摄取 / 查询 / README）
 
 以代码与语料为准，修正契约文档里与实现不符、或已失效的陈述。
