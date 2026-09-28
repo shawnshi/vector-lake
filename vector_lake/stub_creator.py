@@ -233,7 +233,7 @@ def stub_body(page_stem: str, node_type: str, today: str) -> str:
     slots = VALID_H3_SLOTS.get(node_type) or [_FALLBACK_SLOT]
     return (
         f"\n# {core}\n\n"
-        "## 1. 编译事实\n"
+        "## 1. 编译事实 (Compiled Truth - READ MODEL)\n"
         "*[System Directive: This section represents the LATEST consensus.]*\n\n"
         f"Auto-generated stub for {core}. (Last Reshaped: {today})\n\n"
         f"{slots[0]}\n- [[{page_stem}]] Auto-generated stub.\n\n"

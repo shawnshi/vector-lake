@@ -358,7 +358,7 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
     slot = (VALID_H3_SLOTS.get(entity_type) or VALID_H3_SLOTS["concept"])[0]
     restored_at = datetime.now(timezone.utc).date().isoformat()
     return (
-        "## 1. 编译事实\n\n"
+        "## 1. 编译事实 (Compiled Truth - READ MODEL)\n\n"
         f"{slot}\n\n"
         f"{restored_note}\n\n"
         "## 2. 证据时间线\n\n"
