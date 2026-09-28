@@ -160,6 +160,28 @@ def is_generated_artifact(frontmatter: dict | None, filename: str, body: str | N
     return False
 
 
+#: The prefix of a provenance page.  ``Source_*`` records the *document* a node came from.
+SOURCE_NODE_PREFIX: str = prefix_for("source")
+
+
+def is_source_anchor_pair(name_a: str, name_b: str) -> bool:
+    """Is one of these two names the provenance record of the other?
+
+    A ``Source_*`` page records the *document* a node came from, so the source page and the node
+    derived from it share a name whenever the document is named after its subject --
+    ``Source_哲学家的工具箱`` beside ``Concept_哲学家的工具箱``.  That is the ingest contract, not a
+    duplicate: merging them would delete either the provenance record or the knowledge.
+
+    Measured 2026-09-28: nine of the merge detector's twenty candidates were exactly this shape.
+    ``tool_lint`` was already excluding them while ``find_merge_candidates`` was not, and two
+    owners of "is this pair by design" is how the weaker answer reaches an operator.  Both read
+    this function now.
+    """
+    return (str(name_a).startswith(SOURCE_NODE_PREFIX)) != (
+        str(name_b).startswith(SOURCE_NODE_PREFIX)
+    )
+
+
 def type_for_node_id(node_id: str) -> str | None:
     """The declared type of a node id such as ``Vendor_Epic-Systems``.
 

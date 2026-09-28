@@ -3,6 +3,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from vector_lake import governance_store
+from vector_lake.node_vocabulary import is_source_anchor_pair
 
 
 def _utc_now():
@@ -258,6 +259,15 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
             score += 1
 
         if score < 3:
+            continue
+
+        # A ``Source_*`` page is the provenance record of the node it fed, so the pair shares a
+        # name by contract rather than by duplication.  Detected here, before the candidate is
+        # built, because such a pair can never be merged: one side or the other would be lost.
+        if is_source_anchor_pair(
+            str(left.get("page_key") or left_canon_name or ""),
+            str(right.get("page_key") or right_canon_name or ""),
+        ):
             continue
 
         domain = left_domain or right_domain or "General"

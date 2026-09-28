@@ -36,6 +36,7 @@ from vector_lake.node_vocabulary import (
     NON_NODE_WIKI_FILES,
     STUB_MARKER_TAG,
     is_generated_artifact,
+    is_source_anchor_pair,
     strip_prefix,
 )
 
@@ -654,7 +655,7 @@ def lint_vector_lake(auto_fix: bool = False):
                 # the ingest contract, not a duplicate: merging them would delete either the
                 # provenance record or the knowledge.  Measured: 9 of the 42 identity pairs, and 9
                 # of the merge detector's 20 candidates for the same reason (alias overlap).
-                if (_type_prefix(key_a) == "Source") != (_type_prefix(key_b) == "Source"):
+                if is_source_anchor_pair(key_a, key_b):
                     source_anchor_pairs += 1
                     continue
                 # No series test here.  A cross-type pair qualifies only because the *name* is the

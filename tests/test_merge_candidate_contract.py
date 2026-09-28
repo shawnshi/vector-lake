@@ -59,6 +59,42 @@ def _pair(older_first=True):
     return (older, newer) if older_first else (newer, older)
 
 
+def test_a_source_page_beside_its_own_node_is_not_a_merge_candidate(isolated_memory):
+    """``Source_X`` records the document ``Concept_X`` came from; the pair is by contract.
+
+    Measured 2026-09-28: nine of the detector's twenty candidates were exactly this shape -- the
+    source page declares the node's own name among its aliases -- and merging such a pair would
+    delete either the provenance record or the knowledge.  ``tool_lint`` already excluded them;
+    the detector did not.  Both read ``node_vocabulary.is_source_anchor_pair`` now.
+    """
+    source = _entity(
+        1, "Source_哲学家的工具箱", page_key="Source_哲学家的工具箱",
+        created_at="2026-01-01T00:00:00+00:00", aliases=["哲学家的工具箱"],
+    )
+    concept = _entity(
+        2, "哲学家的工具箱", page_key="Concept_哲学家的工具箱",
+        created_at="2026-01-02T00:00:00+00:00", aliases=["哲学家的工具箱"],
+    )
+    _seed([source, concept])
+
+    assert find_merge_candidates(limit=100) == []
+
+
+def test_the_source_exclusion_does_not_exempt_source_pages_from_each_other(isolated_memory):
+    """Negative control: the rule is about the *pair shape*, not about source pages.
+
+    Two source pages that genuinely share a name must still surface, or the exclusion would
+    quietly retire a whole class of real duplicates -- which is exactly how the two source
+    briefings for one day (an 08-26 re-ingest beside the original) went unnoticed.
+    """
+    older, newer = _pair()
+    _seed([older, newer])
+
+    candidates = find_merge_candidates(limit=100)
+
+    assert len(candidates) == 1, [c["pair_key"] for c in candidates]
+
+
 def test_emitted_names_resolve_to_existing_wiki_pages(isolated_memory):
     older, newer = _pair()
     _seed([older, newer])
