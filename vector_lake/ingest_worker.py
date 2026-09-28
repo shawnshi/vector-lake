@@ -4,7 +4,8 @@ import json
 
 from vector_lake.db_store import claim_pending_jobs, get_connection, mark_job_awaiting_subagent, update_job_status
 from vector_lake.native_llm import create_subagent_task
-from vector_lake.schema_validator import VALID_PREDICATES
+from vector_lake.output_contract import build_output_contract
+from vector_lake.schema_validator import INGEST_INTEGRATION_PREDICATES, VALID_PREDICATES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ingest-worker")
@@ -41,8 +42,24 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + " as a typed link instead, e.g. `[related_to:: [[Standard_电子病历评级]]]` in Section 1.\n"
         + "- every typed link must be [predicate:: [[Target]]] with a predicate from this closed"
         + f" vocabulary: {', '.join(sorted(VALID_PREDICATES))}\n"
+        + "- an integration relation's `predicate` is NOT drawn from that list: it binds a document"
+        + " to an existing page, so only this narrower set is accepted --"
+        + f" {', '.join(sorted(INGEST_INTEGRATION_PREDICATES))}. `has_part` and the other structural"
+        + " predicates are refused here\n"
+        + "- every relation `target` must be copied verbatim from the packet's integration_candidates"
+        + " manifest, `.md` suffix included; a rephrased or suffix-less name is refused\n"
+        + "- a bullet under `## 2. 证据时间线` must be `- [YYYY-MM-DD] [Event_Tag] <event>` with a tag"
+        + " from exactly: [Release], [Pivot], [Conflict], [Validation], [Observation], [Decision],"
+        + " [Execution], [Outcome]; an undated item (an open question, a 未决点) does not belong in"
+        + " that list at all, and no date may be invented to satisfy the shape\n"
         + "Do not echo or alter processed_data; the host retains the task packet's lease and source_hash.\n"
         + "Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
+        + "Each integrated relation is a complete checked record: target (verbatim from the manifest,\n"
+        + "`.md` included), target_hash + target_projection_hash (copied from that entry, not computed),\n"
+        + "predicate (from the narrower set above), evidence (>= 12 chars), confidence (a number in\n"
+        + "[0,1]), event_date (YYYY-MM-DD), event_tag (one bare tag, brackets omitted, from Release,\n"
+        + "Pivot, Conflict, Validation, Observation, Decision, Execution, Outcome). One bad field\n"
+        + "refuses the whole ingest.\n"
         + "Do not call finalize_ingest: the host validates and submits the returned object.\n"
     )
 
@@ -101,6 +118,10 @@ def process_jobs():
                         "job_id": job_id,
                         "processed_data": processed_data,
                         "finalize_tool": "finalize_ingest",
+                        # The machine-checked output shape travels with the packet and the model
+                        # seam appends it to the end of the brief.  Buried in the ~50 KB prompt
+                        # it was obeyed by luck; beside the required output it is a checklist.
+                        "output_contract": build_output_contract(),
                     },
                 )
                 mark_job_awaiting_subagent(job_id, str(task_path))

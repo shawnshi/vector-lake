@@ -68,6 +68,27 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: Bounded repair rounds after a finalize rejection.  The model seam is a language model, so a
+#: rejection is usually a wording or shape slip rather than a missing fact: handing the validator's
+#: own message back costs one extra model call and converts a lost attempt (and, at the cap, an
+#: abandoned source) into a corrected answer.  Measured 2026-09-28, a single paper source stacked
+#: several independent schema violations (a naming violation, then a missing tension slot), which
+#: is why the budget is a count and not a flag: one round fixes one fault, and the source still
+#: converges through its remaining attempt budget.  Bounded on purpose -- a source that fails the
+#: same check on every round has a real problem the budget must not paper over.
+REPAIR_ATTEMPTS = max(0, int(os.environ.get("VECTOR_LAKE_RUNNER_REPAIR_ATTEMPTS", "2")))
+
+
+def _repair_packet(packet: dict, previous_output: dict, validation_error: str) -> dict:
+    """Add the rejection to a copy of the packet; the seam turns it into a repair brief."""
+    metadata = dict(packet.get("metadata") or {})
+    metadata["repair"] = {
+        "previous_output": previous_output,
+        "validation_error": str(validation_error)[:2000],
+    }
+    return {**packet, "metadata": metadata}
+
+
 def write_status(**fields) -> None:
     """Write a clean snapshot.
 
@@ -165,6 +186,30 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
                 model_result["files_written"],
                 _merge_model_integration(processed, model_result["integration"]),
             )
+            # Rejection is information, not a verdict: hand the model its own validator message
+            # back, up to the bounded budget, before spending the job's attempt.
+            rejection = "" if "Successfully finalized" in result else result
+            previous_output = model_result
+            rounds_used = 0
+            while rejection and rounds_used < REPAIR_ATTEMPTS:
+                rounds_used += 1
+                repaired, repair_error = run_model(
+                    _repair_packet(packet, previous_output, rejection), model_cmd
+                )
+                if repair_error or not repaired:
+                    result = (
+                        f"{rejection} [repair round {rounds_used} could not produce an answer: "
+                        f"{repair_error or 'empty model output'}]"
+                    )
+                    break
+                previous_output = repaired
+                result = finalize_ingest(
+                    repaired["files_written"],
+                    _merge_model_integration(processed, repaired["integration"]),
+                )
+                rejection = "" if "Successfully finalized" in result else result
+            if rounds_used and rejection:
+                result = f"{result} [after {rounds_used} repair round(s)]"
             if "Successfully finalized" in result:
                 res["finalized"] += 1
             else:

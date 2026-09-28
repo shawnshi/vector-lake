@@ -395,6 +395,49 @@ VALID_PREDICATES = frozenset({
 })
 
 
+#: The controlled event vocabulary.  One owner: the timeline check below writes it as ``[Tag]``
+#: and ``tool_ingest.INTEGRATION_EVENT_TAGS`` uses it bare, and both derive from this tuple, so a
+#: tag can never be legal in one place and unknown in the other.  It is also what
+#: ``vector_lake.output_contract`` publishes to the model, which is the point -- a vocabulary the
+#: validator enforces has to reach the prompt, or the model can only guess at it.
+INGEST_EVENT_TAGS = (
+    "Release", "Pivot", "Conflict", "Validation",
+    "Observation", "Decision", "Execution", "Outcome",
+)
+if not INGEST_EVENT_TAGS:
+    raise RuntimeError("INGEST_EVENT_TAGS must not be empty")
+
+
+#: Integration binds a source *document* to an existing page, so it may only use predicates that
+#: describe how a document stands to a page it did not write: evidence (``validates``,
+#: ``falsifies``, ``depends-on``), provenance of the document itself (``evolved-from``), a standard
+#: it follows (``complies-with``), a standing it contests (``conflicts-with``), and plain reference
+#: (``mentions``, ``related_to``, and their Chinese synonyms).  It deliberately excludes the
+#: *entity taxonomy* predicates -- ``is-a``, ``part-of``, ``has_part``, ``instance-of``,
+#: ``belongs_to``, ``parent``, ``核心构件``, ``属于`` -- because a document is not an instance of a
+#: concept or a part of one; when the closest reading is structural, the honest answer is
+#: ``related_to``.  That distinction is the whole point of the narrower set, and both prompt
+#: surfaces state it.
+#: Measured 2026-09-28: the first cut held only the five evidence/association predicates, and a
+#: "体系研究报告" failed every retry with ``unsupported integration predicate: evolved-from`` --
+#: its true relation (a report evolving out of a standard) had no legal expression, so the model
+#: picked the predicate it meant each time and the ingest was refused each time until the source
+#: was abandoned.  The gap was expressive, not misbehaviour.  Deriving the set from
+#: ``VALID_PREDICATES`` behind a subset guard keeps one owner for the vocabulary: a drift fails
+#: at import, not at finalize.
+INGEST_INTEGRATION_PREDICATES = frozenset({
+    "validates", "falsifies", "depends-on", "mentions", "related_to",
+    "evolved-from", "complies-with", "conflicts-with",
+    "引用", "提及", "关联", "类似",
+})
+if not INGEST_INTEGRATION_PREDICATES <= VALID_PREDICATES:
+    raise RuntimeError(
+        "Ingest integration predicates are missing from VALID_PREDICATES: "
+        f"{sorted(INGEST_INTEGRATION_PREDICATES - VALID_PREDICATES)}. "
+        "The page-link vocabulary and the ingest integration contract must agree."
+    )
+
+
 def validate_schema(
     frontmatter: dict, body: str, filename: str, index_path: Path = None, is_new: bool | None = None
 ):
@@ -560,7 +603,7 @@ def validate_schema(
             section_2_text = section_2_match.group(0)
             # Find all bullets
             bullets = re.findall(r'^\s*-\s+(.*)$', section_2_text, re.MULTILINE)
-            valid_tags = {"[Release]", "[Pivot]", "[Conflict]", "[Validation]", "[Observation]", "[Decision]", "[Execution]", "[Outcome]"}
+            valid_tags = {f"[{tag}]" for tag in INGEST_EVENT_TAGS}
             for bullet in bullets:
                 # Bypass pure text instructions or quotes
                 if bullet.startswith("[YYYY-MM-DD]") or "Event_Tag" in bullet: continue

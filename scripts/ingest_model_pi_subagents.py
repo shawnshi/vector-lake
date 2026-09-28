@@ -91,6 +91,23 @@ def _extract_result(text: str):
     return payload, ""
 
 
+def _repair_block(repair: dict) -> str:
+    """One bounded correction round: the finalizer's own message plus the answer it rejected."""
+    error = " ".join(str(repair.get("validation_error") or "").split())[:1200]
+    try:
+        previous = json.dumps(repair.get("previous_output"), ensure_ascii=False)[:4000]
+    except (TypeError, ValueError):
+        previous = ""
+    return (
+        "\n--- REPAIR ROUND ---\n"
+        "Your previous answer was rejected by the finalizer. Its message, verbatim:\n"
+        f"{error}\n"
+        + (f"\nThe answer that was rejected:\n{previous}\n" if previous else "")
+        + "Return a corrected JSON object. Change only what the rejection requires, keep every\n"
+        "field the contract lists, and do not drop or reword the file contents.\n"
+    )
+
+
 def _brief(packet: dict) -> str:
     metadata = (packet.get("metadata") or {}).get("processed_data") or {}
     return (
@@ -99,7 +116,35 @@ def _brief(packet: dict) -> str:
         f"The raw file to ingest is: {metadata.get('filepath')}\n"
         f"The page that MUST exist in your payload is: {metadata.get('canonical_name')}\n"
         "Return only the JSON object. Do not return processed_data or call finalize_ingest.\n"
+        f"\n{_packet_contract(packet)}"
+        f"{_packet_repair(packet)}"
     )
+
+
+def _packet_contract(packet: dict) -> str:
+    """The packet carries its own contract; fall back to the module copy for older packets.
+
+    Appended last on purpose: it is the final thing the child reads before answering, which is
+    the opposite of the ~50 KB prompt's middle where the same rules used to live.
+    """
+    stored = str((packet.get("metadata") or {}).get("output_contract") or "").strip()
+    if stored:
+        return stored
+    # Pre-v9 packet.  This seam deliberately does not import ``vector_lake``: it runs as a bare
+    # script whose ``sys.path[0]`` is ``scripts/``, and the contract's one owner is
+    # ``vector_lake.output_contract`` -- which the packet publisher has already used by the time
+    # any packet reaches here.
+    return (
+        "OUTPUT CONTRACT: this packet carries none (it was built before v9). Follow the ingest "
+        "prompt's field rules exactly: copy `target`, `target_hash` and `target_projection_hash` "
+        "verbatim from `integration_candidates`, keep `confidence` a JSON number and "
+        "`event_date` a plain YYYY-MM-DD.\n"
+    )
+
+
+def _packet_repair(packet: dict) -> str:
+    repair = (packet.get("metadata") or {}).get("repair")
+    return _repair_block(repair) if isinstance(repair, dict) else ""
 
 
 def _relative(path: Path) -> str:

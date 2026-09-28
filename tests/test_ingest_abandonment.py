@@ -423,6 +423,97 @@ def test_the_predicate_vocabulary_has_one_owner_and_reaches_the_prompts():
         assert predicate in _subagent_ingest_prompt("base"), predicate
 
 
+def test_the_integration_predicate_set_is_narrower_and_reaches_both_prompts():
+    """An integration relation binds a document to a page, so the page-link list does not apply.
+
+    Measured 2026-09-28: the rendered ingest prompt carried the full ``VALID_PREDICATES`` (which
+    contains ``has_part``) but never said the integration relation has its own narrower set.  The
+    model reused ``has_part``, ``finalize_ingest`` refused the ingest with ``unsupported
+    integration predicate: has_part``, and the packet stayed queued to fail the same way on every
+    retry.  Both prompt surfaces must name the narrower set, next to the list they do not use.
+    """
+    from vector_lake import tool_ingest
+    from vector_lake.ingest_worker import _subagent_ingest_prompt
+    from vector_lake.schema_validator import INGEST_INTEGRATION_PREDICATES, VALID_PREDICATES
+
+    assert INGEST_INTEGRATION_PREDICATES < VALID_PREDICATES, "the integration set must be narrower"
+    assert "has_part" in VALID_PREDICATES
+    assert "has_part" not in INGEST_INTEGRATION_PREDICATES
+    assert tool_ingest.INTEGRATION_PREDICATES == INGEST_INTEGRATION_PREDICATES
+
+    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    assert "{{integration_predicates}}" in template, "the template must not hardcode the set"
+
+    rendered = tool_ingest._build_ingest_instructions(
+        str(REPO_ROOT / "README.md"), "hash", "Source_x.md"
+    )
+    assert "{{integration_predicates}}" not in rendered
+    handoff = _subagent_ingest_prompt("base")
+    for text, label in ((rendered, "ingest prompt"), (handoff, "handoff prompt")):
+        assert "narrower set" in text.lower(), label
+        assert "has_part" in text, label  # the page-link vocabulary must survive untouched
+        for predicate in sorted(INGEST_INTEGRATION_PREDICATES):
+            assert predicate in text, (label, predicate)
+
+
+def test_both_prompts_state_the_timeline_rules_the_validator_enforces():
+    """The third validator rule in a row that lived only in the code.
+
+    ``schema_validator`` refuses any bullet under ``## 2. 证据时间线`` without a
+    ``[YYYY-MM-DD]`` prefix, and any Event_Tag outside its eight.  Measured 2026-09-28: a
+    ``体系研究报告`` put its undated 未决点 into that bullet list and the ingest was refused with
+    ``Schema Violation: Timeline entry ... must start with [YYYY-MM-DD]``.  A rule the model
+    cannot read is a rule it can only break, so both surfaces have to state it.
+    """
+    from vector_lake import tool_ingest
+    from vector_lake.ingest_worker import _subagent_ingest_prompt
+
+    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    handoff = _subagent_ingest_prompt("base")
+
+    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+        assert "[YYYY-MM-DD]" in text, label
+        assert "证据时间线" in text, label
+        for tag in ("[Release]", "[Pivot]", "[Conflict]", "[Validation]",
+                    "[Observation]", "[Decision]", "[Execution]", "[Outcome]"):
+            assert tag in text, (label, tag)
+
+    rendered = tool_ingest._build_ingest_instructions(
+        str(REPO_ROOT / "README.md"), "hash", "Source_x.md"
+    )
+    assert "[YYYY-MM-DD]" in rendered
+    assert "{{integration_predicates}}" not in rendered
+
+
+def test_both_prompts_state_the_integration_relation_record_the_validator_enforces():
+    """The fourth validator rule set in a row that lived only in the code.
+
+    ``_apply_integration_disposition`` checks eight fields on every relation: ``target`` verbatim
+    from the manifest, both version tokens, ``predicate``, ``evidence`` length, ``confidence``
+    range, ``event_date`` shape, and ``event_tag`` from ``INTEGRATION_EVENT_TAGS``.  Measured
+    2026-09-28: a paper source returned ``event_tag: paper-analysis`` and the entire ingest was
+    refused with ``unsupported integration event_tag for Product_Vector-Lake.md``.  Neither
+    surface named the tag vocabulary, so the model had no way to pick a legal one.
+    """
+    from vector_lake import tool_ingest
+    from vector_lake.ingest_worker import _subagent_ingest_prompt
+
+    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    handoff = _subagent_ingest_prompt("base")
+
+    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+        assert "bare tag" in text, label
+        for field in ("event_tag", "target_projection_hash", "confidence", "evidence"):
+            assert field in text, (label, field)
+        for tag in sorted(tool_ingest.INTEGRATION_EVENT_TAGS):
+            assert tag in text, (label, tag)
+
+    assert tool_ingest.INTEGRATION_EVENT_TAGS == {
+        "Release", "Pivot", "Conflict", "Validation",
+        "Observation", "Decision", "Execution", "Outcome",
+    }
+
+
 def test_an_in_flight_job_is_not_superseded(isolated_memory, source):
     """The regression that produced three to four concurrent jobs for one source.
 

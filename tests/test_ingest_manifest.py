@@ -6,11 +6,13 @@ and the candidate list in it is the *same* list the prompt shows.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from vector_lake import db_store, governance_store, tool_ingest
+from vector_lake.schema_validator import INGEST_INTEGRATION_PREDICATES, VALID_PREDICATES
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.wiki_utils import projection_hash
 
@@ -135,11 +137,11 @@ def test_a_cold_knowledge_base_reports_no_candidates(isolated_memory):
 _SOURCE_PAGE = "Source_Manifest.md"
 
 
-def _relation(target, target_hash, *, projection=None):
+def _relation(target, target_hash, *, projection=None, predicate="validates"):
     relation = {
         "target": target,
         "target_hash": target_hash,
-        "predicate": "validates",
+        "predicate": predicate,
         "evidence": "The source directly supports the target mechanism.",
         "confidence": 0.9,
         "event_date": "2026-07-15",
@@ -303,7 +305,7 @@ def test_legacy_output_prompt_rebuilt_without_resetting_queued_attempts(isolated
     assert row["task_packet_path"] is None and removed == ["legacy-packet.json"]
     rebuilt = json.loads(row["payload"])
     assert row["status"] == status and row["retries"] == 2
-    assert rebuilt["ingest_contract_version"] == tool_ingest.INGEST_CONTRACT_VERSION == 3
+    assert rebuilt["ingest_contract_version"] == tool_ingest.INGEST_CONTRACT_VERSION == 9
     assert "Return one JSON object" in rebuilt["instructions"]
     assert rebuilt["integration_candidates"]
     assert tool_ingest.requeue_legacy_ingest_jobs() == 0
@@ -355,6 +357,51 @@ def test_a_correct_manifest_relation_is_accepted(isolated_memory):
         source_projection_hash=projection_hash(raw.read_text(encoding="utf-8")),
     )
     assert any(item["filename"] == candidate["target"] for item in files)
+
+
+@pytest.mark.parametrize("predicate", sorted(INGEST_INTEGRATION_PREDICATES))
+def test_every_integration_predicate_from_the_narrow_set_is_accepted(isolated_memory, predicate):
+    """Positive control for the narrow set: membership is what the finalizer acts on."""
+    raw = _raw_and_candidate(isolated_memory)
+    candidate = _manifest(raw)[0]
+    files, _ = _apply(
+        isolated_memory,
+        raw,
+        candidates=[candidate],
+        relation=_relation(
+            candidate["target"], candidate["target_hash"], predicate=predicate,
+            projection=candidate["target_projection_hash"],
+        ),
+        source_projection_hash=projection_hash(raw.read_text(encoding="utf-8")),
+    )
+    assert any(item["filename"] == candidate["target"] for item in files)
+
+
+@pytest.mark.parametrize("predicate", ["has_part", "is-a", "part-of", "created"])
+def test_a_page_link_predicate_is_refused_on_an_integration_relation(isolated_memory, predicate):
+    """Negative control for the same boundary, using predicates the schema does accept.
+
+    ``has_part`` and friends are legal page links, so an integration relation must be refused
+    with a message that names the boundary.  Measured 2026-09-28: the ingest prompt carried the
+    full page-link vocabulary without naming the narrower integration set, the model reused
+    ``has_part``, and this refusal burned an attempt (and an hour of lease) per round trip.
+    """
+    raw = _raw_and_candidate(isolated_memory)
+    candidate = _manifest(raw)[0]
+    assert predicate in VALID_PREDICATES
+    assert predicate not in INGEST_INTEGRATION_PREDICATES
+
+    with pytest.raises(ValueError, match=f"unsupported integration predicate: {re.escape(predicate)}"):
+        _apply(
+            isolated_memory,
+            raw,
+            candidates=[candidate],
+            relation=_relation(
+                candidate["target"], candidate["target_hash"], predicate=predicate,
+                projection=candidate["target_projection_hash"],
+            ),
+            source_projection_hash=projection_hash(raw.read_text(encoding="utf-8")),
+        )
 
 
 def test_a_source_edited_after_the_packet_was_built_is_refused(isolated_memory):

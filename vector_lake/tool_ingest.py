@@ -30,7 +30,7 @@ from vector_lake.wiki_utils import (
     read_frontmatter_only,
     validate_wiki_filename,
 )
-from vector_lake.schema_validator import VALID_PREDICATES
+from vector_lake.schema_validator import INGEST_EVENT_TAGS, INGEST_INTEGRATION_PREDICATES, VALID_PREDICATES
 from vector_lake.purpose_contract import (
     PurposeContractError,
     build_synthesis_proposals,
@@ -617,10 +617,12 @@ def _read_purpose() -> str:
 
 # Bumped when the task-packet manifest or model-output protocol changes. The version forces
 # queued/awaiting packets to rebuild their rendered prompt before the host claims model work.
-INGEST_CONTRACT_VERSION = 3
+INGEST_CONTRACT_VERSION = 9
 
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
-INTEGRATION_PREDICATES = {"validates", "falsifies", "depends-on", "mentions", "related_to"}
+#: The narrower vocabulary an integration relation may use.  Owned by ``schema_validator`` next to
+#: ``VALID_PREDICATES`` so the page-link list and this one cannot drift apart.
+INTEGRATION_PREDICATES = INGEST_INTEGRATION_PREDICATES
 
 DEFAULT_PREDICATE_SLOTS: dict[str, dict[str, str]] = {
     "concept": {
@@ -658,9 +660,7 @@ DEFAULT_PREDICATE_SLOTS: dict[str, dict[str, str]] = {
         "depends-on": "### 管辖范围与适用对象 (Jurisdiction & Applicability)",
     },
 }
-INTEGRATION_EVENT_TAGS = {
-    "Release", "Pivot", "Conflict", "Validation", "Observation", "Decision", "Execution", "Outcome"
-}
+INTEGRATION_EVENT_TAGS = frozenset(INGEST_EVENT_TAGS)
 INGEST_CANDIDATE_TYPES = {
     "concept", "vendor", "institution", "product", "person", "event", "policy", "standard",
     "synthesis",
@@ -1331,6 +1331,7 @@ def _build_ingest_instructions(
         )
         .replace("{{purpose_content}}", _read_purpose())
         .replace("{{valid_predicates}}", ", ".join(sorted(VALID_PREDICATES)))
+        .replace("{{integration_predicates}}", ", ".join(sorted(INTEGRATION_PREDICATES)))
     )
 
 
