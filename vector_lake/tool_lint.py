@@ -617,6 +617,12 @@ def lint_vector_lake(auto_fix: bool = False):
     keys_list = sorted(list(all_keys))
     collision_pairs: list[tuple[str, str]] = []
     series_pairs: list[tuple[str, str]] = []
+    #: pairs a reader already opened and decided are distinct entities.  Read once: the ledger is a
+    #: file, and the similarity loop below is millions of comparisons.
+    from vector_lake.name_collision_ledger import accepted_pair_keys, pair_key
+
+    accepted_collision_keys = accepted_pair_keys()
+    accepted_collision_pairs = 0
 
     # The name-likeness pass below cannot see the corpus's dominant duplication shape: one name
     # under two type prefixes.  It refuses any pair whose type prefix differs, and its window is
@@ -745,6 +751,12 @@ def lint_vector_lake(auto_fix: bool = False):
                                 # "pairs the score would have called duplicates".
                                 series_pairs.append((key_a, key_b))
                                 continue
+                            if pair_key(key_a, key_b) in accepted_collision_keys:
+                                # Read and rejected once already.  Re-reporting it every run is how
+                                # a stable count stops carrying information; the ledger holds the
+                                # reason, and a pair can be carved back out of it.
+                                accepted_collision_pairs += 1
+                                continue
                             issues["similarity"].append(
                                 f"Name collision: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
                             )
@@ -766,6 +778,8 @@ def lint_vector_lake(auto_fix: bool = False):
         "(the provenance record and the node it fed share a name by design)",
         f"excluded as a generated index: {artifact_pairs} pairs "
         "(a community index is not a duplicate of the page it was named after)",
+        f"decided distinct and recorded: {accepted_collision_pairs} pairs "
+        "(read once, in name_collision_accepted.json)",
         "merge decisions belong to merge_suggestions_vector_lake and the governance queue, "
         "not to this pass",
     ]
