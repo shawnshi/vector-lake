@@ -1,5 +1,18 @@
 # Unreleased
 
+## 契约与文档纠偏（Schema / 摄取 / 查询 / README）
+
+以代码与语料为准，修正契约文档里与实现不符、或已失效的陈述。
+
+- `schema.md`：TTL 默认值改为按节点 `type` 取（`DEFAULT_TTL`，`indexer.py` 与 `tool_lint.py` 两份需保持同步），显式 `ttl` 优先；`architecture_patterns` 标注为无代码读取；删去 `[⏳ 过期警告]` 死引用；补全 `## 5. Workflows` 标题前缀；§4.A/§4.B 的语料计数改为 2026-09-28 实测值；§2 标题后缀与语料主流 `(Timeline - EVENT STORE)` 对齐。
+- `SCHEMA_CATEGORIES.md`：升到 V8.0；明确 `categories`（9 个分类值）与 `domain`（9 个宏观域 + 登记纵向 / 别名）是两条不同轴；`propose_schema_mutation` 标注为 `[CLI-only / Internal]`，且审批不会自动改写本文件。
+- `templates/ingest_prompt.md` + `ingest_worker`：检查 5 的必填字段清单改为门禁真值（`ttl` / `memory_type` / `memory_key` 非必填，`evidence_tier` 仅在存在时校验）；检查 3 的拒写归因由 purpose gate 改为 `schema_validator`。
+- `templates/query_prompt.md` + `mcp_server.query_logic_lake`：删去控制器侧不存在的 nonce / 投影基线 / 内容摘要 / 原子批次 / 回执承诺，`dry_run` 文档改为与透传行为一致。
+- `templates/Concept.md` / `Source.md`：实体页与来源页计数改为实测值，首节三形态计数闭合，时间线规则引用 §4.A 原文，重复的规则编号修正。
+- `stub_creator` / `tool_projection`：生成的桩正文改用注解式第 1 节标题。
+- `README.md`：`VECTOR_LAKE_*` 开关名去掉多余的 Markdown 转义，使 `tests/test_registries.py` 能识别（76/76 已登记）。
+- `schema_validator` / `test_placeholder_source_gate`：占位来源普查并列历史值与当前值（2026-09-19：2 267 页；2026-09-28：0 页）。
+
 ## 摄取 Runner 整合判断回传与任务包协议 v3
 
 - 模型接缝改为单个 JSON 对象，显式返回 `files_written` 和 `integration`；Runner 仅从可信任务包继承租约、源哈希与候选清单，缺失判断或旧数组输出失败关闭，不再静默回退为 standalone。
