@@ -134,12 +134,77 @@ def process_jobs():
             log.error(f"Job {job_id} failed: {e}")
             update_job_status(job_id, "failed", str(e))
 
+#: Normal cadence of the ingest worker loop.
+INGEST_WORKER_INTERVAL_SECONDS = 5.0
+
+#: Cadence while another writer is contending for the write lock.
+#:
+#: This loop takes the write lock on every tick, so it is the one that should yield: it is a
+#: periodic housekeeper, while whatever it is contending with is usually a bounded one-off (a
+#: governance batch, a backfill, an operator script).  Measured 2026-09-28: a batch of 19 merges
+#: waited up to 346 s per write and took ~10 minutes in total, because this loop re-took the lock
+#: every 5 seconds.  Yielding costs nothing when nobody else is writing -- the marker this reads is
+#: only written when a lock acquisition actually had to retry.
+INGEST_WORKER_CONTENDED_INTERVAL_SECONDS = 30.0
+
+#: How long a recorded contention keeps the worker in the longer cadence.  Long enough to cover a
+#: multi-minute batch, short enough that it returns to normal on its own if the marker goes stale.
+INGEST_WORKER_CONTENTION_MEMORY_SECONDS = 300.0
+
+
+def _recent_write_contention() -> bool:
+    """Is another writer contending for the write lock right now?
+
+    Reads the marker ``db_store._record_lock_contention`` writes.  A lock that was taken on the
+    first attempt records nothing, so a worker operating alone never sees contention and never
+    slows down; the marker only exists while two writers are actually overlapping.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    from vector_lake.wiki_utils import get_meta_dir
+
+    marker = get_meta_dir() / "runtime" / "write_lock_contention.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    # The real marker is ``{"last": {...}, "history": [...]}``; the newest entry is ``last``.
+    # Reading a top-level ``at`` (as the first cut did, and as its test wrongly assumed) always
+    # yields None and therefore never yields the loop.
+    last = payload.get("last")
+    if not isinstance(last, dict):
+        return False
+    try:
+        stamp = datetime.fromisoformat(str(last.get("at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - stamp).total_seconds()
+    return 0 <= age <= INGEST_WORKER_CONTENTION_MEMORY_SECONDS
+
+
+def _idle_delay() -> float:
+    """How long to wait before the next tick: the normal cadence, or the yielded one."""
+    if _recent_write_contention():
+        return INGEST_WORKER_CONTENDED_INTERVAL_SECONDS
+    return INGEST_WORKER_INTERVAL_SECONDS
+
+
 def start_worker():
     log.info("Ingest Worker Daemon started.")
     while True:
         try:
             process_jobs()
-            time.sleep(5)
+            delay = _idle_delay()
+            if delay > INGEST_WORKER_INTERVAL_SECONDS:
+                log.info(
+                    "Ingest worker yielding to another writer; next tick in %.0fs", delay
+                )
+            time.sleep(delay)
         except Exception as e:
             log.error(f"Worker exception: {e}")
             time.sleep(15)
