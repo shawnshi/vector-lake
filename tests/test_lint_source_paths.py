@@ -104,3 +104,64 @@ def test_a_corrupted_path_and_a_missing_name_are_told_apart(isolated_memory):
     assert "no file named nothing-here.md under raw/: raw/gone/nothing-here.md" in section
     # Two different owners: a mangled string is a write-path defect, a missing file is not.
     assert "moved" not in section
+
+
+# ---------------------------------------------------------------------------------------------
+# Section 17 also covers `sources` entries that are not raw/ paths at all.
+#
+# The field is a provenance declaration.  A page name, a [[wiki link]], a URL or a bare word there
+# declares sourcing the check cannot follow, and those entries used to be skipped in silence.
+# Measured 2026-09-28: 254 such entries, 185 of them naming a page that exists (mis-shaped but
+# still followed by a reader) and 69 resolving to nothing.  Only the second half is a FAIL line;
+# the first is a count, because a mis-shaped entry still carries the intent.
+# ---------------------------------------------------------------------------------------------
+
+
+def _page_with_sources_entry(name: str, entry: str) -> None:
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / name).write_text(
+        "---\n"
+        f"id: test_{name[:-3].lower()}\n"
+        f"title: {name[:-3]}\n"
+        "type: concept\n"
+        "domain: General\n"
+        "status: Active\n"
+        "epistemic-status: seed\n"
+        "categories: [Healthcare_IT]\n"
+        "updated: 2026-09-17\n"
+        f"sources: ['{entry}']\n"
+        "strategic_scope: core\n"
+        "---\n\n" + _BODY,
+        encoding="utf-8",
+    )
+
+
+def test_a_page_name_in_sources_is_counted_but_not_a_failure(isolated_memory):
+    """Naming an existing page is mis-shaped provenance, not unfollowable provenance."""
+    _page("Concept_Named-Source.md", [])
+    _page_with_sources_entry("Concept_Target-Page.md", "Concept_Named-Source.md")
+
+    section = _section(lint_vector_lake(), 17)
+
+    assert "are not raw/ paths" in section, section
+    assert "1 resolve to nothing" not in section, section
+
+
+def test_an_unfollowable_sources_entry_is_reported(isolated_memory):
+    _page_with_sources_entry("Concept_Bad-Entry.md", "CDSS")
+
+    section = _section(lint_vector_lake(), 17)
+
+    assert "[FAIL:" in section, section
+    assert "neither a raw/ path nor a page that exists" in section
+    assert "CDSS" in section
+
+
+def test_a_url_in_sources_is_reported_as_unfollowable(isolated_memory):
+    _page_with_sources_entry("Concept_Url-Entry.md", "https://example.invalid/spec")
+
+    section = _section(lint_vector_lake(), 17)
+
+    assert "neither a raw/ path nor a page that exists" in section
+    assert "https://example.invalid/spec" in section

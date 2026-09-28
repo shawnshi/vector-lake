@@ -962,6 +962,13 @@ def lint_vector_lake(auto_fix: bool = False):
     resolved_paths = 0
     corrupted_sources: list[tuple[str, str]] = []
     unresolved_sources: list[tuple[str, str]] = []
+    #: ``sources`` entries that are not ``raw/`` paths.  The field is a provenance declaration, so
+    #: an entry that is a page name, a ``[[wiki link]]``, a URL or a bare word declares something
+    #: the check below cannot verify -- which is why they used to be skipped in silence.  Measured
+    #: 2026-09-28: 255 such entries, 190 of them naming a page that exists and 65 naming nothing at
+    #: all.  The first kind still carries sourcing intent and is only mis-shaped; the second is a
+    #: claim of provenance that no reader can follow, so only that half is reported.
+    non_raw_sources: list[tuple[str, str]] = []
     for filename, data in parsed.items():
         declared = data["fm"].get("sources") or []
         if isinstance(declared, str):
@@ -971,6 +978,7 @@ def lint_vector_lake(auto_fix: bool = False):
             # name, not a file on disk, so existence is not a question it answers.
             ref = str(entry or "").strip().strip("'\"")
             if not ref.startswith("raw/"):
+                non_raw_sources.append((filename, ref))
                 continue
             checked_paths += 1
             if "?" in ref or "\ufffd" in ref:
@@ -1024,6 +1032,30 @@ def lint_vector_lake(auto_fix: bool = False):
             0,
             f"checked {checked_paths} declared raw path(s): {resolved_paths} resolve, "
             f"{len(unresolved_sources)} do not, {len(corrupted_sources)} corrupted in the page",
+        )
+
+    if non_raw_sources:
+        page_keys = {name[:-3] for name in parsed}
+
+        def names_an_existing_page(ref: str) -> bool:
+            token = ref.strip()
+            if token.startswith("[[") and token.endswith("]]"):
+                token = token[2:-2]
+            token = token.split("|")[0].strip().replace(".md", "")
+            return token in page_keys or token.startswith("raw/")
+
+        unverifiable = [
+            (filename, ref) for filename, ref in non_raw_sources if not names_an_existing_page(ref)
+        ]
+        for filename, ref in unverifiable:
+            issues["source_path"].append(
+                f"{filename}: sources entry is neither a raw/ path nor a page that exists, "
+                f"so the provenance it declares cannot be followed: {ref[:90]}"
+            )
+        source_path_summary.append(
+            f"    {len(non_raw_sources)} sources entr(ies) are not raw/ paths: "
+            f"{len(non_raw_sources) - len(unverifiable)} name a page that exists (mis-shaped, "
+            f"still followed by a reader), {len(unverifiable)} resolve to nothing"
         )
 
     check_names = {
