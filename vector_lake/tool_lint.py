@@ -973,7 +973,7 @@ def lint_vector_lake(auto_fix: bool = False):
     #: ``sources`` entries that are not ``raw/`` paths.  The field is a provenance declaration, so
     #: an entry that is a page name, a ``[[wiki link]]``, a URL or a bare word declares something
     #: the check below cannot verify -- which is why they used to be skipped in silence.  Measured
-    #: 2026-09-28: 255 such entries, 190 of them naming a page that exists and 65 naming nothing at
+    #: 2026-09-28: 65 such entries, 52 of them naming a page that exists and 13 naming nothing at
     #: all.  The first kind still carries sourcing intent and is only mis-shaped; the second is a
     #: claim of provenance that no reader can follow, so only that half is reported.
     non_raw_sources: list[tuple[str, str]] = []
