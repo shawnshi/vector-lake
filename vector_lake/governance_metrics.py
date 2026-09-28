@@ -178,6 +178,16 @@ def ambiguous_name_hazards(page_keys) -> list:
 
 
 def find_merge_candidates(limit: int = 20) -> list[dict]:
+    #: Pairs a reader already opened and decided are distinct entities.  The same ledger the
+    #: name-shape check reads: "these two names are not one entity" is one decision, and offering
+    #: the pair again every run is how a stable list stops carrying information.
+    #: Imported under a distinct name on purpose: this function already binds ``pair_key`` to a
+    #: ``"::"``-joined entity-id string further down, and a bare import would be shadowed by it.
+    from vector_lake.name_collision_ledger import accepted_pair_keys
+    from vector_lake.name_collision_ledger import pair_key as ledger_pair_key
+
+    decided_pairs = accepted_pair_keys()
+
     entities = list(governance_store.query_entities({"status!=": "Merged", "type!=": "system"})["items"].values())
     candidates = []
 
@@ -268,6 +278,12 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
             str(left.get("page_key") or left_canon_name or ""),
             str(right.get("page_key") or right_canon_name or ""),
         ):
+            continue
+
+        if ledger_pair_key(
+            str(left.get("page_key") or left_canon_name or ""),
+            str(right.get("page_key") or right_canon_name or ""),
+        ) in decided_pairs:
             continue
 
         domain = left_domain or right_domain or "General"
