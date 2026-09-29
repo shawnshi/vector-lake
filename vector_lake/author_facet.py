@@ -117,6 +117,35 @@ def _latest_canonical_names(prefixes: tuple[str, ...]) -> dict[str, str]:
     return {relative: canonical for relative, (canonical, _) in latest.items()}
 
 
+def _trace_derived_page_keys(prefixes: tuple[str, ...]) -> frozenset[str]:
+    """Pages whose own ``sources`` name a raw file the author wrote.
+
+    Why the trace and not only the ledger: the ledger maps a raw file to the *source page* it
+    produced, so a page **compiled from** that writing (``Concept_``/``Event_``/…) was never in the
+    set -- and those are exactly the pages that answer "师成关于 X 的观点".  Measured on the live lake
+    2026-09-30: **168 pages by the ledger, 893 by the trace**, and the compiled pages carry the raw
+    path directly (one hop, no graph walk).
+
+    Precision: ``json_extract(..., '$.sources')`` is tested rather than the whole document, because a
+    plain ``node_json LIKE`` scan matches one extra page that merely *mentions* the path in prose.
+    Any-of-the-sources is the rule, so a page compiled from the author's writing **and** someone
+    else's is attributed to him -- the facet's purpose is recall of his positions, and ``filter``
+    mode is the only place where that breadth is visible.
+    """
+    from vector_lake.db_store import get_connection
+
+    connection = get_connection()
+    keys: set[str] = set()
+    for prefix in prefixes:
+        rows = connection.execute(
+            "SELECT node_key FROM page_index_nodes"
+            " WHERE json_extract(node_json, '$.sources') LIKE ?",
+            (f"%{prefix}%",),
+        )
+        keys.update(str(row["node_key"]) for row in rows)
+    return frozenset(keys)
+
+
 def author_page_keys(*, refresh: bool = False) -> frozenset[str]:
     """Page keys (filenames without ``.md``) written by the author.
 
@@ -139,11 +168,24 @@ def author_page_keys(*, refresh: bool = False) -> frozenset[str]:
         ledger = connection.execute(
             "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM jobs"
         ).fetchone()
+        # The trace half depends on the projection, not on the ledger: a rebuild can rewrite a
+        # page's ``sources`` without any job moving, so the projection's own stamp is part of the
+        # key.  Its absence is not fatal -- the ledger half still works on a database that has no
+        # projection state yet -- so it is read defensively rather than through the outer guard.
+        try:
+            state = connection.execute(
+                "SELECT COALESCE(node_count, 0), COALESCE(updated_at, '')"
+                " FROM page_index_state WHERE singleton = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            state = None
         key = (
             str(connection.execute("PRAGMA database_list").fetchone()[2]),
             int(ledger[0]),
             str(ledger[1]),
             prefixes,
+            int(state[0]) if state else 0,
+            str(state[1]) if state else "",
         )
     except sqlite3.Error as exc:
         log.warning("Author facet unavailable (%s: %s); no author pages.", type(exc).__name__, exc)
@@ -159,6 +201,15 @@ def author_page_keys(*, refresh: bool = False) -> frozenset[str]:
     keys = frozenset(
         name[:-3] if name.endswith(".md") else name for name in names.values() if name
     )
+    try:
+        keys = keys | _trace_derived_page_keys(prefixes)
+    except sqlite3.Error as exc:
+        # An older database may have no ``page_index_nodes``; the ledger half still stands.
+        log.warning(
+            "Author trace unavailable (%s: %s); using the ledger mapping only.",
+            type(exc).__name__,
+            exc,
+        )
     with _lock:
         _cache[key] = keys
     return keys

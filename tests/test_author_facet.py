@@ -229,3 +229,109 @@ def test_the_marker_can_be_turned_off(lake_with_author_page, monkeypatch):
     _two_candidates(monkeypatch)
     context = tool_search.assemble_context(QUERY)
     assert "[author]" not in context["wiki_context"]
+
+
+# --- the trace half: pages compiled *from* the author's writing ---------------------------------
+#
+# The ledger names the source page a raw file produced, so a page compiled from that writing was
+# never in the set -- and the compiled pages are the ones that answer "关于他的观点".  Measured on the
+# live lake 2026-09-30: 168 pages by the ledger, 893 by the trace (728 of them compiled), which is
+# what moved the boost from lifting one page to reordering the top ten.
+
+
+def _add_sourced_nodes(**nodes):
+    """Add nodes carrying a ``sources`` list to the fixture lake, then rebuild the projection."""
+    index_path = get_index_path()
+    data = json.loads(index_path.read_text(encoding="utf-8"))
+    data["nodes"].update(nodes)
+    index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    for key, node in nodes.items():
+        (get_wiki_dir() / f"{key}.md").write_text(
+            f"# {node['title']}\n\n{node.get('summary', '')}\n", encoding="utf-8"
+        )
+    page_index_projection.reset_catalog_cache()
+    page_index_projection.refresh_page_index_projection(
+        json.loads(index_path.read_text(encoding="utf-8"))
+    )
+    author_facet.author_page_keys(refresh=True)
+
+
+def _compiled(key, title, source_path):
+    return key, {
+        "title": title,
+        "type": "concept",
+        "status": "Active",
+        "domain": "AI_Engineering",
+        "summary": "人工智能 观点 编译",
+        "sources": [source_path],
+    }
+
+
+def test_a_page_compiled_from_the_authors_writing_is_an_author_page(lake_with_author_page):
+    _add_sourced_nodes(
+        **dict([_compiled("Concept_内部编译", "内部编译", "raw/article/团队内参.md")]),
+        **dict([_compiled("Concept_转载编译", "转载编译", "raw/news/别人的文章.md")]),
+    )
+    keys = author_facet.author_page_keys(refresh=True)
+    assert "Concept_内部编译" in keys
+    assert "Concept_转载编译" not in keys, "someone else's sources must not confer authorship"
+
+
+def test_the_trace_survives_a_prefix_change(lake_with_author_page, monkeypatch):
+    _add_sourced_nodes(**dict([_compiled("Concept_转载编译", "转载编译", "raw/news/别人的文章.md")]))
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_SOURCES", "raw/news")
+    keys = author_facet.author_page_keys(refresh=True)
+    assert "Concept_转载编译" in keys, "the trace must follow the declared prefixes, not a fixed one"
+
+
+def test_the_boost_lifts_a_compiled_page_by_the_relative_amount(lake_with_author_page, monkeypatch):
+    """The behavioural half, pinned to the measured rule: lift = BOOST x pool top, capped there.
+
+    Measured on this two-page pool: the traced page sits at 0.0 and the third-party page at 0.6, so
+    boost=0.25 puts it at 0.15, 0.6 at 0.36, and 1.0 at exactly 0.60 -- a lifted page reaches the
+    pool top but never passes it.  A *flip* therefore cannot be asserted here (the minimum can only
+    tie at boost=1.0); the ordering benefit in a real pool is evidenced by the live A/B, where the
+    boost moved the top ten from one author page to ten.
+    """
+    _add_sourced_nodes(
+        **dict([_compiled("Concept_内部编译", "内部编译", "raw/article/团队内参.md")]),
+        **dict([_compiled("Concept_第三方编译", "第三方编译", "raw/news/别人的文章.md")]),
+    )
+
+    def scores():
+        monkeypatch.setattr(
+            tool_search,
+            "_get_fts_search_results",
+            # Rank order deliberately favours the third-party page, so the facet is what moves it.
+            lambda query, limit=50: [
+                {"node_key": "Concept_内部编译", "title": "内部编译", "summary": "人工智能 观点 编译", "rank": -19.9},
+                {"node_key": "Concept_第三方编译", "title": "第三方编译", "summary": "人工智能 观点 编译", "rank": -20.0},
+            ],
+        )
+        monkeypatch.setattr(tool_search, "_get_query_embedding", lambda q: ([], "no embedding provider"))
+        monkeypatch.setattr(tool_search, "_get_vector_search_results", lambda v, limit=50: ({}, None))
+        scored, _notes, _filtered = _search_scored_pages(QUERY, 5)
+        return {node["_key"]: score for score, node in scored}
+
+    monkeypatch.delenv("VECTOR_LAKE_AUTHOR_SOURCES", raising=False)
+
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_FACET", "off")
+    off = scores()
+    assert off["Concept_第三方编译"] > off["Concept_内部编译"], "off leaves the rank order alone"
+
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_FACET", "boost")
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_BOOST", "0.25")
+    boosted = scores()
+    pool_top = max(off.values())
+    assert boosted["Concept_内部编译"] == pytest.approx(off["Concept_内部编译"] + 0.25 * pool_top)
+    assert boosted["Concept_第三方编译"] == pytest.approx(off["Concept_第三方编译"]), (
+        "only author pages may move"
+    )
+
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_BOOST", "1.0")
+    capped = scores()
+    assert capped["Concept_内部编译"] == pytest.approx(pool_top), "the cap is the pool top"
+    assert capped["Concept_内部编译"] <= capped["Concept_第三方编译"] + 1e-9
+
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_FACET", "filter")
+    assert set(scores()) == {"Concept_内部编译"}, "filter must narrow to the traced page only"
