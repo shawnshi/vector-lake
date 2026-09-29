@@ -347,6 +347,16 @@ def lint_vector_lake(auto_fix: bool = False) -> str:
         return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
 
 @mcp.tool()
+def preview_query_context(query_str: str) -> str:
+    """Return an inline reasoning context without a proposal payload or Wiki write.
+
+    Retrieval may record an audit-ledger entry. For page proposals, use
+    ``query_logic_lake`` and finalize only after independent validation.
+    """
+    return tools.preview_query_context(query_str)
+
+
+@mcp.tool()
 def query_logic_lake(query_str: str, dry_run: bool = False) -> str:
     """Deep reasoning with budget-controlled context.
 

@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "vector-lake-mcp": {
+    "mentat-mind-mcp": {
       "command": "python",
       "args": [
         "-m",

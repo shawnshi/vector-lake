@@ -17,10 +17,11 @@ from vector_lake.tool_ingest import (
     list_ingest_tasks,
     prepare_ingest_batch,
 )
-from vector_lake.tool_query import prepare_query_context, finalize_query_synthesis
+from vector_lake.tool_query import prepare_query_context, preview_query_context, finalize_query_synthesis
 from vector_lake.tool_review import review_vector_lake
 from vector_lake.tool_search import assemble_context, search_vector_lake
 from vector_lake.tool_sync import sync_vector_lake
+from vector_lake.two_stage_index import rebuild_report as rebuild_two_stage_vector_index
 from vector_lake.tool_trace import trace_vector_lake
 from vector_lake.tool_timeline import (
     rebuild_timeline_events_from_claims,
@@ -75,10 +76,12 @@ __all__ = [
     "list_ingest_tasks",
     "prepare_ingest_batch",
     "prepare_query_context",
+    "preview_query_context",
     "canonical_backfill_missing_wiki",
     "embedding_backfill_projection",
     "projection_diff_report",
     "rebuild_index_projection",
+    "rebuild_two_stage_vector_index",
     "restore_missing_wiki_from_canonical",
     "research_vector_lake",
     "review_vector_lake",

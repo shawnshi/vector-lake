@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import functools
 import ast
 import operator
+from html import escape
 
 from vector_lake import governance_store, search_ledger
 from vector_lake import author_facet
@@ -26,6 +27,21 @@ except ImportError:
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+_PPR_INDEX: dict = {"generation": None, "index": None}
+
+
+def _ppr_index(adj, generation: int):
+    """The prepared PPR index for this graph generation, built at most once per graph.
+
+    Keyed on the projection's generation, not on ``id(adj)``: a freed dict can be replaced by a new
+    one at the same address, which would serve a stale index for a changed graph -- silently, since
+    the result would still look like a valid ranking.
+    """
+    if _PPR_INDEX["generation"] != generation or _PPR_INDEX["index"] is None:
+        _PPR_INDEX["index"] = vector_lake_core.PprIndex(adj)
+        _PPR_INDEX["generation"] = generation
+    return _PPR_INDEX["index"]
 log = logging.getLogger("vector-lake-tool-search")
 
 BUDGET_SHARES = {
@@ -240,22 +256,31 @@ def _passes_filters(node: dict, domain: str | None, cluster: str | None, include
 # long-lived server cannot grow without limit; vectors are stored as float32
 # because that is what the vector projection consumes anyway.
 QUERY_EMBEDDING_CACHE_SIZE = 256
-_QUERY_EMBEDDING_CACHE: "OrderedDict[str, array]" = OrderedDict()
+_QUERY_EMBEDDING_CACHE: "OrderedDict[tuple[str, int, str], array]" = OrderedDict()
 _QUERY_EMBEDDING_CACHE_LOCK = threading.Lock()
 
 
+def _embedding_cache_key(query: str) -> tuple[str, int, str]:
+    from vector_lake.embedding_scheduler import load_embedding_rate_config
+
+    config = load_embedding_rate_config()
+    return config.model, config.dimension, query
+
+
 def _cached_query_embedding(query: str):
+    key = _embedding_cache_key(query)
     with _QUERY_EMBEDDING_CACHE_LOCK:
-        cached = _QUERY_EMBEDDING_CACHE.get(query)
+        cached = _QUERY_EMBEDDING_CACHE.get(key)
         if cached is not None:
-            _QUERY_EMBEDDING_CACHE.move_to_end(query)
+            _QUERY_EMBEDDING_CACHE.move_to_end(key)
         return cached
 
 
 def _store_query_embedding(query: str, values) -> None:
+    key = _embedding_cache_key(query)
     with _QUERY_EMBEDDING_CACHE_LOCK:
-        _QUERY_EMBEDDING_CACHE[query] = array("f", values)
-        _QUERY_EMBEDDING_CACHE.move_to_end(query)
+        _QUERY_EMBEDDING_CACHE[key] = array("f", values)
+        _QUERY_EMBEDDING_CACHE.move_to_end(key)
         while len(_QUERY_EMBEDDING_CACHE) > QUERY_EMBEDDING_CACHE_SIZE:
             _QUERY_EMBEDDING_CACHE.popitem(last=False)
 
@@ -284,6 +309,28 @@ def _get_query_embedding(query: str) -> tuple[list[float], str | None]:
         return [], f"{type(e).__name__}: {e}"
 
 
+def _vector_projection_error() -> str | None:
+    """Do not compare vectors made by different encoders or dimensionalities."""
+    if not os.environ.get("GEMINI_API_KEY"):
+        return None
+    try:
+        from vector_lake import db_store
+        from vector_lake.embedding_scheduler import load_embedding_rate_config
+
+        state = db_store.embedding_projection_state()
+        if not state:
+            return ("embedding projection model is unverified; rebuild vectors"
+                    if db_store.count_embeddings() else None)
+        config = load_embedding_rate_config()
+        if state.get("model") != config.model or state.get("dimension") != config.dimension:
+            return (f"embedding projection model/dimension mismatch: stored "
+                    f"{state.get('model')}/{state.get('dimension')}, "
+                    f"query {config.model}/{config.dimension}; rebuild vectors")
+    except Exception as exc:
+        return f"embedding projection check failed ({type(exc).__name__}: {exc})"
+    return None
+
+
 def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tuple[dict[str, float], str | None]:
     """Vector hits plus an explicit degradation reason when the query failed."""
     try:
@@ -291,22 +338,34 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
         import sqlite_vec
         conn = get_connection()
         query_blob = sqlite_vec.serialize_float32(query_vector)
-        # Using match because it's fast. It returns L2 distance.
-        # Cosine similarity for normalized vectors: 1 - L2^2 / 2
-        cursor = conn.execute(
-            "SELECT page_key, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (query_blob, limit)
-        )
+        # Two-stage path (binary prefilter + exact rerank) replaces the brute-force scan; it is
+        # used only when its shadow index reports itself consistent, so a missing or drifted
+        # shadow degrades to the scan below instead of answering from stale vectors.
+        from vector_lake import two_stage_index
+        state = None if two_stage_index.mode() == "legacy" else two_stage_index.status(conn)
+        if state is not None:
+            scored = two_stage_index.search(conn, query_blob, limit, state=state)
+        else:
+            if two_stage_index.mode() == "two_stage":
+                log.warning(
+                    "VECTOR_LAKE_VECTOR_INDEX=two_stage but the shadow index is unavailable;"
+                    " using the legacy brute-force scan."
+                )
+            # Using match because it's fast. It returns L2 distance.
+            # Cosine similarity for normalized vectors: 1 - L2^2 / 2
+            cursor = conn.execute(
+                "SELECT page_key, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                (query_blob, limit)
+            )
+            scored = [(row["page_key"], row["distance"]) for row in cursor.fetchall()]
 
         results = {}
-        for row in cursor.fetchall():
+        for page_key, dist in scored:
             # ``vec_embeddings.page_key`` holds a **page key** (the writer passes ``node_key``, and
             # ``db_store`` deletes by the same name), not ``entities.entity_id``.  The column name is
             # a trap: a join to ``entities.entity_id`` returns nothing, silently.  The FTS path keys
             # by ``node_key`` too, so the two remain in one namespace and the fusion cannot mix them.
-            page_key = row["page_key"]
             # distance is L2. convert to approx sim: 1 - (dist^2)/2
-            dist = row["distance"]
             sim = 1.0 - (dist * dist) / 2.0
             if sim > VECTOR_MIN_COSINE:
                 results[page_key] = sim
@@ -314,6 +373,77 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
     except Exception as e:
         log.warning(f"Failed to query vec_embeddings: {e}")
         return {}, f"vec_embeddings query failed: {type(e).__name__}: {e}"
+
+def _metadata_first_enabled() -> bool:
+    """Whether a filtered query rejects on metadata before paying for the exact rerank.
+
+    On by default because it is where most of a filtered query's cost was: the rerank stage fell
+    from 38.2 ms to 2.6 ms (p50, 36 measured cells) and p95 total from 483.5 ms to 288.9 ms.  It can
+    change *which* eligible page fills a slot -- the candidate pool is the binary shortlist rather
+    than the exact top-N, so 30 of 36 measured cells kept the legacy order with mean top-5 overlap
+    0.97, and the other 6 got better-ranked eligible pages.  The switch exists so an operator who
+    wants the old ordering back does not need a code change.
+    """
+    return os.environ.get("VECTOR_LAKE_METADATA_FIRST", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+
+
+def _get_vector_search_results_filtered(
+    query_vector: list[float],
+    limit: int,
+    catalog,
+    domain: str | None,
+    cluster: str | None,
+    include_history: bool,
+    filter_expr: str | None,
+) -> tuple[dict[str, float] | None, str | None, int]:
+    """Vector hits that already satisfy the selectors, plus how many candidates were examined.
+
+    The order of operations is the whole point.  The binary shortlist is cheap (a 2.75 MB Hamming
+    index), the metadata verdict is cheap, and the exact L2 rerank is the expensive stage -- so the
+    rerank runs only on pages that can actually appear in the answer.  The legacy order reranked
+    every candidate and then threw most of them away on metadata, which is why a filtered query cost
+    several times an unfiltered one and why the widening loop dominated its latency.
+
+    ``results is None`` means the shadow index is unavailable and the caller must use the plain arm.
+    The third value is the **raw shortlist size**, never the number of survivors: a caller that
+    widens when "the source ran out" must not read a heavy filter as an exhausted corpus.
+    """
+    try:
+        from vector_lake.db_store import get_connection
+        import sqlite_vec
+        from vector_lake import two_stage_index
+
+        conn = get_connection()
+        state = two_stage_index.status(conn)
+        if state is None:
+            return None, None, 0
+        query_blob = sqlite_vec.serialize_float32(query_vector)
+        # Exactly what the caller asked for, with no floor.  The widening loop *is* the depth
+        # mechanism: a floor of the recorded shortlist made its first four steps (25/50/100/200)
+        # examine the same 256 candidates four times, and it also returned pages drawn from a deeper
+        # pool than the step the loop had asked about.  Both are avoidable, and neither buys recall
+        # the loop cannot buy by widening.
+        depth = max(1, int(limit))
+        keys = two_stage_index.shortlist_keys(conn, query_blob, depth, state=state)
+        nodes = catalog.nodes_by_key(keys)
+        eligible = [
+            key
+            for key in keys
+            if key in nodes
+            and _passes_filters(nodes[key], domain, cluster, include_history, filter_expr)
+        ]
+        results: dict[str, float] = {}
+        for key, dist in two_stage_index.rerank_keys(conn, query_blob, eligible, limit):
+            sim = 1.0 - (dist * dist) / 2.0
+            if sim > VECTOR_MIN_COSINE:
+                results[key] = sim
+        return results, None, len(keys)
+    except Exception as e:
+        log.warning(f"Failed to run the metadata-first vector arm: {e}")
+        return None, f"vector arm failed: {type(e).__name__}: {e}", 0
+
 
 _LAST_FTS_ERROR = threading.local()
 _LAST_MEMORY_VIEWS = threading.local()
@@ -916,6 +1046,55 @@ def _safe_eval(expr: str, context: dict) -> bool:
         return False
 
 
+MAX_FILTERED_RECALL_CANDIDATES = 4096
+
+
+def _filtered_recall(fetch, catalog, depth: int, domain, cluster, include_history, filter_expr, *, raw_count=None):
+    """Widen a ranked source until its first ``depth`` eligible pages are known.
+
+    Applying the filter to the first N *unfiltered* hits loses valid pages; widening preserves
+    ranked order without changing the unfiltered retrieval path.  A fetch may already be
+    metadata-aware (see ``_get_vector_search_results_filtered``), in which case ``raw_count``
+    reports how many candidates it examined -- the source is only exhausted when the *raw* list came
+    back shorter than requested, not when a filter rejected most of it.
+    """
+    limit = min(depth, MAX_FILTERED_RECALL_CANDIDATES)
+    while True:
+        rows, error = fetch(limit)
+        keys = list(rows) if isinstance(rows, dict) else [row["node_key"] for row in rows]
+        nodes = catalog.nodes_by_key(keys)
+        eligible = {
+            key for key in keys
+            if key in nodes and _passes_filters(
+                nodes[key], domain, cluster, include_history, filter_expr
+            )
+        }
+        if isinstance(rows, dict):
+            selected = {key: value for key, value in rows.items() if key in eligible}
+        else:
+            selected = [row for row in rows if row["node_key"] in eligible]
+        examined = raw_count() if raw_count else None
+        if examined is None:
+            examined = len(keys)
+        complete = len(selected) >= depth or examined < limit
+        capped = limit >= MAX_FILTERED_RECALL_CANDIDATES and not complete
+        if error or complete or capped:
+            if capped:
+                note = (f"filtered recall cap ({MAX_FILTERED_RECALL_CANDIDATES}) reached; "
+                        "results may be incomplete")
+            elif not error and not selected and keys:
+                # The source did match; the selectors removed every candidate. Reporting this as
+                # "no stored vectors matched" sent the reader to ``embedding-backfill``, which
+                # cannot repair a filter. Name the stage that actually decided.
+                note = (f"{len(keys)} ranked candidate(s) matched but none passed the "
+                        "domain/cluster/history/filter selectors")
+            else:
+                note = None
+            return (dict(list(selected.items())[:depth]) if isinstance(selected, dict)
+                    else selected[:depth]), error, note
+        limit = min(limit * 2, MAX_FILTERED_RECALL_CANDIDATES)
+
+
 def _search_scored_pages(
     query: str,
     top_k: int,
@@ -998,8 +1177,20 @@ def _search_scored_pages(
     try:
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
-        fts_results = _get_fts_search_results(expanded_query, limit=_candidate_depth())
-        fts_error = getattr(_LAST_FTS_ERROR, "msg", None)
+        if domain or cluster or filter_expr or not include_history:
+            def fetch_fts(limit):
+                rows = _get_fts_search_results(expanded_query, limit=limit)
+                return rows, getattr(_LAST_FTS_ERROR, "msg", None)
+
+            fts_results, fts_error, fts_note = _filtered_recall(
+                fetch_fts, catalog, _candidate_depth(), domain, cluster,
+                include_history, filter_expr,
+            )
+            if fts_note:
+                vector_notes.append(f"FTS: {fts_note}")
+        else:
+            fts_results = _get_fts_search_results(expanded_query, limit=_candidate_depth())
+            fts_error = getattr(_LAST_FTS_ERROR, "msg", None)
         if fts_error:
             vector_notes.append(fts_error)
             if hasattr(catalog, "_nodes") and isinstance(catalog._nodes, dict):
@@ -1037,12 +1228,42 @@ def _search_scored_pages(
 
     # 2. Vector Search (Hybrid blending)
     vector_ranked: list[str] = []
-    query_vector, embedding_error = _get_query_embedding(query)
+    projection_error = _vector_projection_error()
+    query_vector, embedding_error = ([], projection_error) if projection_error else _get_query_embedding(query)
     if query_vector:
-        vector_results, vector_error = _get_vector_search_results(query_vector, limit=_candidate_depth())
+        vector_note = None
+        if domain or cluster or filter_expr or not include_history:
+            # Metadata-first arm: reject on metadata before paying for the exact rerank.  The
+            # fallback to the plain arm (shadow index unavailable, or the switch off) keeps the old
+            # cost and ordering profile rather than losing filtered recall.
+            examined = {"raw": None}
+
+            def _fetch(limit, _examined=examined):
+                rows, error, raw = (
+                    _get_vector_search_results_filtered(
+                        query_vector, limit, catalog, domain, cluster, include_history, filter_expr
+                    )
+                    if _metadata_first_enabled()
+                    else (None, None, 0)
+                )
+                if rows is None:
+                    _examined["raw"] = None
+                    return _get_vector_search_results(query_vector, limit=limit)
+                _examined["raw"] = raw
+                return rows, error
+
+            vector_results, vector_error, vector_note = _filtered_recall(
+                _fetch,
+                catalog, _candidate_depth(), domain, cluster, include_history, filter_expr,
+                raw_count=lambda: examined["raw"],
+            )
+            if vector_note:
+                vector_notes.append(f"vector: {vector_note}")
+        else:
+            vector_results, vector_error = _get_vector_search_results(query_vector, limit=_candidate_depth())
         if vector_error:
             vector_notes.append(vector_error)
-        elif not vector_results:
+        elif not vector_results and not vector_note:
             vector_notes.append(
                 "no stored vectors matched; run `embedding-backfill --apply` to (re)build the vector projection"
             )
@@ -1095,9 +1316,18 @@ def _search_scored_pages(
         existing_keys = {node["_key"] for _, node in scored}
         expansion_limit = 12 if intent == "entity" else 5
 
-        if HAVE_CORE:
+        if HAVE_CORE and hasattr(vector_lake_core, "prepared_personalized_pagerank"):
+            # The same walk on a prebuilt index.  Measured 31.9 -> 1.5 ms per query (20.7x) and
+            # verified bit-identical on 16 edge cases plus the live graph: the legacy call pays for
+            # moving the 39 382-edge dict into Rust and cloning ~150k strings per call, which the
+            # index does once (27.9 ms) per graph generation.
+            from vector_lake import page_index_projection as _pip
+
+            sorted_ppr = vector_lake_core.prepared_personalized_pagerank(
+                _ppr_index(adj, _pip.adjacency_generation()), list(seed_keys), 0.85, 2
+            )
+        elif HAVE_CORE:
             sorted_ppr = vector_lake_core.fast_personalized_pagerank(adj, list(seed_keys), 0.85, 2)
-            sorted_expansions = [(k, v) for k, v in sorted_ppr if k not in existing_keys]
         else:
             alpha = 0.85
             restart_mass = (1 - alpha) / len(top_keys)
@@ -1120,6 +1350,8 @@ def _search_scored_pages(
                 key=lambda x: x[1], 
                 reverse=True
             )
+        if HAVE_CORE:
+            sorted_expansions = [(k, v) for k, v in sorted_ppr if k not in existing_keys]
 
         expansion_keys = [key for key, _ in sorted_expansions[:expansion_limit]]
         expanded_nodes = catalog.nodes_by_key(expansion_keys)
@@ -1247,6 +1479,44 @@ def _search_scored_pages(
     return final_scored, vector_notes, None
 
 
+def _relevant_excerpt(content: str, query: str, limit: int = 2500) -> tuple[str, str]:
+    """Select a query-bearing section/window and return a stable page-line locator."""
+    frontmatter = re.match(r"\A---\s*\n.*?\n---\s*\n", content, re.DOTALL)
+    offset = frontmatter.end() if frontmatter else 0
+    body = content[offset:]
+    if not body:
+        return "", "L1"
+    headings = list(re.finditer(r"(?m)^(#{1,6})\s+(.+)$", body))
+    sections = []
+    path: list[str] = []
+    for index, heading in enumerate(headings):
+        level = len(heading.group(1))
+        path = path[:level - 1] + [heading.group(2).strip()]
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+        sections.append((heading.start(), end, " > ".join(path)))
+    if not sections or sections[0][0] > 0:
+        sections.insert(0, (0, sections[0][0] if sections else len(body), ""))
+    terms = set(re.findall(r"[a-zA-Z0-9]{2,}|[\u4e00-\u9fff]{2,}", query.lower()))
+    terms.update(
+        term[i:i + 2] for term in tuple(terms) if CJK_REGEX.search(term)
+        for i in range(len(term) - 1)
+    )
+    phrase = query.strip().lower()
+    best = (-1, 0, 0, "")
+    for start, end, heading in sections:
+        for position in range(start, end, max(1, limit // 2)):
+            segment = body[position:min(end, position + limit)]
+            lower = segment.lower()
+            score = (10 if phrase and phrase in lower else 0) + sum(
+                len(term) * lower.count(term) for term in terms
+            )
+            if score > best[0]:
+                best = (score, position, min(end, position + limit), heading)
+    _, start, end, heading = best
+    line = content.count("\n", 0, offset + start) + 1
+    return body[start:end].strip(), f"L{line}" + (f" ({heading})" if heading else "")
+
+
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
@@ -1274,11 +1544,11 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     for index, (score, node) in enumerate(final_scored):
         filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
         snippet = ""
+        locator = "summary"
         if os.path.exists(filepath):
             try:
                 with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                    content = handle.read()
-                snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:2500]
+                    snippet, locator = _relevant_excerpt(handle.read(), query)
             except OSError:
                 snippet = str(node.get("summary") or "")
         else:
@@ -1292,9 +1562,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 tension_info += f"    -> {te.get('target')} (Polarity: {te.get('polarity')}, Intensity: {te.get('intensity')}): {te.get('context')}\n"
                 
         if as_xml:
-            result += f"<Evidence_Node ID='Wiki_{index}' Source='{node['_key']}.md'>\n{tension_info}{snippet}\n</Evidence_Node>\n"
+            result += (f"<Evidence_Node ID='Wiki_{index}' "
+                       f"Source='{escape(node['_key'], quote=True)}.md' "
+                       f"Locator='{escape(locator, quote=True)}'>\n"
+                       f"{escape(tension_info + snippet)}\n</Evidence_Node>\n")
         else:
-            result += f"- **{node.get('title', node['_key'])}** (score: {score:.3f})\n{tension_info}  {snippet}...\n\n"
+            result += f"- **{node.get('title', node['_key'])}** (score: {score:.3f}) [source: {node['_key']}.md:{locator}]\n{tension_info}  {snippet}...\n\n"
     return result
 
 
@@ -1380,16 +1653,17 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         key = node["_key"]
         filepath = os.path.join(wiki_dir, f"{key}.md")
         snippet = ""
+        locator = "summary"
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                snippet = re.sub(r"^---.*?---\s*", "", handle.read(), flags=re.DOTALL)[:2500]
+                snippet, locator = _relevant_excerpt(handle.read(), query)
         except OSError:
-            snippet = ""
+            snippet = str(node.get("summary") or "")[:2500]
         # An authorship marker, never a filter: the reader can tell the author's own writing from
         # writing about him, which no amount of page text says (131 of 149 author pages never name
         # him).  It does not change which pages are retrieved.
         marker = " `[author]`" if key in author_keys else ""
-        block = f"- **{node.get('title', key)}**{marker} (score: {score:.3f})\n  {snippet}\n\n"
+        block = f"- **{node.get('title', key)}**{marker} (score: {score:.3f}; source: {key}.md:{locator})\n  {snippet}\n\n"
         if wiki_used + len(block) > wiki_budget:
             break
         wiki_blocks.append(block)

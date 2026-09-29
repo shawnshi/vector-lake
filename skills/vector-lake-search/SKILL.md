@@ -33,7 +33,7 @@ description: 'Search the Vector Lake index for knowledge graph nodes and entitie
   </workflow>
 
   <tool_dispatch>
-    - `vector-lake-mcp`: `search_vector_lake` to query the index.
+    - `mentat-mind-mcp`: `search_vector_lake` to query the index.
     - `invoke_subagent`: Mandated for concurrent tasks if the search intent is complex.
   </tool_dispatch>
 

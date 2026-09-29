@@ -26,14 +26,14 @@ triggers: When the user wants to perform deep reasoning or query the Logic Lake
 <execution_workflow>
   <workflow>
     1. Parse the user's query intent and formulate the reasoning query string.
-    2. Invoke the `query_logic_lake` MCP tool from the `vector-lake-mcp` server, providing the `query_str` parameter.
+    2. Invoke the `query_logic_lake` MCP tool from the `mentat-mind-mcp` server, providing the `query_str` parameter.
     3. Process the returned insights and logic chains.
     4. Store intermediate logic and scratch data in `scratch/` for Sandbox Isolation if needed.
     5. Fable 5 Checkpoint: Review the reasoning context and extracted insights before finalizing the response.
   </workflow>
 
   <tool_dispatch>
-    - vector-lake-mcp (Tool: query_logic_lake): For deep reasoning over the Logic Lake.
+    - mentat-mind-mcp (Tool: query_logic_lake): For deep reasoning over the Logic Lake.
     - invoke_subagent: For concurrent tasks if complex reasoning requires multiple agents.
   </tool_dispatch>
 

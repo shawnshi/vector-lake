@@ -34,6 +34,8 @@ fn vector_lake_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // 模块 3: 图遍历与召回融合
     m.add_function(wrap_pyfunction!(graph_fusion::fast_personalized_pagerank, m)?)?;
+    m.add_class::<graph_fusion::PprIndex>()?;
+    m.add_function(wrap_pyfunction!(graph_fusion::prepared_personalized_pagerank, m)?)?;
     m.add_function(wrap_pyfunction!(graph_fusion::fast_reciprocal_rank_fusion, m)?)?;
 
     // 模块 4: 图拓扑加权边计算

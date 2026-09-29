@@ -183,3 +183,44 @@ def test_the_threshold_is_not_a_read_path_cap(isolated_memory, monkeypatch):
     assert memory_gram_index._projection_doc_count(db_store.get_connection()) > 1
     assert "Rebuilt the memory gram index" in memory_gram_index.maybe_rebuild_memory_gram_index()
     assert memory_gram_index.gram_index_usable() is True
+
+
+def test_interactive_latency_trigger_is_off_by_default(isolated_memory, monkeypatch):
+    monkeypatch.delenv("VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES", raising=False)
+    monkeypatch.setattr(memory_gram_index, "REBUILD_AFTER_WRITES", 50)
+    _write(50)
+    _build()
+    _write(2, start=100)
+
+    # Two dirty documents: the read path is off, and by default nothing is scheduled to fix it.
+    assert memory_gram_index.gram_index_usable() is False
+    assert memory_gram_index.rebuild_due() is False
+    assert memory_gram_index.latency_rebuild_after_searches() == 0
+
+
+def test_interactive_latency_trigger_fires_on_search_count(isolated_memory, monkeypatch):
+    monkeypatch.setattr(memory_gram_index, "REBUILD_AFTER_WRITES", 50)
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES", "3")
+    _write(50)
+    _build()
+    _write(2, start=100)
+
+    monkeypatch.setattr(memory_gram_index, "_searches_since_last_rebuild", lambda: 2)
+    assert memory_gram_index.rebuild_due() is False, "below the interactive bar"
+
+    monkeypatch.setattr(memory_gram_index, "_searches_since_last_rebuild", lambda: 3)
+    assert memory_gram_index.rebuild_due() is True
+    reason = memory_gram_index.rebuild_due_reason()
+    assert "interactive bar 3" in reason
+    assert "projected scan" in reason
+
+
+def test_interactive_trigger_never_fires_without_dirt(isolated_memory, monkeypatch):
+    """A clean base must not be rebuilt just because searches happened."""
+    monkeypatch.setattr(memory_gram_index, "REBUILD_AFTER_WRITES", 50)
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES", "1")
+    _write(50)
+    _build()
+
+    monkeypatch.setattr(memory_gram_index, "_searches_since_last_rebuild", lambda: 999)
+    assert memory_gram_index.rebuild_due() is False

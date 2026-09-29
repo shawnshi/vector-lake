@@ -103,6 +103,10 @@ Usage Examples:
     index_rebuild_parser = subparsers.add_parser("projection-rebuild-index", help="[MAINTENANCE] Rebuild index projection from canonical SQLite.")
     index_rebuild_parser.add_argument("--apply", action="store_true", help="Persist rebuilt index projection. Defaults to dry-run.")
 
+    vector_index_parser = subparsers.add_parser("vector-index-rebuild", help="[MAINTENANCE] Rebuild the two-stage vector shadow index (binary prefilter + exact rerank).")
+    vector_index_parser.add_argument("--apply", action="store_true", help="Persist the rebuild. Defaults to dry-run.")
+    vector_index_parser.add_argument("--shortlist", type=int, default=None, help="Binary shortlist depth before the exact rerank (default: module default).")
+
     embedding_backfill_parser = subparsers.add_parser("embedding-backfill", help="[MAINTENANCE] Backfill missing vector embeddings under rate limits.")
     embedding_backfill_parser.add_argument("--apply", action="store_true", help="Persist embeddings. Defaults to dry-run.")
     embedding_backfill_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of nodes to embed.")
@@ -311,6 +315,12 @@ def main() -> int:
             ))
         elif args.command == "projection-rebuild-index":
             print(tools.rebuild_index_projection(dry_run=not getattr(args, "apply", False)))
+        elif args.command == "vector-index-rebuild":
+            from vector_lake.two_stage_index import DEFAULT_SHORTLIST
+            print(tools.rebuild_two_stage_vector_index(
+                dry_run=not getattr(args, "apply", False),
+                shortlist=getattr(args, "shortlist", None) or DEFAULT_SHORTLIST,
+            ))
         elif args.command == "embedding-backfill":
             print(tools.embedding_backfill_projection(
                 dry_run=not getattr(args, "apply", False),

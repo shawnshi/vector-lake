@@ -7,6 +7,9 @@ from vector_lake import mcp_server
 
 ROOT = Path(__file__).resolve().parents[1]
 
+#: The published MCP server key, shared by both host manifests and the README example.
+EXPECTED_MCP_SERVER = "mentat-mind-mcp"
+
 
 def test_query_and_timeline_mcp_tools_are_registered():
     """The two capabilities the old compat layer mapped to must still exist."""
@@ -60,6 +63,12 @@ def test_host_mcp_manifests_are_identical():
     ``.mcp.json`` is canonical and ``mcp_config.json`` is a byte-identical
     mirror for the other host convention.  They are not produced by a generator
     script, so this test is the only thing preventing silent drift.
+
+    The published server name is pinned here *and* cross-checked against the README, because the
+    2026-09 rename (``vector-lake-mcp`` -> ``mentat-mind-mcp``) landed in the manifests and the
+    README but left this assertion behind: the guard then failed on the new name instead of
+    catching a rename that only reached one surface.  A name is published in three places, so the
+    assertion has to look at all three.
     """
     canonical = (ROOT / ".mcp.json").read_bytes()
     assert (ROOT / "mcp_config.json").read_bytes() == canonical, (
@@ -67,10 +76,26 @@ def test_host_mcp_manifests_are_identical():
     )
 
     servers = json.loads(canonical)["mcpServers"]
-    assert set(servers) == {"vector-lake-mcp"}
-    entry = servers["vector-lake-mcp"]
+    assert set(servers) == {EXPECTED_MCP_SERVER}, (
+        f"the host manifests must publish exactly {EXPECTED_MCP_SERVER!r}, got {sorted(servers)}"
+    )
+    entry = servers[EXPECTED_MCP_SERVER]
     assert entry["args"] == ["-m", "vector_lake.mcp_server"]
     assert entry["env"]["PYTHONPATH"] == "."
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f'"{EXPECTED_MCP_SERVER}"' in readme, (
+        f"README must document the published MCP server name {EXPECTED_MCP_SERVER!r}"
+    )
+    stale = "vector-lake-mcp"
+    stale_files = [
+        str(path.relative_to(ROOT))
+        for path in list(ROOT.glob("skills/*/SKILL.md"))
+        if stale in path.read_text(encoding="utf-8")
+    ]
+    assert stale_files == [], (
+        f"these shipped skills still call the MCP server {stale!r}: {stale_files}"
+    )
 
 
 def test_no_slash_command_compat_layer_ships():
@@ -96,10 +121,11 @@ def test_no_slash_command_compat_layer_ships():
 
 
 def test_mcp_server_registers_its_tool_surface():
-    """The server must register exactly the 18 core tools."""
+    """The server registers the inline preview alongside its proposal tools."""
     names = mcp_server.registered_tool_names(mcp_server.mcp)
 
-    assert len(names) == 18, f"expected exactly 18 core tools, got {len(names)}: {names}"
+    assert len(names) == 19, f"expected exactly 19 core tools, got {len(names)}: {names}"
+    assert "preview_query_context" in names
     assert "search_vector_lake" in names
     assert "query_logic_lake" in names
     assert "doctor_vector_lake" in names

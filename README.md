@@ -27,7 +27,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 |删除类命令默认演练|`gc` / `delete` 默认 dry-run，必须 `--apply` 才落盘|保持默认；仅在确认 dry-run 输出后追加 `--apply`|
 |修复类工具需要后置重建|`wiki-restore` 会恢复 Markdown，但索引投影需单独重建|按其输出末尾提示运行 `projection-rebuild-index --apply`|
 |全量重建成本随语料线性增长|冷启动需对全部正文分词（5000 页约 100 秒）；未变更节点会被跳过|仅在有结构变更时全量重建；日常依赖增量更新|
-|检索成本几乎全在向量臂，且随语料线性|7,164 页实例上单查询热态中位 **210 ms**，其中向量臂 **167 ms（80%）**、Phase-2 重排 6 ms、FTS 臂 2 ms（2026-09-24 审计实测）。`vec\_embeddings` 走 sqlite-vec 的 `vec0`，是 C 实现的**线性** KNN、没有 ANN 索引，按此比例 10 万页约 **2.3 s**（**线性外推，未实测**）|语料再大一个量级时给向量臂换 ANN 索引（HNSW/IVF）或降维；当前规模下无需处理|
+|检索成本已从向量臂转到 PPR，且不再随语料线性|7,166 页实例上本地检索热态 **p50 58.5 ms**（2026-09-29 重测）：**PPR 随机游走 ~34 ms（约 59%）**、向量臂 **~15 ms**、FTS 臂 2 ms、两阶段自检 2.5 ms。同日全链路 `_search_scored_pages` p50 59.5 ms、向量臂单独 p50 12.2 ms（短名单 256，top-10 与旧路径 **400/400 完全一致**）。旧的“中位 210 ms / 向量臂 167 ms（80%）”与“10 万页线性外推 ~2.3 s”**已作废**：向量臂改为二值预筛（3072 维 → 2.75 MB）+ 按 rowid 精排，扫描量不再与 float32 全量成正比|如需继续压：PPR 是当前单项最大成本，根治需在 Rust 侧提供“预构建图 + 多次查询”接口（现无此 API，每次调用自建内部结构，单次 ~34 ms）；退而求其次的方案（子图限制、缓存同种子结果）会改变或仅局部命中，尚未采用|
 |人工编辑会经过校验|未通过 schema / 目的契约校验的手改页面会被拒绝并保留原文件，日志给出原因|修复页面后重新保存，或查看守护进程状态文件的 `current\_action`|
 
 ## Architecture
@@ -172,14 +172,14 @@ python cli.py doctor
 
 ### 5\. 宿主 Agent 接入 (MCP Client Configuration)
 
-Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 18 个核心认知与知识工具。
+Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 19 个核心认知与知识工具。
 
 **在客户端配置文件（如 `claude\_desktop\_config.json` 或 `.mcp.json`）中添加：**
 
 ```json
 {
   "mcpServers": {
-    "vector-lake-mcp": {
+    "mentat-mind-mcp": {
       "command": "python",
       "args": \[
         "-m",
@@ -308,7 +308,7 @@ MEMORY/
 
 > \*\*MCP 是主接口\*\*：Agent 直接调用 `vector\_lake/mcp\_server.py` 注册的工具，不经过终端模拟。本仓库\*\*不随附\*\*任何 slash command 兼容层（`commands/` 目录已不存在）；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
 >
-> 为避免上下文膨胀并防止 Agent 误触全库重建或并发破坏性运维命令，MCP 接口物理精简为 \*\*18 个核心业务工具\*\*（由 `doctor` 校验与 `test\_command\_surface.py` 严格守护），其余 29 个灾难恢复、内部调度与维护端点完整收敛至 `cli.py`：
+> 为避免上下文膨胀并防止 Agent 误触全库重建或并发破坏性运维命令，MCP 接口物理精简为 \*\*19 个核心业务工具\*\*（由 `doctor` 校验与 `test\_command\_surface.py` 严格守护：新工具加在 `preview_query_context` 上，计数 18→19），其余 29 个灾难恢复、内部调度与维护端点完整收敛至 `cli.py`：
 
 |职责分类|工具|说明|
 |-|-|-|
@@ -406,6 +406,9 @@ python cli.py timeline-rebuild --apply
 python cli.py timeline-repair
 python cli.py timeline-repair --apply
 python cli.py projection-rebuild-index --apply
+# 向量影子索引（二值预筛 + 全精度精排）：投影/维度变更后 status 会停用它，重建一次即恢复。
+python cli.py vector-index-rebuild
+python cli.py vector-index-rebuild --apply --shortlist 256
 python cli.py embedding-backfill --limit 200
 python cli.py embedding-backfill --apply --limit 200
 python cli.py wiki-restore --apply --limit 10
@@ -530,6 +533,9 @@ frontmatter 上，被写入门以 schema/YAML 错误拒绝（未造成破坏）�
 **判定：默认保持 `0`。** 注册口径为 r3 标注集（`search\_eval\_labels\_r3\_p.jsonl` / `\_r3\_consensus.jsonl`，300 条）+ `--vectors snapshot` + `search\_replay.py --compare`：primary nDCG@5 **+0.0275**（CI \[+0.005, +0.051]，p=0.015，**CI 不含 0 通过**）、MRR **+0.0551**（CI \[+0.025, +0.087]，p=0.000），但**最小效应量 +0.143 SD 未达注册门槛 +0.30 SD**，且 **recall 回退 −0.0070** → 规则 **NOT MET**。回退的机制已记录：“点名”不等于“要它”——`shawnshi` 这类查询把人物页提到第 1，而标签要的是技能产品页。判定与数值见该轮评测记录（已随 `benchmarks/` 退役，见 git 历史）。
 * `VECTOR_LAKE_FUSION`：FTS 与向量两路的融合方式。默认 `sum`（历史行为：`-bm25` 与 `sim²·15` 两个原始量级相加）；`rrf` 改按名次融合（`Σ 1/(60+rank)`，常量见 `tool\_search.RRF\_K`），并把**图扩展也表达成同一量纲的第三路名次**。
 **判定：默认保持 `sum`。** 预登记的主指标是 nDCG@5（规则见该轮预注册记录，含事后加的最小效应量 ≥ +0.05；该记录已随评测脚手架退役，见 git 历史）。确认集 76 条查询、**三位独立判定者**（两位 `deepseek` 同族 + 一位 `gemini` 跨族；三对 kappa 0.70–0.77）下，`rrf` 在 **16/16 个「指标×标注集」组合**里方向一致更好，但主指标配对 bootstrap 95% CI 在四个标注集上**全部包含 0**、符号检验全不显著，且四个点估计（`+0.035 / +0.047 / +0.046 / +0.044`）**全部低于 +0.05** → 规则 **NOT MET**。稳定的是次要指标 recall@5（三处 CI 不含 0），不是主指标 —— 改主指标会翻结论，这正是预登记要防的事。跨族一致率与同族同带（0.70–0.77 vs 0.73），说明判定分歧是判定者特异的，不是共享模型偏置。
+* `VECTOR_LAKE_VECTOR_INDEX`：向量臂的检索结构。默认 `auto`：影子索引（`vec_emb_bits` 二值预筛 + `vec_emb_float` 按 rowid 精排）**存在且自检一致**时使用它，否则自动回落 `vec_embeddings` 的暴力扫描；`two_stage` 强制影子（不可用时告警并回落），`legacy` 强制旧路径。为什么是两阶段：实测生产语料（7162×3072）暴力扫描 **227–254 ms**、recall@10 1.0000；单用二值 **2.04 ms** 只到 0.7167；**二值 top-100 + 全精度精排 3.4–8.4 ms 且 recall@10 1.0000**。注意 `vec0` 按 `page_key` 取向量是 **7.7 ms/条**的陷阱，精排必须走整数 `rowid`（0.012 ms/条）。影子表是派生物：重建或 DROP 三张 `vec_emb_*` 表即完全回到旧行为。
+* `VECTOR_LAKE_METADATA_FIRST`：过滤态（`domain`/`cluster`/`filter_expr`/默认的 `include_history=False`）向量臂的**取值顺序**。默认 `1`：先用二值短名单取候选 → 用页面元数据过滤 → 只对通过者做全精度精排；`0` 回到旧顺序（先把 `limit` 个候选全部精排、再过滤）。为什么默认开：实测 36 个过滤单元里**精排阶段 38.2 → 2.6 ms（p50）**、总时延 **p50 130.0 → 81.3 ms、p95 483.5 → 288.9 ms**。代价是候选池从“精确 top-N”变成“二值 top-N”，可能改变**哪个**合格页占坑：36 个单元中 30 个顺序完全一致（top-5 平均重叠 0.97），其余 6 个取到了更靠前的合格页；两种顺序都满足“返回的每一页 100% 通过过滤”（0 违规）。需要旧顺序时设 `0`。
+* `VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES`：memory n-gram 索引的**交互式延迟触发**，单位是“自上次重建以来的搜索次数”，默认 `0`＝关闭（保留原来的机器时间最优策略：一次重建 77 s，按每次搜索省 0.46 s 计需约 166 次搜索回本，写入计数阈值 500）。设为 N>0 后，只要索引离开快路（存在脏文档）且自上次重建已发生 ≥N 次搜索，`gram-index --if-due` 即判为到期，理由里会写明当前在付多少次慢路径。为什么需要它：实测 2026-09-29 本库有 458 篇脏文档（低于 500 阈值）→ 读路径关闭索引、每次 memory 检索多付 ~0.5 s，而“未到期”状态下不会有任何东西自愈；重建后 `assemble_context` **669.9 → 63.2 ms**。写入计数阈值管的是写入锁预算，不管用户可见延迟，两者是不同的取舍，所以这个触发是可配的而不是直接改默认。
 * `VECTOR_LAKE_EXPANSION_QUOTA`：给图扩展预留的候选池槽位数。不设＝维持历史行为，即扩展只能捡融合剩下的槽位（实测一半查询捡到 0）；设 N 后每次查询都保证有扩展候选进池。受 `expansion\_limit`（general 5 / entity 12）约束，故有效上限是 `min(N, expansion\_limit)`。
 * `VECTOR_LAKE_AUTHOR_SOURCES`：哪些 raw 前缀算作**作者自己的写作**，逗号分隔，默认 `raw/article`。映射不是从标题猜的：每个摄入任务自带 `filepath`（raw 路径）与 `canonical\_name`（写入的页名），取每个源最新一次成功任务的那一对。
 **为什么需要它**：署名不是被索引的信号。实测：149 个来自 `raw/article/` 的页里 **131 个正文从未出现作者姓名**（无“师成/Shawn/Vector Lake/作者”），于是“他怎么看 X”这类问法只能命中**提到**他的 18 页——`师成关于医疗人工智能的观点` 下他亲手写的页只在第 12/13/14/17/18 名，而 `Person\_Shawn-Shi`（写他的页）第 2。
@@ -618,7 +624,7 @@ CJK 分词采用两层后端（统一入口 `vector\_lake/tokenizer.py`）：
 |-|-|-|
 |**`fast\_gram\_index`**|`vector\_lake/memory\_gram\_index.py`|纯 C/Rust 级别的小端紧凑 `uint32` delta postings 解包、跳过脏页与权重累加，避免 Python 字典遍历与位移开销，使海量运行态记忆检索进入毫秒级|
 |**`fast\_markdown`**|`vector\_lake/wiki\_utils.py`、`vector\_lake/claim\_extractor.py`|基于 `pulldown-cmark` Pull Parser 事件流的高速 Frontmatter 分割、章节列表项计数与段落/列表项块提取（claim 抽取 0.15 → 0.02 ms/页，见 `VECTOR_LAKE_CLAIM_BLOCKS`）。`fast\_extract\_wikilinks` 已导出但**无调用点**——仓里还没人接它，不要按它已生效来估收益|
-|**`fast\_graph\_fusion`**|`vector\_lake/tool\_search.py`|带重启 Personalized PageRank (PPR) 随机游走扩散。同模块导出的 `fast\_reciprocal\_rank\_fusion` 同样**无调用点**（RRF 目前在 Python 里算），且 2026-09-25 实测它比那几行 Python **慢**（5.7 µs vs 8.3 µs，因为每查询的列表只有 6–17 项、过界成本占主导）——**不要接**|
+|**`fast\_graph\_fusion`**|`vector\_lake/tool\_search.py`|带重启 Personalized PageRank (PPR) 随机游走扩散；另导出 `prepared\_personalized\_pagerank` + `PprIndex`（预构建整数 id 索引，按图代际缓存）。为什么加预构建：旧入口每次调用要把整张 Python 邻接表搬进 Rust（39 382 条边、每条两个 String）并每轮克隆 7.6k 个键，**实测单次 31.9 ms**，几乎全是堆分配；预构建后 **1.50 ms（20.7×）**，构建成本 27.9 ms 每图一次。两条路径输出**逐位相同**（16 个边界用例 + 真实图验证，含“零分节点的邻居仍会被插入结果集”这个可观测键集细节）；旧函数保留不动。同模块导出的 `fast\_reciprocal\_rank\_fusion` 同样**无调用点**（RRF 目前在 Python 里算），且 2026-09-25 实测它比那几行 Python **慢**（5.7 µs vs 8.3 µs，因为每查询的列表只有 6–17 项、过界成本占主导）——**不要接**|
 |**`graph\_topology`**|`vector\_lake/indexer.py`|`fast\_calculate\_weighted\_edges` 计算稀疏共现图的加权边。下面那些耗时数字来自更早的语料（未在现语料重测）|
 |**`text\_similarity`**|`vector\_lake/tool\_lint.py`|纯 Rust 实现的 Gestalt/Ratcliff-Obershelp 算法，替代 Python `difflib.SequenceMatcher`；2026-09-25 实测在 380 对名称上 **10.25×**（3.2 ms → 0.3 ms），批量版（`fast\_batch\_sequence\_matcher\_ratios`，无调用点）相对它只多 1.3 个点|
 |**`local\_bm25`**|`vector\_lake/tool\_search.py`|纯内存轻量 Okapi BM25 局部候选池重排引擎；2026-09-25 起是**唯一**引擎（第三方 `bm25s` 回退已移除），打分与权重混合一并在此完成|

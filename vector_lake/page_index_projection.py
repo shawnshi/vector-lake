@@ -667,13 +667,25 @@ def node_summary_lines(limit: int = 50) -> list[str]:
 # --- adjacency --------------------------------------------------------------
 
 _adjacency_lock = threading.Lock()
-_adjacency: dict = {"stamp": None, "data": None}
+_adjacency: dict = {"stamp": None, "data": None, "generation": 0}
 
 
 def _invalidate_adjacency() -> None:
     with _adjacency_lock:
         _adjacency["stamp"] = None
         _adjacency["data"] = None
+        _adjacency["generation"] += 1
+
+
+def adjacency_generation() -> int:
+    """Identity of the current adjacency object, for callers keying their own derived caches.
+
+    Bumped on invalidation and again whenever the table is rebuilt, so a derived structure (the
+    prepared PPR index) is dropped exactly when the graph changes instead of on a timer.  A timer
+    would either rebuild a 6 095-node index for nothing or serve one built from a stale graph.
+    """
+    with _adjacency_lock:
+        return int(_adjacency["generation"])
 
 
 def adjacency() -> dict[str, list[tuple[str, float]]]:
@@ -701,6 +713,7 @@ def adjacency() -> dict[str, list[tuple[str, float]]]:
     with _adjacency_lock:
         _adjacency["stamp"] = stamp
         _adjacency["data"] = table
+        _adjacency["generation"] = int(_adjacency.get("generation", 0)) + 1
     return table
 
 

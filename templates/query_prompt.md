@@ -1,10 +1,10 @@
 [PROPOSAL-ONLY PROMPT]
 
-This template is served by the default read-only query path: the MCP tool `query_logic_lake`
-renders it through `prepare_query_context` for any caller. This header used to claim that an
-operator had to enable it first, naming a condition no code ever checked -- worse than a missing
-gate, because a reviewer reads such a header as protection that exists. `dry_run: true` stops
-after the context envelope is written and returns a provenance trace instead of this prompt.
+This template is served by the proposal-preparation path: `query_logic_lake` renders it
+through `prepare_query_context` and writes a temporary context envelope. For an inline
+context preview without a proposal payload, use `preview_query_context`; its retrieval may
+still write an audit-ledger entry. `dry_run: true` stops after the context envelope is
+written and returns a provenance trace instead of this prompt. Neither path writes Wiki pages.
 
 What this prompt can rely on is the division of labour below. The synthesis model is a
 proposal-only worker: it returns page content, and the caller is what writes it to disk. The

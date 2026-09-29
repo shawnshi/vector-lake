@@ -34,7 +34,7 @@ triggers: 'When the user requests to clean up, garbage collect, prune, or remove
 
   <tool_dispatch>
     - `bash`: `python cli.py gc [--days N] [--apply]` for safe preview and execution.
-    - `vector-lake-mcp`: `inspect_projections` to verify projection health after pruning.
+    - `mentat-mind-mcp`: `inspect_projections` to verify projection health after pruning.
     - `invoke_subagent`: Use if concurrent tasks or deep structural audits are needed before triggering the deletion.
   </tool_dispatch>
 

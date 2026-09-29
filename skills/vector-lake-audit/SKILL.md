@@ -32,8 +32,8 @@ description: 'Synthesize graph topology insights into the unified review surface
   </workflow>
 
   <tool_dispatch>
-    - `vector-lake-mcp` (trigger_audit_graph): To perform the actual graph topology audit.
-    - `vector-lake-mcp`: For knowledge registry and updates to the unified review surface.
+    - `mentat-mind-mcp` (trigger_audit_graph): To perform the actual graph topology audit.
+    - `mentat-mind-mcp`: For knowledge registry and updates to the unified review surface.
     - `invoke_subagent`: For concurrent sub-tasks or specialized deeper topology analysis if required.
   </tool_dispatch>
 

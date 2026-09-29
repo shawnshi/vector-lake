@@ -1,5 +1,13 @@
 # Unreleased
 
+## MCP 注册名更名（`vector-lake-mcp` → `mentat-mind-mcp`）
+
+宿主侧注册名统一为 `mentat-mind-mcp`，服务实现与自报身份不变。
+
+- 更名范围：`.mcp.json`、`mcp_config.json`、`README.md` §5 宿主接入示例，以及 Pi 侧全局注册与引用（`mcp-adapter.json`、`agents/medical-researcher.md`、`pai/references/knowledge-sources.md`、`pai/tests/test_contracts.py`、四个技能 reference 及其 `_sync` 镜像）。
+- 未改动：`python -m vector_lake.mcp_server` 启动入口、`vector_lake` 包名与目录名、`serverInfo.name`（仍为 `vector-lake`，version 4.0.4）、18 个工具的物理表面。
+- 历史条目中的旧名保留原样；本条目记录改名时点。
+
 ## 评测脚手架退役（`benchmarks/` 移出仓库）
 
 - 删除 `benchmarks/`：检索回放、判定集 / 标注集与复现脚本不再随仓库分发（27 个文件）。

@@ -2145,6 +2145,29 @@ def search_index_state() -> dict[str, str]:
         for row in get_connection().execute("SELECT node_key, content_hash FROM wiki_search_index_state")
     }
 
+def _store_vector(conn, page_key, blob) -> None:
+    """The only place that writes ``vec_embeddings``.
+
+    Keeping the mirror call inside the same helper is the point: a second writer elsewhere would
+    keep the row counts equal while serving stale vectors, which no count check can detect.  A
+    guard test asserts no other write to this table exists in the module.
+    """
+    from vector_lake import two_stage_index
+    conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (str(page_key),))
+    conn.execute(
+        "INSERT INTO vec_embeddings (page_key, embedding) VALUES (?, ?)", (str(page_key), blob)
+    )
+    two_stage_index.mirror_write(conn, page_key, blob)
+
+
+def _delete_vectors(conn, page_keys) -> None:
+    """The only place that deletes from ``vec_embeddings``, mirrored in the same transaction."""
+    from vector_lake import two_stage_index
+    keys = [(str(key),) for key in page_keys]
+    conn.executemany("DELETE FROM vec_embeddings WHERE page_key = ?", keys)
+    two_stage_index.mirror_delete(conn, page_keys)
+
+
 def upsert_embedding(page_key: str, embedding: list[float], *, content_digest: str | None = None):
     """Store one unit vector under a page key.
 
@@ -2163,8 +2186,7 @@ def upsert_embedding(page_key: str, embedding: list[float], *, content_digest: s
     import sqlite_vec
     query_blob = sqlite_vec.serialize_float32(embedding)
     with transaction():
-        conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (page_key,))
-        conn.execute("INSERT INTO vec_embeddings (page_key, embedding) VALUES (?, ?)", (page_key, query_blob))
+        _store_vector(conn, page_key, query_blob)
         # A digest is written only when the caller actually has one.  Storing a NULL or guessed
         # digest would make an unverified row look verified, and the reader treats "no row" as
         # "needs stamping", so the no-digest path converges instead of lying.
@@ -2193,7 +2215,7 @@ def embedding_input_digests() -> dict[str, str]:
 def delete_embedding(page_key: str):
     conn = get_connection()
     with transaction():
-        conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (str(page_key),))
+        _delete_vectors(conn, [page_key])
         conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (str(page_key),))
 
 
@@ -2205,7 +2227,7 @@ def delete_stale_embeddings(valid_page_keys: set[str]) -> int:
     if not stale:
         return 0
     with transaction():
-        conn.executemany("DELETE FROM vec_embeddings WHERE page_key = ?", [(page_key,) for page_key in stale])
+        _delete_vectors(conn, stale)
         # The input ledger is keyed the same way and would otherwise keep rows for pages that no
         # longer exist, which reads as "every orphan is stale" on the next sweep.
         conn.executemany("DELETE FROM vec_embedding_inputs WHERE node_key = ?", [(page_key,) for page_key in stale])
@@ -2225,12 +2247,22 @@ def record_embedding_projection(model: str, dimension: int) -> None:
     """
     now = datetime.now(timezone.utc).isoformat()
     with transaction():
-        get_connection().execute(
+        conn = get_connection()
+        previous = conn.execute(
+            "SELECT model, dimension FROM vec_embedding_projection WHERE id = 1"
+        ).fetchone()
+        conn.execute(
             "INSERT INTO vec_embedding_projection (id, model, dimension, written_at) VALUES (1, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET model = excluded.model, "
             "dimension = excluded.dimension, written_at = excluded.written_at",
             (str(model), int(dimension), now),
         )
+        # A new projection means the vectors were produced by a different encoder than the shadow
+        # was built from.  Invalidating it here makes the read path fall back to the exact scan
+        # until a rebuild, instead of mixing encoders under equal row counts.
+        if previous and (previous["model"], int(previous["dimension"])) != (str(model), int(dimension)):
+            from vector_lake import two_stage_index
+            conn.execute(f"DELETE FROM {two_stage_index.META_TABLE} WHERE id = 1")
 
 
 def embedding_projection_state() -> dict:
@@ -2298,7 +2330,7 @@ def delete_search_index(node_key: str):
         else:
             conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
-        conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (node_key,))
+        _delete_vectors(conn, [node_key])
         conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (node_key,))
     mirror = _tantivy()
     if mirror is not None:
@@ -2334,7 +2366,7 @@ def delete_node_cascade(node_key: str):
         else:
             conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
-        conn.execute(f"DELETE FROM vec_embeddings WHERE page_key IN ({placeholders})", related_ids)
+        _delete_vectors(conn, related_ids)
         conn.execute(f"DELETE FROM vec_embedding_inputs WHERE node_key IN ({placeholders})", related_ids)
         mirror = _tantivy()
         if mirror is not None:

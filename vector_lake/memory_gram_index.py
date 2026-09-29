@@ -140,6 +140,30 @@ REBUILD_AFTER_WRITES = 500
 REBUILD_COST_SECONDS = 77.0
 SEARCH_SECONDS_SAVED = 0.46
 
+#: Interactive-latency trigger, off by default, in **searches since the last rebuild**.
+#:
+#: The amortisation branch above decides on aggregate machine time: one rebuild is repaid after
+#: ~166 searches, which is the right answer for a busy host and a poor one for an interactive one.
+#: Measured state on 2026-09-29: 458 live dirty documents (below the 500 churn threshold), 8 searches
+#: since the last rebuild, so nothing was scheduled while *every* memory-backed query paid the
+#: ~0.46 s scan -- the same shape the docstring above calls out as a churny day's failure, reached
+#: by the other gate.  A host that serves a human can prefer latency over machine time and set
+#: ``VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES`` (e.g. 20); 0 keeps the historical behaviour, so the
+#: default is not silently changed for hosts that never asked for the trade.
+DEFAULT_LATENCY_REBUILD_AFTER_SEARCHES = 0
+
+
+def latency_rebuild_after_searches() -> int:
+    """The operator's interactive trigger, in searches, or 0 when it is disabled."""
+    raw = os.environ.get("VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES", "")
+    if not raw.strip():
+        return DEFAULT_LATENCY_REBUILD_AFTER_SEARCHES
+    try:
+        return max(0, int(raw.strip()))
+    except ValueError:
+        log.warning("Ignoring VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES=%r (not an integer).", raw)
+        return DEFAULT_LATENCY_REBUILD_AFTER_SEARCHES
+
 
 def _searches_since_last_rebuild() -> int | None:
     """Searches the ledger recorded since the base was last built, or ``None`` if unknowable.
@@ -767,6 +791,17 @@ def rebuild_due_reason(conn=None) -> str | None:
     live = writes_since_rebuild(conn)
     if live >= REBUILD_AFTER_WRITES:
         return f"{live} document(s) written since the last rebuild (threshold {REBUILD_AFTER_WRITES})"
+    # Interactive host: has the slow path been paid for often enough to justify a rebuild before the
+    # churn threshold?  Kept separate from the amortisation branch so the two policies stay legible.
+    latency_bar = latency_rebuild_after_searches()
+    if live > 0 and latency_bar > 0:
+        searched_now = _searches_since_last_rebuild()
+        if searched_now is not None and searched_now >= latency_bar:
+            return (
+                f"the indexed path is off with {live} document(s) pending and {searched_now} "
+                f"search(es) since the last rebuild (interactive bar {latency_bar}); each of those "
+                f"paid ~{SEARCH_SECONDS_SAVED}s on the projected scan"
+            )
     if live > 0:
         searched = _searches_since_last_rebuild()
         if searched is not None:

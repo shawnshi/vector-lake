@@ -79,47 +79,78 @@ COMPARATIVE_QUERY_PATTERN = re.compile(
 )
 
 
-def prepare_query_context(query_str: str, dry_run: bool = False):
-    # ``wiki_dir`` was read only by the dead ``{{wiki_dir}}`` substitution at the end of this
-    # function; the template never contained that placeholder.
-    
-    is_comparative = bool(COMPARATIVE_QUERY_PATTERN.search(query_str))
-    
-    context = assemble_context(query_str)
-    context_block = ""
-    
-    if is_comparative:
-        context_block += "\n[SYSTEM NOTE: This is a comparative query. Ensure equal retrieval weighting for both sides to avoid skew.]\n"
-    if context.get("memory_packet"):
-        context_block += (
-            f"\n\n--- OPERATIONAL MEMORY PACKET "
-            f"({context.get('memory_count', 0)} items, {context.get('memory_warning_count', 0)} warnings) ---\n"
-            f"{context['memory_packet']}"
-        )
-    if context["wiki_context"]:
-        context_block += (
-            f"\n\n--- RELEVANT WIKI PAGES ({context['wiki_page_count']} pages, "
-            f"{context['budget_used']}/{context['budget_max']} chars) ---\n{context['wiki_context']}"
-        )
-    if context.get("index_summary"):
-        context_block += f"\n\n--- NODE INDEX SUMMARY ---\n{context['index_summary']}"
+def _render_context_payload(query_str: str, context: dict) -> str:
+    """Budget the serialized text and UTF-8 bytes, including headings and notes.
 
-    # Computed diagnostics used to be dropped here, so a vector-retrieval failure or a budget
-    # eviction looked exactly like a complete context -- the silent-degradation shape this tree
-    # forbids elsewhere.  ``budget_used`` already charges for these bytes, so surfacing them
-    # makes the payload match what the accounting claims was delivered.
-    retrieval_notes = [str(note) for note in (context.get("retrieval_notes") or []) if note]
-    omitted_memory = int(context.get("memory_omitted_count") or 0)
-    if retrieval_notes or omitted_memory:
-        degradations = [f"- {note}" for note in retrieval_notes]
-        if omitted_memory:
-            degradations.append(
-                f"- {omitted_memory} operational memory item(s) were dropped to fit the budget."
+    The byte bound is conservative for byte-fallback tokenizers; it is not an
+    exact count for the eventual model's tokenizer.
+    """
+    max_chars = int(context["budget_max"])
+    if max_chars <= 0:
+        raise ValueError("budget_max must be positive")
+    wiki = str(context.get("wiki_context") or "")
+    index = str(context.get("index_summary") or "")
+    purpose = str(context.get("purpose") or "")
+    notes = [str(note) for note in (context.get("retrieval_notes") or []) if note]
+    omitted = int(context.get("memory_omitted_count") or 0)
+    if omitted:
+        notes.append(f"{omitted} operational memory item(s) were dropped to fit the budget.")
+
+    def render() -> str:
+        parts = []
+        if COMPARATIVE_QUERY_PATTERN.search(query_str):
+            parts.append("\n[SYSTEM NOTE: This is a comparative query. Ensure equal retrieval weighting for both sides to avoid skew.]\n")
+        if context.get("memory_packet"):
+            parts.append(
+                f"\n\n--- OPERATIONAL MEMORY PACKET "
+                f"({context.get('memory_count', 0)} items, {context.get('memory_warning_count', 0)} warnings) ---\n"
+                f"{context['memory_packet']}"
             )
-        context_block += "\n\n--- RETRIEVAL NOTES (degradations) ---\n" + "\n".join(degradations)
+        if wiki:
+            pages = context.get("wiki_page_count", 0) if wiki == context.get("wiki_context") else wiki.count("- **")
+            parts.append(
+                f"\n\n--- RELEVANT WIKI PAGES ({pages} pages, {len(wiki)}/{max_chars} chars) ---\n{wiki}"
+            )
+        if index:
+            parts.append(f"\n\n--- NODE INDEX SUMMARY ---\n{index}")
+        if notes:
+            parts.append("\n\n--- RETRIEVAL NOTES (degradations) ---\n" + "\n".join(f"- {note}" for note in notes))
+        if purpose:
+            parts.append(f"\n\n--- PURPOSE ---\n{purpose}")
+        return "".join(parts)
 
-    if context["purpose"]:
-        context_block += f"\n\n--- PURPOSE ---\n{context['purpose']}"
+    def over_budget(text: str) -> bool:
+        return len(text) > max_chars or len(text.encode("utf-8")) > max_chars
+
+    payload = render()
+    while over_budget(payload) and wiki:
+        previous = wiki.rfind("\n- **")
+        wiki = wiki[:previous].rstrip() if previous >= 0 else ""
+        if not any("Wiki pages omitted" in note for note in notes):
+            notes.append("Wiki pages omitted from serialized payload to meet the budget.")
+        payload = render()
+    while over_budget(payload) and index:
+        index = index.rsplit("\n", 1)[0] if "\n" in index else ""
+        payload = render()
+    if over_budget(payload) and purpose:
+        purpose = ""
+        notes.append("Purpose omitted from serialized payload to meet the budget.")
+        payload = render()
+    if over_budget(payload):
+        raise ValueError("query metadata, memory and retrieval notes exceed serialized payload budget")
+    return payload
+
+
+def preview_query_context(query_str: str) -> str:
+    """Return a query context inline, without writing a proposal payload or Wiki page.
+
+    Retrieval may record an audit-ledger event; it is not a filesystem-wide dry run.
+    """
+    return _render_context_payload(query_str, assemble_context(query_str))
+
+
+def prepare_query_context(query_str: str, dry_run: bool = False):
+    context_block = _render_context_payload(query_str, assemble_context(query_str))
 
     # The template is resolved and read *before* the payload is written.  It used to be read
     # afterwards, and a missing template merely set the template text to its own error message --

@@ -385,9 +385,9 @@ def _budget_run(isolated_memory, monkeypatch, catalog_nodes: int, max_chars: int
     # differential below would pass for the wrong reason.
     (wiki / "index.json").write_text("{}", encoding="utf-8")
     pages = []
-    for index in range(80):
-        key = f"Concept_Page{index:02d}"
-        (wiki / f"{key}.md").write_text("x" * 3000, encoding="utf-8")
+    for index in range(180):
+        key = f"Concept_Page{index:03d}"
+        (wiki / f"{key}.md").write_text("x" * 1600, encoding="utf-8")
         pages.append((1.0, {"_key": key, "title": key}))
 
     class Catalog:

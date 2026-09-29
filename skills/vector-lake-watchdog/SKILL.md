@@ -27,7 +27,7 @@ triggers: 'When the user requests to start the Vector Lake daemon, watchdog, or 
 
 <execution_workflow>
   <workflow>
-    1. Active install (decide this first): the daemon code only ever comes from `C:/Users/shich/projects/vector-lake` — the cwd/PYTHONPATH of `vector-lake-mcp` in `~/.pi/agent/mcp.json`, and the tree every recorded launch used. `%USERPROFILE%\.codex\plugins\vector-lake` is a 2026-08-29 Codex snapshot whose `watchdog_sync.py` still imports `vector_lake.runtime_paths`; never start the host daemon from it.
+    1. Active install (decide this first): the daemon code only ever comes from `C:/Users/shich/projects/vector-lake` — the cwd/PYTHONPATH of `mentat-mind-mcp` in `~/.pi/agent/mcp.json`, and the tree every recorded launch used. `%USERPROFILE%\.codex\plugins\vector-lake` is a 2026-08-29 Codex snapshot whose `watchdog_sync.py` still imports `vector_lake.runtime_paths`; never start the host daemon from it.
     2. Independent service: the scheduled task `VectorLake-Watchdog` is the only resident path. It runs `scripts/watchdog_service.ps1` (pins the repo root, pins UTF-8, logs to `scratch/watchdog_service-*-{out,err}.log`, keeps the newest 10) with triggers Logon + Boot + every 5 minutes, `MultipleInstances=IgnoreNew`, `ExecutionTimeLimit=PT0S`, `RestartOnFailure 3/PT1M`, principal `S4U` (session 0). The 5-minute repeat only fires after the previous wrapper returns, so a hard kill self-heals and a healthy daemon is never doubled.
     3. Launch: `Start-ScheduledTask -TaskName 'VectorLake-Watchdog'`; if the task is missing, re-register from `scratch/register_watchdog_task.ps1`, not by hand-rolling XML.
     4. Handover, not duplication: `.meta/.watchdog.instance.lock` rejects a second instance, so stop the shell-launched watchdog before starting the task. Never kill the ingest runner service — the new watchdog adopts it (`Ingest runner supervised by an existing supervisor (pid N)`), which is what keeps a mid-flight ingest alive.
@@ -38,7 +38,7 @@ triggers: 'When the user requests to start the Vector Lake daemon, watchdog, or 
 
   <tool_dispatch>
     - `bash` + `powershell.exe -File/-Command`: register, start and read back the task (`Get-ScheduledTask`, `Get-ScheduledTaskInfo`).
-    - `vector-lake-mcp`: read-only cross-check of runtime state; never used to start processes.
+    - `mentat-mind-mcp`: read-only cross-check of runtime state; never used to start processes.
   </tool_dispatch>
 
   <checkpoint_rules>
