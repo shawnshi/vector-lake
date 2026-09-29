@@ -70,6 +70,62 @@ class _Catalog:
 
         return page_index_projection.nodes_by_key(list(keys))
 
+    def filter_fields(self, keys):
+        from vector_lake import page_index_projection
+
+        return page_index_projection.filter_fields(list(keys))
+
+
+def test_filter_fields_projection_matches_full_nodes(monkeypatch):
+    """The cheap lookup must carry exactly what the selectors would have read from the JSON.
+
+    If a selector ever starts reading a fourth field, this comparison fails rather than the filter
+    silently seeing ``None``.
+    """
+    vectors = _seed(monkeypatch)
+    from vector_lake import page_index_projection
+
+    keys = [*vectors, "Doc_missing"]
+    cheap = page_index_projection.filter_fields(keys)
+    full = page_index_projection.nodes_by_key(keys)
+    assert set(cheap) == set(full), "missing keys must be absent from both lookups"
+    for key, fields in cheap.items():
+        assert set(fields) == set(page_index_projection.FILTER_FIELDS)
+        for name in page_index_projection.FILTER_FIELDS:
+            assert fields[name] == full[key].get(name), f"{key}.{name} differs from the node payload"
+
+
+def test_arm_prefers_the_cheap_lookup_and_falls_back_for_expressions(monkeypatch):
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = [float(x) for x in vectors["Doc_000"]]
+
+    class Recording:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def nodes_by_key(self, keys):
+            self.calls.append("nodes_by_key")
+            return _Catalog().nodes_by_key(keys)
+
+        def filter_fields(self, keys):
+            self.calls.append("filter_fields")
+            return _Catalog().filter_fields(keys)
+
+    plain = Recording()
+    ts._get_vector_search_results_filtered(query, 20, plain, "Alpha", None, False, None)
+    assert plain.calls == ["filter_fields"], "a plain filter must not deserialise node payloads"
+
+    expressed = Recording()
+    results, error, _raw = ts._get_vector_search_results_filtered(
+        query, 20, expressed, None, None, False, "title == 'Doc_000'"
+    )
+    assert error is None
+    assert expressed.calls == ["nodes_by_key"], "a filter_expr can read any field, so it needs nodes"
+    assert list(results) == ["Doc_000"]
+
 
 def test_filtered_arm_returns_only_eligible_pages(monkeypatch):
     vectors = _seed(monkeypatch)

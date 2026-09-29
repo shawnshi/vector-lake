@@ -427,7 +427,14 @@ def _get_vector_search_results_filtered(
         # the loop cannot buy by widening.
         depth = max(1, int(limit))
         keys = two_stage_index.shortlist_keys(conn, query_blob, depth, state=state)
-        nodes = catalog.nodes_by_key(keys)
+        # The selectors read three fields; ``nodes_by_key`` deserialises the whole payload for
+        # every candidate examined, which measured as the largest single cost of this arm.  A
+        # ``filter_expr`` can reference any field, so only that case pays for full nodes.
+        if filter_expr:
+            nodes = catalog.nodes_by_key(keys)
+        else:
+            cheap = getattr(catalog, "filter_fields", None)
+            nodes = cheap(keys) if cheap is not None else catalog.nodes_by_key(keys)
         eligible = [
             key
             for key in keys
