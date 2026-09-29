@@ -47,6 +47,24 @@ $err = Join-Path $scratch "watchdog_service-$stamp-err.log"
 # The MCP server runs with the same pair; without them the log mangles non-ASCII page names.
 $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
+
+# Interactive latency trigger for the memory n-gram index.
+#
+# The write-count threshold (500 documents) is a *write-lock* budget, not a latency budget: it
+# decides how often a rebuild may stop writers, and it ignores that a stale index turns every
+# memory-backed query into an O(rows x terms) scan.  Measured 2026-09-29 on the live lake: 458
+# dirty documents sat below that threshold, the read path had switched the indexed path off, and
+# nothing was scheduled to fix it -- every affected query paid ~0.5 s (rebuild afterwards took
+# ``assemble_context`` from 669.9 ms to 63.2 ms).
+#
+# 20 searches is deliberately far below the ~166-search machine-time break-even: this host serves a
+# human, so user-visible latency outranks aggregate CPU time, while 20 still bounds rebuild churn to
+# roughly one rebuild per 20 searches.  Export the variable yourself (including ``0``) to override;
+# the guard below only supplies the default.
+if (-not $env:VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES) {
+    $env:VECTOR_LAKE_MEMORY_GRAM_LATENCY_SEARCHES = '20'
+}
+
 Set-Location $root
 
 $process = Start-Process -FilePath $exe -ArgumentList 'watchdog_sync.py' `
