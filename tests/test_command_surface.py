@@ -1,5 +1,7 @@
 import inspect
 import json
+import re
+import shlex
 from pathlib import Path
 
 from vector_lake import mcp_server
@@ -129,3 +131,46 @@ def test_mcp_server_registers_its_tool_surface():
     assert "search_vector_lake" in names
     assert "query_logic_lake" in names
     assert "doctor_vector_lake" in names
+
+
+def test_readme_json_examples_are_parseable_and_use_the_published_module():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```json\s*\n(.*?)```", readme, re.DOTALL)
+    assert blocks, "README must include a copyable MCP configuration"
+    configs = []
+    for block in blocks:
+        parsed = json.loads(block)
+        if "mcpServers" in parsed:
+            configs.append(parsed)
+    assert len(configs) == 1
+    entry = configs[0]["mcpServers"][EXPECTED_MCP_SERVER]
+    assert entry["args"] == ["-m", "vector_lake.mcp_server"]
+    assert entry["env"]["PYTHONPATH"] == "."
+
+
+def test_readme_tool_table_matches_registered_tools():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    table = readme.split("## Commands", 1)[1].split("基础体检：", 1)[0]
+    names = set()
+    for line in table.splitlines():
+        if line.startswith("|**"):
+            tool_cell = line.split("|")[2]
+            names.update(re.findall(r"`([a-z_]+)`", tool_cell))
+    assert names == set(mcp_server.registered_tool_names(mcp_server.mcp))
+
+
+def test_readme_cli_examples_parse_without_running_commands():
+    from vector_lake.cli_app import build_parser
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    parser = build_parser()
+    examples = 0
+    for block in re.findall(r"```(?:powershell|bash|sh)\s*\n(.*?)```", readme, re.DOTALL):
+        assert r"\_" not in block, "Markdown escapes inside code break copy/paste"
+        for line in block.splitlines():
+            command = line.strip()
+            if command.startswith("python cli.py "):
+                tokens = shlex.split(command)
+                parser.parse_args(tokens[2:])
+                examples += 1
+    assert examples >= 20, "the operational CLI examples must remain covered"

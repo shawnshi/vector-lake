@@ -245,5 +245,274 @@ class _RejectingCatalog:
         return {key: {"_key": key, "domain": "Other", "status": "Active"} for key in keys}
 
 
+def test_widening_reuses_prefix_and_only_filters_new_keys(monkeypatch):
+    vectors = _seed(monkeypatch, count=80)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = list(vectors["Doc_000"])
+    catalog = _Catalog()
+    expected = {
+        depth: ts._get_vector_search_results_filtered(
+            query, depth, catalog, "Alpha", None, False, None
+        )
+        for depth in (5, 10, 20, 40, 80)
+    }
+    calls, checked = [], []
+    original = two_stage_index.shortlist_keys
+
+    def shortlist(*args, **kwargs):
+        calls.append(args[2])
+        return original(*args, **kwargs)
+
+    class Recording(_Catalog):
+        def filter_fields(self, keys):
+            checked.extend(keys)
+            return super().filter_fields(keys)
+
+    monkeypatch.setattr(two_stage_index, "shortlist_keys", shortlist)
+    reuse = {}
+    recorded = Recording()
+    for depth, oracle in expected.items():
+        actual = ts._get_vector_search_results_filtered(
+            query, depth, recorded, "Alpha", None, False, None, reuse=reuse
+        )
+        assert actual == oracle
+        assert list(actual[0]) == list(oracle[0]), "exact L2 order must be unchanged"
+    assert calls == [5, ts.MAX_FILTERED_RECALL_CANDIDATES]
+    assert len(checked) == len(set(checked)) == len(vectors)
+
+
+def test_reuse_keeps_full_nodes_for_filter_expr_and_resets_selectors(monkeypatch):
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = list(vectors["Doc_000"])
+    reuse = {}
+    catalog = _Catalog()
+    for domain, expr in (("Alpha", None), ("Beta", None), (None, "title == 'Doc_000'")):
+        for depth in (5, 10, 40):
+            actual = ts._get_vector_search_results_filtered(
+                query, depth, catalog, domain, None, False, expr, reuse=reuse
+            )
+            oracle = ts._get_vector_search_results_filtered(
+                query, depth, catalog, domain, None, False, expr
+            )
+            assert actual == oracle
+
+
+def test_reuse_invalidates_after_local_write_and_projection_change(monkeypatch):
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = list(vectors["Doc_000"])
+    reuse, catalog = {}, _Catalog()
+    ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None, reuse=reuse
+    )
+    with db_store.transaction():
+        conn.execute("DELETE FROM page_index_nodes WHERE node_key = 'Doc_000'")
+    actual = ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None, reuse=reuse
+    )
+    assert "Doc_000" not in actual[0]
+    assert actual == ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None
+    )
+    db_store.record_embedding_projection("changed-model", DIM)
+    assert ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None, reuse=reuse
+    ) == (None, None, 0)
+
+
+def test_reuse_invalidates_after_external_write(monkeypatch):
+    import sqlite3
+
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = list(vectors["Doc_000"])
+    reuse, catalog = {}, _Catalog()
+    ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None, reuse=reuse
+    )
+    path = conn.execute("PRAGMA database_list").fetchone()[2]
+    other = sqlite3.connect(path)
+    try:
+        with other:
+            other.execute("DELETE FROM page_index_nodes WHERE node_key = 'Doc_000'")
+    finally:
+        other.close()
+    actual = ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None, reuse=reuse
+    )
+    assert "Doc_000" not in actual[0]
+    assert actual == ts._get_vector_search_results_filtered(
+        query, 40, catalog, "Alpha", None, False, None
+    )
+
+
+def test_prefix_mismatch_falls_back_without_unioning_candidates(monkeypatch):
+    vectors = _seed(monkeypatch, count=80)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = list(vectors["Doc_000"])
+    catalog = _Catalog()
+    expected = {
+        depth: ts._get_vector_search_results_filtered(
+            query, depth, catalog, "Alpha", None, False, None
+        ) for depth in (5, 10, 20)
+    }
+    original, calls = two_stage_index.shortlist_keys, []
+
+    def inconsistent(*args, **kwargs):
+        calls.append(args[2])
+        keys = original(*args, **kwargs)
+        return list(reversed(keys)) if args[2] == ts.MAX_FILTERED_RECALL_CANDIDATES else keys
+
+    monkeypatch.setattr(two_stage_index, "shortlist_keys", inconsistent)
+    reuse = {}
+    for depth, oracle in expected.items():
+        assert ts._get_vector_search_results_filtered(
+            query, depth, catalog, "Alpha", None, False, None, reuse=reuse
+        ) == oracle
+    assert calls == [5, ts.MAX_FILTERED_RECALL_CANDIDATES, 10, 20]
+
+
+def test_reuse_retains_cap_note_and_raw_exhaustion_semantics(monkeypatch):
+    vectors = _seed(monkeypatch, count=80)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    query = list(vectors["Doc_000"])
+    monkeypatch.setattr(ts, "MAX_FILTERED_RECALL_CANDIDATES", 40)
+    reuse, catalog, raw = {}, _Catalog(), {}
+
+    def fetch(depth):
+        rows, error, raw["count"] = ts._get_vector_search_results_filtered(
+            query, depth, catalog, "Absent", None, False, None, reuse=reuse
+        )
+        return rows, error
+
+    rows, error, note = ts._filtered_recall(
+        fetch, catalog, 5, "Absent", None, False, None, raw_count=lambda: raw["count"]
+    )
+    assert rows == {} and error is None
+    assert note and "cap (40) reached" in note
+    monkeypatch.setattr(ts, "MAX_FILTERED_RECALL_CANDIDATES", 4096)
+    reuse.clear()
+    rows, error, note = ts._filtered_recall(
+        fetch, catalog, 5, "Absent", None, False, None, raw_count=lambda: raw["count"]
+    )
+    assert rows == {} and error is None
+    assert not note or "cap" not in note, "a short raw source really is exhausted"
+
+
+def test_supported_binary_backend_keeps_tied_prefixes_across_chunks():
+    import sqlite3
+    import sqlite_vec
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        if conn.execute("SELECT vec_version()").fetchone()[0] != "v0.1.9":
+            pytest.skip("unknown backends use demand-sized scans, not pooled prefixes")
+        conn.execute("CREATE VIRTUAL TABLE bits_test USING vec0(page_key TEXT PRIMARY KEY, bits BIT[16])")
+        rng = np.random.default_rng(9)
+        for i in range(2050):
+            blob = bytes([i % 3] * 2) if i % 2 else rng.integers(0, 256, 2, dtype=np.uint8).tobytes()
+            conn.execute("INSERT INTO bits_test VALUES (?, vec_bit(?))", (f"p{i:04d}", blob))
+        sql = "SELECT page_key FROM bits_test WHERE bits MATCH vec_bit(?) ORDER BY distance LIMIT ?"
+        for query in (bytes([0, 0]), bytes([255, 255]), bytes([0, 255])):
+            pool = list(conn.execute(sql, (query, 4096)))
+            for depth in (5, 25, 50, 100, 256, 512, 1024, 2048):
+                assert list(conn.execute(sql, (query, depth))) == pool[:depth]
+    finally:
+        conn.close()
+
+
+def test_unknown_backend_uses_original_depths(monkeypatch):
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    calls = []
+    original = two_stage_index.shortlist_keys
+
+    class VersionProxy:
+        def execute(self, sql, *args):
+            if sql == "SELECT vec_version()":
+                class Row:
+                    def fetchone(self):
+                        return ("vFuture",)
+                return Row()
+            return conn.execute(sql, *args)
+
+        @property
+        def total_changes(self):
+            return conn.total_changes
+
+    proxy = VersionProxy()
+    monkeypatch.setattr(db_store, "get_connection", lambda: proxy)
+
+    def recording(*args, **kwargs):
+        calls.append(args[2])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(two_stage_index, "shortlist_keys", recording)
+    reuse, catalog = {}, _Catalog()
+    for depth in (5, 10, 20):
+        result, error, raw = ts._get_vector_search_results_filtered(
+            list(vectors["Doc_000"]), depth, catalog, "Alpha", None, False, None, reuse=reuse
+        )
+        assert error is None and result and raw == depth
+        assert len(reuse["verdicts"]) <= depth
+    assert calls == [5, 10, 20]
+
+
+def test_reuse_does_not_leak_between_query_vectors(monkeypatch):
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    reuse, catalog = {}, _Catalog()
+    for name in ("Doc_000", "Doc_001", "Doc_000"):
+        for depth in (5, 20):
+            query = list(vectors[name])
+            assert ts._get_vector_search_results_filtered(
+                query, depth, catalog, "Alpha", None, False, None, reuse=reuse
+            ) == ts._get_vector_search_results_filtered(
+                query, depth, catalog, "Alpha", None, False, None
+            )
+
+
+def test_reuse_failure_is_reported_and_cleared(monkeypatch):
+    vectors = _seed(monkeypatch)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        two_stage_index.build(conn)
+    reuse, catalog = {}, _Catalog()
+    query = list(vectors["Doc_000"])
+    ts._get_vector_search_results_filtered(
+        query, 5, catalog, "Alpha", None, False, None, reuse=reuse
+    )
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("shortlist dependency failed")
+
+    monkeypatch.setattr(two_stage_index, "shortlist_keys", broken)
+    result, error, raw = ts._get_vector_search_results_filtered(
+        query, 10, catalog, "Alpha", None, False, None, reuse=reuse
+    )
+    assert result is None and raw == 0
+    assert error and "RuntimeError: shortlist dependency failed" in error
+    assert reuse == {}, "a failed expansion must not leave a reusable pool behind"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

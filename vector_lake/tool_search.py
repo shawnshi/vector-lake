@@ -397,6 +397,8 @@ def _get_vector_search_results_filtered(
     cluster: str | None,
     include_history: bool,
     filter_expr: str | None,
+    *,
+    reuse: dict | None = None,
 ) -> tuple[dict[str, float] | None, str | None, int]:
     """Vector hits that already satisfy the selectors, plus how many candidates were examined.
 
@@ -409,6 +411,11 @@ def _get_vector_search_results_filtered(
     ``results is None`` means the shadow index is unavailable and the caller must use the plain arm.
     The third value is the **raw shortlist size**, never the number of survivors: a caller that
     widens when "the source ran out" must not read a heavy filter as an exhausted corpus.
+
+    ``reuse`` belongs to one widening loop, never to a process-wide cache.  The first round stays
+    demand-sized; on widening it prefetches at most the recall cap and serves subsequent prefixes.
+    Metadata verdicts are reused, but exact reranking stays with the original SQL and tie ordering.
+    A changed database/query/selector invalidates it; an inconsistent prefix disables prefetching.
     """
     try:
         from vector_lake.db_store import get_connection
@@ -416,31 +423,77 @@ def _get_vector_search_results_filtered(
         from vector_lake import two_stage_index
 
         conn = get_connection()
-        state = two_stage_index.status(conn)
+        query_blob = sqlite_vec.serialize_float32(query_vector)
+        # Both tokens matter: data_version observes other connections, total_changes our own.
+        # Keep the pre-read token, so a write during a round also invalidates the next round.
+        if reuse is not None:
+            stamp = (
+                conn, conn.execute("PRAGMA data_version").fetchone()[0], conn.total_changes,
+                query_blob, id(catalog), domain, cluster, include_history, filter_expr,
+            )
+            if reuse.get("stamp") != stamp:
+                reuse.clear()
+                reuse.update(
+                    stamp=stamp, state=two_stage_index.status(conn), verdicts={},
+                    # KNN prefix/tie behaviour was verified on this runtime.  Unknown versions
+                    # retain demand-sized scans rather than silently inheriting that assumption.
+                    prefix_safe=conn.execute("SELECT vec_version()").fetchone()[0] == "v0.1.9",
+                )
+            state = reuse["state"]
+        else:
+            state = two_stage_index.status(conn)
         if state is None:
             return None, None, 0
-        query_blob = sqlite_vec.serialize_float32(query_vector)
         # Exactly what the caller asked for, with no floor.  The widening loop *is* the depth
         # mechanism: a floor of the recorded shortlist made its first four steps (25/50/100/200)
         # examine the same 256 candidates four times, and it also returned pages drawn from a deeper
         # pool than the step the loop had asked about.  Both are avoidable, and neither buys recall
         # the loop cannot buy by widening.
         depth = max(1, int(limit))
-        keys = two_stage_index.shortlist_keys(conn, query_blob, depth, state=state)
-        # The selectors read three fields; ``nodes_by_key`` deserialises the whole payload for
-        # every candidate examined, which measured as the largest single cost of this arm.  A
-        # ``filter_expr`` can reference any field, so only that case pays for full nodes.
-        if filter_expr:
-            nodes = catalog.nodes_by_key(keys)
+        if reuse is None or depth > MAX_FILTERED_RECALL_CANDIDATES:
+            keys = two_stage_index.shortlist_keys(conn, query_blob, depth, state=state)
+            verdicts = {}
         else:
-            cheap = getattr(catalog, "filter_fields", None)
-            nodes = cheap(keys) if cheap is not None else catalog.nodes_by_key(keys)
-        eligible = [
-            key
-            for key in keys
-            if key in nodes
-            and _passes_filters(nodes[key], domain, cluster, include_history, filter_expr)
-        ]
+            previous = reuse.get("keys")
+            if previous is None or not reuse.get("prefix_safe", True):
+                keys = two_stage_index.shortlist_keys(conn, query_blob, depth, state=state)
+                reuse["keys"] = keys
+            elif depth <= len(previous) or reuse.get("pooled") or len(previous) < reuse["depth"]:
+                keys = previous[:depth]
+            else:
+                pool = two_stage_index.shortlist_keys(
+                    conn, query_blob, MAX_FILTERED_RECALL_CANDIDATES, state=state
+                )
+                if pool[:len(previous)] != previous:
+                    # KNN tie behaviour is backend-owned.  Never union incompatible prefixes:
+                    # that would admit candidates the original depth did not contain.
+                    reuse["prefix_safe"] = False
+                    keys = two_stage_index.shortlist_keys(conn, query_blob, depth, state=state)
+                    reuse["keys"] = keys
+                else:
+                    reuse.update(keys=pool, pooled=True)
+                    keys = pool[:depth]
+            reuse["depth"] = depth
+            if not reuse.get("prefix_safe", True):
+                reuse["verdicts"] = {
+                    key: reuse["verdicts"][key] for key in keys if key in reuse["verdicts"]
+                }
+            verdicts = reuse["verdicts"]
+        unseen = [key for key in keys if key not in verdicts]
+        # An expression may read arbitrary fields; ordinary selectors need only three columns.
+        if unseen:
+            if filter_expr:
+                nodes = catalog.nodes_by_key(unseen)
+            else:
+                cheap = getattr(catalog, "filter_fields", None)
+                nodes = cheap(unseen) if cheap is not None else catalog.nodes_by_key(unseen)
+            verdicts.update({
+                key: key in nodes and _passes_filters(
+                    nodes[key], domain, cluster, include_history, filter_expr
+                )
+                for key in unseen
+            })
+        eligible = [key for key in keys if verdicts[key]]
         results: dict[str, float] = {}
         for key, dist in two_stage_index.rerank_keys(conn, query_blob, eligible, limit):
             sim = 1.0 - (dist * dist) / 2.0
@@ -448,6 +501,8 @@ def _get_vector_search_results_filtered(
                 results[key] = sim
         return results, None, len(keys)
     except Exception as e:
+        if reuse is not None:
+            reuse.clear()
         log.warning(f"Failed to run the metadata-first vector arm: {e}")
         return None, f"vector arm failed: {type(e).__name__}: {e}", 0
 
@@ -1244,11 +1299,13 @@ def _search_scored_pages(
             # fallback to the plain arm (shadow index unavailable, or the switch off) keeps the old
             # cost and ordering profile rather than losing filtered recall.
             examined = {"raw": None}
+            shortlist_reuse = {}
 
             def _fetch(limit, _examined=examined):
                 rows, error, raw = (
                     _get_vector_search_results_filtered(
-                        query_vector, limit, catalog, domain, cluster, include_history, filter_expr
+                        query_vector, limit, catalog, domain, cluster, include_history, filter_expr,
+                        reuse=shortlist_reuse,
                     )
                     if _metadata_first_enabled()
                     else (None, None, 0)
