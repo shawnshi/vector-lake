@@ -133,6 +133,24 @@ def test_mcp_server_registers_its_tool_surface():
     assert "doctor_vector_lake" in names
 
 
+def test_readme_maintenance_examples_match_parser_and_bind_approval():
+    from scripts import repair_orphan_memory
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    commands = [line for line in readme.splitlines() if line.startswith("python scripts/repair_orphan_memory.py ")]
+    assert len(commands) == 5
+    parser_source = inspect.getsource(repair_orphan_memory.main)
+    documented_modes = set()
+    for line in commands:
+        documented_modes.add(re.search(r"--mode ([a-z-]+)", line).group(1))
+        for option in re.findall(r"--[a-z0-9-]+", line):
+            assert f'"{option}"' in parser_source
+        if "--mode apply " in line or "--mode restore " in line or "--mode refresh-triggers " in line:
+            assert "--approved-count $ApprovedCount" in line
+            assert "--approved-sha256 $ApprovedScopeHash" in line
+    assert documented_modes == {"freeze", "dry-run", "refresh-triggers", "apply", "restore"}
+
+
 def test_readme_json_examples_are_parseable_and_use_the_published_module():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```json\s*\n(.*?)```", readme, re.DOTALL)
@@ -145,7 +163,8 @@ def test_readme_json_examples_are_parseable_and_use_the_published_module():
     assert len(configs) == 1
     entry = configs[0]["mcpServers"][EXPECTED_MCP_SERVER]
     assert entry["args"] == ["-m", "vector_lake.mcp_server"]
-    assert entry["env"]["PYTHONPATH"] == "."
+    assert entry["env"]["PYTHONPATH"] == "C:/path/to/vector-lake"
+    assert "GEMINI_API_KEY" not in entry["env"]
 
 
 def test_readme_tool_table_matches_registered_tools():

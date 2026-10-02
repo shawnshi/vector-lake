@@ -1,5 +1,18 @@
 # Unreleased
 
+## 删除级联、冻结范围维护与文档同步（2026-10-02）
+
+- 页面删除在原生 SQLite 事务内先移除派生 operational memory，再删除关联 claim；lookup 删除及 gram retirement 使用原生触发器。
+- 初始化刷新 lookup 的 INSERT / UPDATE 触发器，修复旧定义遗漏 `source_rowid` 的问题；现有表格式不变。
+- 新增 `scripts/repair_orphan_memory.py`：默认 dry-run，提供冻结快照、批准数量/hash 绑定、定向 trigger refresh、原子 apply 与原行号 restore；拒绝未结算 mutation、嵌套事务、范围漂移及恢复冲突，保护无关数据和 gram 标记。
+- 提交后连接清理或回执出版失败，仍明确报告 committed 状态；SQL、备份验证和迭代采用合作式 deadline，不承诺操作系统 I/O 的绝对上限。
+- 相关回归覆盖事务失败、恢复冲突、脏标记越界、触发器升级与提交状态报告。生产数据库、恢复 payload 和本机验收日志不进入版本库。
+- README 补上定向维护和常驻 MCP 重连步骤，修正记忆排序的更新时间层级及跨客户端 MCP 路径示例，移除用历史采样数字代替当前运行状态的说明。
+
+### 历史采样：过滤候选前缀复用（2026-10-01）
+
+7,162 个向量的只读快照，本地热态 `_search_scored_pages`，不含 provider 网络。36 个跨域过滤场景各重复 3 次，复用前后 p50 **69.5 → 55.6 ms**、p95 **180.6 → 95.8 ms**，108 对结果、分数、顺序及诊断一致；触顶控制场景的位表扫描 **9 → 2 次**。另测 12 个默认过滤查询各 3 次，p95 **507.0 → 363.9 ms**。这是特定负载的历史测量，不是当前语料规模或通用 SLA；4096 上限及不完整告警不变。
+
 ## 检索性能与过滤正确性（2026-09-29 实测）
 
 生产语料（7,162 页 / 3,072 维）实测：本地检索 p50 **293.5 → 58.5 ms**，过滤态 p95 **504.0 → 193.6 ms**。所有数字都有随代码提交的验收脚本与边界用例。
@@ -735,10 +748,10 @@ native 形式，于是 `raw/privacy/Diary/` 下 3 个存在的日记被报成“
 ```
 model runner exited 4: model seam: pi exited 1: [pi-web-access] ...
 Extension error (...NVlabs\SoL-Pi\src\sol-pi\index.ts): SoL-Pi requires a persistent Pi session directory
-Extension error (C:\Users\s
+Extension error (<truncated-local-path>
 ```
 
-最后一行停在 `C:\Users\s`——不是子进程没报，而是缝只留 `stderr[:400]`、Runner 再留 300 字符，两者叠加后真正的死因必然落在窗口之外。**这次修的是“失败不可诊断”这件事本身**：一条线的报错被自己的截断吃掉，比它偶尔失败更贵。
+最后一行停在被截断的本机路径——不是子进程没报，而是缝只留 `stderr[:400]`、Runner 再留 300 字符，两者叠加后真正的死因必然落在窗口之外。**这次修的是“失败不可诊断”这件事本身**：一条线的报错被自己的截断吃掉，比它偶尔失败更贵。
 
 探测后是两个独立缺陷，各自都有读数，不是一个猜测：
 
@@ -1234,7 +1247,7 @@ vec0 既不支持 `RENAME COLUMN` 也不支持 `ADD COLUMN`，且**任何** `REN
 | 影子表 | `vec_embeddings_{chunks,info,rowids,vector_chunks00}` 完整 |
 | 数据完好性 | 用某行自身向量做 `MATCH`，首条即该页、`distance=0.0` |
 | 事务耗时 | 101 s（库 2.33 GB / 向量 88 MB） |
-| 恢复点 | `C:/Users/shich/backups/vector-lake/vector_lake.db.bak-a4-20260922`（`VACUUM INTO`，1745 MB，已校验 7175 行且仍是旧列名） |
+| 恢复点 | `<local-backup-root>/vector_lake.db.bak-a4-20260922`（`VACUUM INTO`，1745 MB，已校验 7175 行且仍是旧列名） |
 | 端到端 | 真实代码路径（`_get_query_embedding` → `_get_vector_search_results`）命中 5 条、无错误；`count_embeddings()` = 7175；**全量测试 1378 passed** |
 
 代码侧同步改名：`db_store`（DDL + `upsert_embedding`/`delete_embedding`/`delete_stale_embeddings` 的参数名）、
@@ -2799,7 +2812,7 @@ retention 机制。但被删代码已经用 `CREATE ... IF NOT EXISTS` 把对象
 - `governance_store.ALLOWED_TABLES` 移除 `claim_graph_nodes`。
 - `doctor` 新增 `Schema Migrations` 检查（未收敛时计 FAIL + `schema_prune_pending:` 告警）。
 
-验证（活库 `C:/Users/shich/MEMORY`，2.29 GB）：对象数 130 → 123；`PRAGMA quick_check` = `ok`；
+验证（本机 `<MEMORY>`，2.29 GB）：对象数 130 → 123；`PRAGMA quick_check` = `ok`；
 `change_sets` 26 774 行无损；`operational_memory` 146 679 行无损；
 `State Consistency: Wiki:7125 JSON:7125 SQLite:7125`、`Write Gate: clean`、
 `Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)` 全部保持。
@@ -2830,7 +2843,7 @@ retention 机制。但被删代码已经用 `CREATE ... IF NOT EXISTS` 把对象
 
 - `tool_graph._graph_output_path` 的首选位置原为 `<memory_dir>` 的**上一级** `tmp/`，即不传 `output_dir` 时会把生成的仪表盘写进宿主家目录布局（备选是 `<extension_root>/data/tmp`），与 `skills/graph` 自述的“禁止向全局路径盲写”相矛盾。现改为 `<memory_dir>/scratch/vector_lake_graph.html`，与技能对显式 `output_dir` 要求的隔离区一致；extension-root 备选仅保留为 scratch 不可写时的降级路径。
 - `skills/graph/SKILL.md` 同步：`output_dir` 改为可选（默认即 `<MEMORY>/scratch`），阻断点改为针对“显式传入且超出获批沙盒”的情况；技能版本 11.1.0 → 11.1.1。
-- 验证：新增 `tests/test_graph_algo_contract.py::test_default_output_path_is_the_memory_scratch_tree` 与 `::test_default_output_path_never_escapes_the_memory_root`（断言产物落在 memory 根之内、不再落在其上一级）；活图无参调用 `visualize_vector_lake()` 实测返回 `C:\Users\shich\MEMORY\scratch\vector_lake_graph.html`（10,868,401 字节，重写），`C:/Users/shich/tmp` 与 `vector-lake/data/tmp` 均未创建。
+- 验证：新增 `tests/test_graph_algo_contract.py::test_default_output_path_is_the_memory_scratch_tree` 与 `::test_default_output_path_never_escapes_the_memory_root`（断言产物落在 memory 根之内、不再落在其上一级）；活图无参调用 `visualize_vector_lake()` 实测返回 `<MEMORY>/scratch/vector_lake_graph.html`（10,868,401 字节，重写），`<home>/tmp` 与 `vector-lake/data/tmp` 均未创建。
 
 ## 图谱可视化四层算法的六个不变量修复（P0-P2）
 
@@ -2847,7 +2860,7 @@ retention 机制。但被删代码已经用 `CREATE ... IF NOT EXISTS` 把对象
 - **脏标记与陈旧度可见（P2）**：`_apply_graph_topology` 原本把 `dirty` 又置回 `True`，导致该标记永不清除、`refresh_graph_topology_if_dirty` 每次都报“有变更”，且 `centrality_score` 只写过占位值（实测 4,645 节点为 1.0、2,478 节点无此键）。现拆分为 `dirty`（边拓扑，由本模块清除）与 `clustering_stale`（社区划分，由 daemon 清除，跳过聚类时保持为真），旧载荷无该键时回退到 `dirty`。`tool_graph` 在 meta 中新增 `communities_stale` / `community_labels_available` / `read_consistency` / `orphan_page_nodes`，模板新增陈旧告警徽标，工具返回值在社区过期或降级读时显式告警。
 - **锁超时与降级显性化（P2）**：`visualize_vector_lake` 对 169 MB 的 `index.json` 只等 5 秒锁，实测**每次调用都超时**并静默落入无锁读；改为 20 秒（可传参），并在载荷 `meta.read_consistency` 与返回串中标记降级。修复后同一活数据在锁内完成（`read_consistency: locked`）。
 - **前端杂项（P2）**：`PALETTE` 补 `Institution` / `Policy` / `Standard` / `Claim` / `System`（前三者是 `VALID_PREFIXES` 中的一等类型，实测 187/7,123 节点此前落到灰色 Unknown）；`onlyRisk` 改走共享 `isRiskyNode()`——原判据 `alignment_score >= 80` 因实测全部为 100.0 而恒真、且把大写 `status === 'Contested'` 与小写字面量比较、又对无该字段的 claim 节点求值，四种情形下都不可能过滤；删除从未被读取的 `timeFilterRatio` 死变量。
-- 验证：新增 `tests/test_graph_algo_contract.py`（18 例，覆盖去重/封顶/确定性/幂等、骨架覆盖率与关系分级、社区 ID 唯一性与稳定性、载荷去重与真度、陈旧度回退、洞察契约与上限）；全量 pytest 676 例通过；另有 4 例失败属于本次改动之外的既有问题——`test_ingest_contract.py` 两例源于工作区未提交的 `native_llm._stable_task_root()` 把 ingest 包移到 `MEMORY/wiki/.meta/subagent_tasks/` 后触发 `remove_task_packet` 的 brain-tree 守卫，`test_runtime_health.py` 一例源于未提交的 `runtime_health.py` 把 `mutation_outbox_failed` 从 `issues` 降为条件门控，`test_portability.py[ingest_runner.py]` 源于本次会话期间新出现的未跟踪文件 `scripts/ingest_runner.py` 内硬编码 `C:/Users/shich/MEMORY`；活图验证使用 `MEMORY/scratch/accept_graph_fixes.py`（只读，7,123 节点重放全部指标）与 `MEMORY/scratch/measure_repulsion.js`（node 25 实测新旧斥力开销），`node --check` 校验生成 HTML 的内联脚本语法通过。
+- 验证：新增 `tests/test_graph_algo_contract.py`（18 例，覆盖去重/封顶/确定性/幂等、骨架覆盖率与关系分级、社区 ID 唯一性与稳定性、载荷去重与真度、陈旧度回退、洞察契约与上限）；全量 pytest 676 例通过；另有 4 例失败属于本次改动之外的既有问题——`test_ingest_contract.py` 两例源于工作区未提交的 `native_llm._stable_task_root()` 把 ingest 包移到 `MEMORY/wiki/.meta/subagent_tasks/` 后触发 `remove_task_packet` 的 brain-tree 守卫，`test_runtime_health.py` 一例源于未提交的 `runtime_health.py` 把 `mutation_outbox_failed` 从 `issues` 降为条件门控，`test_portability.py[ingest_runner.py]` 源于本次会话期间新出现的未跟踪文件 `scripts/ingest_runner.py` 内硬编码本机 MEMORY 绝对路径；活图验证使用 `MEMORY/scratch/accept_graph_fixes.py`（只读，7,123 节点重放全部指标）与 `MEMORY/scratch/measure_repulsion.js`（node 25 实测新旧斥力开销），`node --check` 校验生成 HTML 的内联脚本语法通过。
 - 未验证：未对活 `MEMORY` 运行聚类 daemon（其写入未被本次授权覆盖），因此活图 `community_labels` 仍为空、`clustering_stale` 仍为真——工具现在会显式告警而非静默展示过期划分；`weighted_edges` 的收敛要在下一次批次更新或全量重建时才落到磁盘。
 
 ## lint 自动合并改走共享合并器 + 治理项与其效果同事务提交

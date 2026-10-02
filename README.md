@@ -27,7 +27,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 |删除类命令默认演练|`gc` / `delete` 默认 dry-run，必须 `--apply` 才落盘|保持默认；仅在确认 dry-run 输出后追加 `--apply`|
 |修复类工具需要后置重建|`wiki-restore` 会恢复 Markdown，但索引投影需单独重建|按其输出末尾提示运行 `projection-rebuild-index --apply`|
 |全量重建成本取决于语料与后端|全量重建需要读取与分词正文；增量路径可跳过未变更节点，不使用旧语料耗时外推当前实例|仅在必要时全量重建；日常依赖增量更新，并记录当前工作负载下的耗时|
-|过滤态扩容有界，采样延迟不等于普适 SLA|2026-10-01，7,162 个向量的生产库只读快照，本地热态 `_search_scored_pages`，不含 provider 网络：36 个跨域过滤场景各重复 3 次，前缀复用前后 **p50 69.5 → 55.6 ms、p95 180.6 → 95.8 ms**，108 对结果、分数、顺序及诊断一致。另测 12 个默认过滤查询各 3 次，p95 **507.0 → 363.9 ms**，说明宽泛查询仍可能超过 250 ms；不是所有过滤查询都已满足预算|已实施查询内候选池前缀与过滤判定复用，触顶控制场景的位表扫描 **9 → 2 次**。**4096 上限及不完整告警保留**，不能用缓存消除召回缺口；候选池不是精确全量检索，历史同构一致性测试也不等于人工相关性验收|
+|过滤态扩容有界|查询内复用候选池前缀与过滤判定；候选池最多 4096 条，宽泛过滤仍可能触顶或超过延迟预算|触顶时保留不完整告警，不把有界候选检索写成精确全量检索。性能需按当前语料和 provider 网络重新测量，历史结果见 [CHANGELOG](CHANGELOG.md)|
 |人工编辑会经过校验|未通过 schema / 目的契约校验的手改页面会被拒绝并保留原文件，日志给出原因|修复页面后重新保存，或查看守护进程状态文件的 `current_action`|
 
 ## Architecture
@@ -185,16 +185,29 @@ Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Deskt
         "-m",
         "vector_lake.mcp_server"
       ],
-      "cwd": "C:/path/to/vector-lake",
       "env": {
-        "PYTHONPATH": ".",
-        "PYTHONUTF8": "1",
-        "GEMINI_API_KEY": "your-api-key"
+        "PYTHONPATH": "C:/path/to/vector-lake",
+        "PYTHONUTF8": "1"
       }
     }
   }
 }
 ```
+
+`PYTHONPATH` 使用仓库的绝对路径，避免依赖不同客户端的工作目录规则。需要向量嵌入时，由启动环境或客户端的私有配置提供 `GEMINI_API_KEY`，不要把真实密钥写入共享示例。
+
+Pi 1.0 的文件配置位于 `~/.pi/agent/mcp.json`；其他客户端使用各自的配置入口。在具备 `tool_search` 的 Pi 会话中，可以在该 server 项增加：
+
+```json
+{
+  "toolExposure": {
+    "query_logic_lake": "deferred",
+    "finalize_query_synthesis": "deferred"
+  }
+}
+```
+
+这是 Pi 的工具暴露配置，不应直接复制到其他 MCP 客户端。更新服务代码后，常驻 Python 进程需要重连或重启；Pi 使用 `/mcp reconnect mentat-mind-mcp`。`doctor` 的新进程导入检查不等于现有连接已经加载新代码。
 
 ### 6. 启动后台守护进程 (Starting Daemon)
 
@@ -263,7 +276,7 @@ Windows 上的常驻形态是计划任务 **`VectorLake-Watchdog`**：`scripts/r
 * `validity_factor`
 * `memory_score`
 
-**相关性排序**：字段命中权重（key 4 / text 3 / page 1 / type 1）按 `log(1 + N/df)` 缩放；`memory_type` 不参与 df 统计。先按相关性排序，`memory_score` 只裁决平局，最终以 `memory_id` 升序稳定排序。索引与全量扫描使用同一口径。
+**相关性排序**：字段命中权重（key 4 / text 3 / page 1 / type 1）按 `log(1 + N/df)` 缩放；`memory_type` 不参与 df 统计。依次按查询相关性、`memory_score`、更新时间降序排序，再以 `memory_id` 升序破同分；索引与全量扫描使用同一口径。候选窗口另保留 canonical `rowid` 的自然顺序，索引触发器维护对应的 `source_rowid`。
 
 冲突规则：
 
@@ -457,12 +470,47 @@ python cli.py anchor-backfill --only 1,2,5,9-14 --apply
 * `gram-index`：报告或重建精确 n-gram 倒排。脏基表不服务，检索退回精确扫描；重建分批 staging，最后经内容指纹校验发布。`--if-due` 根据基表可用性、500 个脏文档阈值、搜索成本摊销及交互式搜索阈值判断到期。守护进程提供定时维护；手工命令本身不要求守护进程运行。以实际 `due=` 和 `Watchdog Status` 判断维护状态。
 * `backup-retention`：只约束 `.meta/backups` 中的数据库副本，默认保留最新 3 份，其余受 12 GiB 预算约束；最新一份不会因超预算被删。`MEMORY/backup/` 中的页面恢复点不在此范围。
 * `idempotency-status` / `repair-idempotency`：检查唯一性等级，清理冗余幂等键以恢复完整唯一索引，不删除业务行。
-* `claim-pointer-report` / `claim-pointer-repair`：检查及摘除证据中的死 claim 指针，先记录回滚项；`--edges` 只修正可解析的目标页面键，不改边的出处页，不更新证据新鲜度。
+* `claim-pointer-report` / `claim-pointer-repair`：检查及摘除证据中的死 claim 指针，先记录回滚项；`--edges` 只修正可解析的目标页面键，不改边的出处页，不更新证据新鲜度。该入口不清理历史孤儿 operational memory，后者使用下述冻结范围维护脚本。
 * `claim-evidence-queue`：按缺口形状与 cohort 分批进入治理队列，默认演练，`--apply` 才入队。出处缺口不自动转成外部研究指令。占位符和运行态 Packet 叙述不作为 claim。
 * `provenance-backfill`：仅根据摄入台账或唯一源文件逆匹配补来源，经正常写入门提交并保留回滚记录；多义与无匹配时弃权。`provenance-accept` 记录已接受的遗产缺口，不把它伪装成已找到来源。
 * `anchor-draft`：依据候选出处的判别词起草块级归属，并提供原文行供复核；证据不足时弃权。`anchor-backfill --only ... --apply` 只写确认项并保留回滚记录。
 
 锚点写入需保持 claim 清洗后的文本与 ID 不变：出处标记贴紧追加；含括号而不能安全解析的出处跳过；只定位正文，不在标题或 frontmatter 上补锚点。迁移执行统计与旧评测记录不作为当前运维状态，历史版本见 Git 与 CHANGELOG。
+
+### 历史孤儿记忆的定向维护
+
+正常页面删除会在同一 native SQLite 事务中，先删除引用所选 claim 的运行态记忆，再删除 claim；lookup 行和 gram dirty / retirement 标记由数据库触发器同步维护。初始化会刷新原生 INSERT / UPDATE lookup 触发器，避免旧定义遗漏 `source_rowid`。
+
+遗留孤儿使用 `scripts/repair_orphan_memory.py`，不需要全库重建。仅选择 claim、页面投影和显式 canonical `page_key` 都已不存在的记忆；实体显示名或 ID 相同不算该页面仍存在。`freeze` / `apply` 要求 canonical mutation outbox 已结算，冻结最多 2000 条。以下为 PowerShell 示例，路径与批准值须按本机实际范围填写：
+
+```powershell
+$env:VECTOR_LAKE_MEMORY_DIR = "C:/data/MEMORY"
+$Database = "$env:VECTOR_LAKE_MEMORY_DIR/wiki/.meta/vector_lake.db"
+$Archive = "$env:VECTOR_LAKE_MEMORY_DIR/wiki/.meta/backups/orphan-memory-recovery"
+$ApprovedCount = [int](Read-Host "输入已核对的冻结数量")
+
+python scripts/repair_orphan_memory.py --database $Database --archive $Archive --mode freeze --expect-count $ApprovedCount
+python scripts/repair_orphan_memory.py --database $Database --archive $Archive --mode dry-run
+# 核对 manifest 与 dry-run 的数量和 scope hash 后，才输入批准 hash 并执行写入。
+$ApprovedScopeHash = Read-Host "输入已批准的 scope SHA256"
+python scripts/repair_orphan_memory.py --database $Database --archive $Archive --mode refresh-triggers --approved-count $ApprovedCount --approved-sha256 $ApprovedScopeHash
+python scripts/repair_orphan_memory.py --database $Database --archive $Archive --mode apply --approved-count $ApprovedCount --approved-sha256 $ApprovedScopeHash
+```
+
+只有需要撤回清理时，才使用同一 archive、批准数量及 hash 执行恢复；不要把它与清理流程连续运行：
+
+```powershell
+python scripts/repair_orphan_memory.py --database $Database --archive $Archive --mode restore --approved-count $ApprovedCount --approved-sha256 $ApprovedScopeHash
+```
+
+* 默认模式为 `dry-run`；`apply` / `restore` / `refresh-triggers` 都必须显式绑定批准数量与 scope hash。不要把有写入作用的 mode 当作预览。
+* `refresh-triggers` 只替换 `trg_om_index_insert` / `trg_om_index_update`，验证行内容与其他 schema 不变；不迁移表结构，也不回填全库历史行。触发器更新需单独纳入授权。
+* `apply` 在独占 native 事务内重验实时范围、原始 payload 与 canonical 行号；范围变化、未结算 outbox、嵌套事务或索引验证失败均拒绝提交。无关记忆、lookup 和已有 gram 标记保持不变。
+* `restore` 恢复原始 canonical 行号与字段，重新生成正确的 lookup；已有 ID 或行号冲突时拒绝覆盖。旧版本错误的 lookup 排序标记不是恢复目标。
+* SQL 与迭代采用合作式 deadline，不能承诺操作系统 I/O 永不阻塞。提交后连接清理或回执出版失败，返回明确的 `state=committed` 及错误元数据；不能当作未执行直接重试。
+* archive 包含完整 SQLite 快照和原始记忆 payload，应保留在本机私有备份目录，不进入 Git、模型审查包或对外报告。恢复演练使用隔离数据库，不能在生产库上随意往返执行。
+
+执行后检查 `claim-pointer-report`、`projections` 与 `doctor`。gram 索引可能因其他摄取产生 live dirty backlog 而回退精确扫描；这不等于清理失败，也不代表应强制重建。是否维护以实际 `due=`、写入门和用户授权为准。
 
 ## Config
 

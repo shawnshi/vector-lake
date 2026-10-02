@@ -344,9 +344,10 @@ def _create_operational_memory_index(conn: sqlite3.Connection) -> None:
         ("trg_om_index_insert", "AFTER INSERT"),
         ("trg_om_index_update", "AFTER UPDATE"),
     ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         conn.execute(
             f"""
-            CREATE TRIGGER IF NOT EXISTS {trigger}
+            CREATE TRIGGER {trigger}
             {event} ON operational_memory
             BEGIN
                 INSERT INTO operational_memory_index ({columns})
@@ -2371,6 +2372,11 @@ def delete_node_cascade(node_key: str):
         mirror = _tantivy()
         if mirror is not None:
             _tan_quiet(mirror.delete_node, node_key)
+        conn.execute(
+            "DELETE FROM operational_memory WHERE f_source_claim_id IN ("
+            "SELECT claim_id FROM claims WHERE f_page_key = ? OR f_source_page IN (?, ?))",
+            (node_key, node_key, node_key + ".md"),
+        )
         conn.execute(
             "DELETE FROM claims WHERE "
             "f_page_key = ? OR "
