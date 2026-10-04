@@ -117,19 +117,20 @@ graph TD
 
 * **Python**: `>= 3.10`（推荐 3.11 \~ 3.13）。
 * **操作系统**: Windows (需支持 UTF-8)、macOS、Linux。
-* **大模型 API Key（可选）**: `GEMINI_API_KEY`（用于混合检索中的向量生成；若不配置，系统以纯词法 FTS5 + 图拓扑降级运行，不阻断核心读写）。
+* **嵌入模型凭据（可选）**：`GEMINI_API_KEY` 仅用于 embedding；未配置时检索使用 FTS5 与图拓扑，不能生成或补齐向量。文本编译另需具备 subagent 能力的宿主，配置此 Key 不会使 `sync` 自行调用文本模型。
 
 ### 2. 依赖安装 (Dependencies)
 
 ```powershell
 # 1. 克隆仓库并进入根目录
+git clone https://github.com/shawnshi/vector-lake.git
 cd vector-lake
 
 # 2. 安装 Python 核心运行时依赖
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 # 3. 可选：首次安装原生核心需要 Rust 与 maturin（详见“原生性能加速”）
-pip install maturin
+python -m pip install maturin
 python scripts/build_core.py
 ```
 
@@ -142,19 +143,22 @@ cp config.example.json config.json
 
 `config.json` 核心字段说明：
 
-* `memory_dir`: 自定义 `MEMORY` 根目录路径（留空时默认查找环境约定的 `MEMORY/` 目录）；
-* `target_directories`: 摄入扫描目录；留空时扫描当前 `MEMORY/raw`，非空时替代默认目录（相对路径基于项目根目录，注意勿指向私密资料）；
-* `supported_extensions`: 允许编译的原始资料后缀（默认 `[".md", ".txt"]`）。
+* `memory_dir`：自定义 `MEMORY` 根目录；优先级为 `VECTOR_LAKE_MEMORY_DIR`、此字段、宿主历史默认路径。新部署建议显式设置绝对路径，避免误用宿主目录。
+* `target_directories`：摄入扫描目录；留空时扫描当前 `MEMORY/raw`，非空时替代默认目录（相对路径基于项目根目录）。
+* `exclude_paths`：默认排除 `stocks/`、`garmin/`、`personal-insights/`；配置会覆盖默认列表。另有代码级规则拒绝 `privacy/.../Diary/...` 来源，不能通过配置解除。
+* `supported_extensions`：允许编译的原始资料后缀（默认 `[".md", ".txt"]`）。
+
+启用 embedding 或宿主编译会将相关文本交给模型服务。先核对扫描目录、排除项及宿主的数据边界；本地文件优先不等于零外联。
 
 **关键环境变量（由宿主环境注入；项目不会自动加载 `.env`）：**
 
 |环境变量|作用|推荐值|
 |-|-|-|
 |`PYTHONUTF8`|强制 Python 运行时使用 UTF-8 编码（Windows 强烈推荐）|`1`|
-|`GEMINI_API_KEY`|向量嵌入模型 API Key（Gemini Embedding）；通过本机环境或私有配置提供，不要提交凭据|不在仓库填写|
+|`GEMINI_API_KEY`|向量嵌入模型 API Key（Gemini Embedding）；代码从进程环境读取，不从 `config.json` 读取凭据|不在仓库填写|
 |`VECTOR_LAKE_MEMORY_DIR`|显式指定 MEMORY 根路径（优先级高于 `config.json`）|例如 `C:/path/to/MEMORY`|
-|`VECTOR_LAKE_RUNNER_SHADOW`|设为 `1` 时摄取 Runner 仅模拟评估而不真实写页|默认 `0`|
-|`VECTOR_LAKE_RUNNER_CONCURRENCY`|摄取 Runner 并发模型调用线程数（批量摄取加速）|推荐 `3` \~ `5`|
+|`VECTOR_LAKE_RUNNER_SHADOW`|Watchdog 拉起 Runner 时，设为 `1` 只评估、不写 Wiki 页面；直接运行 `ingest_runner.py` 默认 shadow，需 `--no-shadow` 才写页|默认 `0`（Watchdog 路径）|
+|`VECTOR_LAKE_RUNNER_CONCURRENCY`|摄取 Runner 并发模型调用线程数，也可由 `ingest_runner.py --concurrency` 覆盖|默认 `1`；按宿主容量调整|
 |`VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE`|设为 `1` 时 shadow 轮不释放已认领的任务包（保留租约供人工检查；默认释放以便下一轮重试）|默认 `0`|
 |`VECTOR_LAKE_QUERY_CONTEXT_TTL`|Query 上下文临时文件的过期秒数|默认 `7200` (2小时)|
 |`VECTOR_LAKE_VECTOR_SIM_SCALE`|Sum 混合检索模式下向量相似度权重乘数|默认 `15.0`|
@@ -231,13 +235,13 @@ python watchdog_sync.py
 * **持久化增量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台变更先写 durable outbox，Watchdog 合并批次后更新索引；`_calculate_weighted_edges` 使用稀疏遍历并限制每节点投影边数。
 * **跨平台 I/O 韧性 (I/O Resilience)**：后台子脚本拉起时注入 `PYTHONIOENCODING=utf-8`，避免中文 Windows 上的编解码崩溃。
 * **定时确定性维护 (Scheduled Deterministic Maintenance)**：每天 10:00 与 23:00 刷新脏图拓扑、执行只读 lint、在索引落后时重建 gram 倒排、做 SQLite WAL checkpoint 并执行备份保留；重建与 checkpoint 都在 lint 的失败范围之外，lint 自身失败也会被有界重试而不是无限重跑。另有一条独立节拍的兜底扫描（`VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`，默认 900 秒）负责把未入队的 raw 源重新入队、作废陈旧任务、释放失去 job 的在途标记，并按批次重建缺失或**输入已变**的向量。研究、去重、聚类等独立脚本不会被该循环隐式启动。
-* **向量投影存于 SQLite (vec\_embeddings)**：向量由 `sqlite-vec` 存放于 `vector_lake.db` 的 `vec_embeddings` 表，不再依赖模型侧的 JSON 载荷；语义去重守护进程只读该表，读取失败时退回**词法/拓扑去重**（不是旧缓存）。向量的**存在不等于有效**：页面被绕过增量索引的路径改写、或全量重建改动了别名与摘要时，旧向量不会被删除，只会默默继续用已经不存在的正文答题。因此每个节点在写入向量的同时记录其嵌入输入的摘要（`vec_embedding_inputs`），周期兜底每轮全量比对（实测 7175 节点 0.41 秒），把缺失、输入已变、以及未打标的节点一并按批重建；需要一次性全量重建时用显式 `embedding-backfill`。
+* **向量投影存于 SQLite (vec\_embeddings)**：向量由 `sqlite-vec` 存放于 `vector_lake.db` 的 `vec_embeddings` 表，不再依赖模型侧的 JSON 载荷；语义去重守护进程只读该表，读取失败时退回**词法/拓扑去重**（不是旧缓存）。向量的**存在不等于有效**：页面被绕过增量索引的路径改写、或全量重建改动了别名与摘要时，旧向量不会被删除，只会默默继续用已经不存在的正文答题。因此每个节点在写入向量的同时记录其嵌入输入的摘要（`vec_embedding_inputs`），周期兜底每轮比对当前节点，把缺失、输入已变、以及未打标的节点一并按批重建；需要一次性全量重建时用显式 `embedding-backfill`。
 * **本体免疫型排重 (Ontology-Immune Deduplication)**：去重守护进程豁免 `Source_*` 等时序不可变信源，避免“相似度过高即合并”把不同日期的研报强行合流。
 * **合并的可回放性 (Merge Durability)**：`resolution=merge` 只能在合并**已落盘**时写下。类型/ID 不匹配不再静默落到 `_mark_resolved`（fail-closed），声明的名字与文件名不一致（`_`/`-`）时回退查别名注册表，落盘时同写 `merge_applied`/`applied_at`；`lint` 按 `unapplied_merge_items()` 报出“已 resolved 但两页俱在”的条数——只看 `type`/`status` 会把早先已判定为 `skip` 的近邻算成待办。**被消费页的键与标题必须进入幸存页的 `aliases`**（`semantic_merge._union_frontmatter` 的既有规则）：链接解析只认文件名、标题与 frontmatter `aliases`，不读 SQLite 别名表。
 * **统一 SQLite 数据底座 (Unified SQLite Engine)**：实体、断言、证据、信源、图拓扑、变更集、治理队列与运行态记忆统一落在 SQLite，启用 WAL。
 * **差分垃圾回收机制 (Diff-based GC)**：Markdown 层面重命名 / 删除或断言被移除时，同步层按页面增量清理对应的实体、断言与证据，不再只增不减。
 * **夜间拾荒者集群 (Janitor Swarm)**：语义去重的**分片准备器**。`python scripts/launch_janitor_swarm.py` 读取治理队列中的 pending merge 项，按 `SHARD_SIZE` 切分为子代理任务包并写出 `janitor_manifest.json`。**它不会自行合并或启动任何外部进程**；实际合并由宿主子代理调用 `resolve_governance_item` 或 `bulk_reconciliation` 完成。
-* **MCP 载荷沙箱 (Payload Sandbox)**：所有长文本参数经 `payload_file` 指向的文件传入，读取受 `VECTOR_LAKE_PAYLOAD_ROOT`（或 `brain/<run>/scratch/`）与 `VECTOR_LAKE_PAYLOAD_MAX_BYTES` 限制，避免命令行传参截断与注入。
+* **MCP 载荷沙箱 (Payload Sandbox)**：`write_wiki_page` 等文件载荷入口要求 `payload_file`；`update_operational_memory` 也接受直接 `content`，治理与摄取提交入口另支持内联参数。文件读取受沙箱路径与 `VECTOR_LAKE_PAYLOAD_MAX_BYTES` 限制；`VECTOR_LAKE_PAYLOAD_ROOT` 扩展允许根，不替代内置 `brain/<run>/scratch/` 沙箱。这是文件读取约束，不是模型、网络或进程隔离。
 
 ### 日常运行入口
 
@@ -537,9 +541,9 @@ python scripts/repair_orphan_memory.py --database $Database --archive $Archive -
 * `VECTOR_LAKE_BACKUP_KEEP` / `VECTOR_LAKE_BACKUP_MAX_BYTES`：`backup-retention` 的默认保留份数（`3`）与字节预算（`12 GiB`）。
 * `VECTOR_LAKE_RUNNER_EXPECTED=0`：不再把缺失的摄取 Runner 报为告警；用于不需要摄取的主机。
 * `VECTOR_LAKE_RUNNER_AUTOSTART=0`：不让 `watchdog_sync.py` 拉起并看护摄取 Runner（保留 `runner_absent` 告警，用于手工管理 Runner 的主机）。默认开启。
-* `VECTOR_LAKE_RUNNER_MODEL_CMD`：自动拉起的 Runner 使用的模型接缝命令（等价于 `--model-cmd`），默认 `python scripts/ingest_model_pi_subagents.py`（即本机 `runner_supervisor.json` 记录的生产值）。相关脚本另读 `VECTOR_LAKE_RUNNER_PI_BIN`、`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT`、`VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`、`VECTOR_LAKE_RUNNER_COOLDOWN`。
-* `VECTOR_LAKE_RUNNER_REPAIR_ATTEMPTS`：`finalize_ingest` 拒绝后的修正重试轮数（默认 `2`；`0` 关闭）。拒绝时 Runner 把校验器的原始报错与上一次输出回灌给模型再试：措辞或形状失误只多花一次模型调用，而不消耗 job 的尝试预算（到上限即弃源）。之所以需要这层，是因为 prompt 与校验器曾长期各持一份规则而只能靠猜；契约现已随 packet 投递，这层是兜底而非替代。轮数是计数而非开关，因为单一源可能叠加多个互不相关的 schema 违规（实测：先命名违规、再缺张力槽位）。
-* `VECTOR_LAKE_RUNNER_SHADOW=1`：让自动拉起的 Runner 只报告 `needs-model`、不写页面。默认关闭，因为默认复现的是本机原本常驻的写入配置（`shadow=false`）；新主机若只想观察应先打开它。
+* `VECTOR_LAKE_RUNNER_MODEL_CMD`：自动拉起的 Runner 使用的模型接缝命令，默认 `python scripts/ingest_model_pi_subagents.py`。直接运行 `scripts/ingest_runner.py` 时需用此变量或 `--model-cmd` 提供模型接缝。相关脚本另读 `VECTOR_LAKE_RUNNER_PI_BIN`、`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT`、`VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`、`VECTOR_LAKE_RUNNER_COOLDOWN`。
+* `VECTOR_LAKE_RUNNER_REPAIR_ATTEMPTS`：`finalize_ingest` 拒绝后的修正重试轮数（默认 `2`；`0` 关闭）。Runner 将校验器报错与上一次输出交给模型修正；每轮会增加模型调用，到上限后进入失败处理。输出契约随任务包投递，重试不能替代校验。
+* `VECTOR_LAKE_RUNNER_SHADOW=1`：让自动拉起的 Runner 不写 Wiki 页面，默认关闭。直接运行 `scripts/ingest_runner.py` 默认 shadow，使用 `--no-shadow` 才写页；shadow 跳过模型调用，但仍会认领任务、处理重复来源并记录运行状态，不是零副作用模式。
 * `VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`：守护进程的周期性兜底间隔（默认 `900` 秒；`0` 关闭）。兜底做三件事：把未摄入的 raw 源重新入队（否则失去事件、被取消或从未入队的源没有回到队列的路径）、把超过时限的陈旧摄取任务作废、以及按批次重建缺失或输入已变的向量。
 * `VECTOR_LAKE_CATCHUP_EMBEDDING_BATCH`：兜底每轮最多重新嵌入多少个节点（默认 `200`；`0` 关闭该半部）。增量索引在页面变更时会作废其向量且按契约不调用 embedding API，兜底是把这个失效补回来的自动对应物；批大小的上限保证循环不被长时间占用。
 * `VECTOR_LAKE_CATCHUP_EMBEDDING_BUDGET_SECONDS`：兜底单个 embedding 批次允许等待的上限（默认 `120` 秒，含限流窗口与重试）。超出被记为失败批并留给下一轮，而不是占住 900 秒的节拍——配额错误每次重试固定 sleep 60 秒，不设上限时两个批次就能吃掉整轮。
@@ -616,21 +620,13 @@ python scripts/repair_orphan_memory.py --database $Database --archive $Archive -
 
 #### CJK 分词
 
-CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
+CJK 分词仅使用 `rjieba`（统一入口 `vector_lake/tokenizer.py`）。无法导入时会告警并标记为 `unavailable`，不切换到其他分词后端；CJK 预切词停用，检索召回会受影响：
 
 |后端|角色|安装|
 |-|-|-|
 |**`rjieba`（唯一后端）**|`jieba-rs` 的官方 PyO3 绑定（同作者 messense），Rust 实现|必需依赖；提供 `cp38-abi3` wheel（Windows / macOS / manylinux / musllinux），**无需编译器**|
 
-
-
-|对比对象|结果|
-|-|-|
-|完整 token 流|**16/500 相同（3.2%）**|
-|**只含 CJK 的 token 流**|**500/500 相同（100%），差异位置 0**|
-
-即 0.9 → 0.11 改的是** ASCII/标点串的切分**（`Concept_1 - 0` → `Concept_1-0`、`1+5 + 2` → `1 + 5 + 2`），
-切换分词后端前验证相关性，并重建 FTS 中的预切词投影。原生核心的更新方式见下文。
+升级分词依赖时应验证当前语料的检索相关性，并重建 FTS 中的预切词投影；不沿用未绑定版本与样本的历史 token 对比结果。原生核心的更新方式见下文。
 
 #### 原生性能加速 (Rust Native Acceleration)
 
@@ -747,6 +743,14 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 
 ## Validation
 
+README 的命令示例、MCP 工具表、依赖说明及配置项可通过定向测试核对；测试使用临时 MEMORY 根，不读写本机知识库：
+
+```powershell
+$env:PYTHONUTF8='1'; python -m pytest -p no:cacheprovider -q tests/test_command_surface.py tests/test_registries.py tests/test_dependency_manifest.py tests/test_portability.py tests/test_mcp_surface_improvements.py tests/test_runner_supervision.py
+```
+
+完整测试与实例运行检查（`doctor`、`search`、`debt` 面向当前配置的知识库，不是隔离测试）：
+
 ```powershell
 $env:PYTHONUTF8='1'; python -m pytest -p no:cacheprovider -q      # 与 CI 一致
 $env:PYTHONUTF8='1'; python -m compileall -q vector_lake tests
@@ -755,7 +759,7 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-测试数量、语料规模和运行时健康度会随实例变化，应执行当前验证命令。README 只保留注明工作负载与日期的性能样本；历史变更和评测记录见 CHANGELOG 与 Git 历史，不作为当前健康度或质量保证。
+测试数量、语料规模和运行时健康度会随实例变化，应执行当前验证命令。历史变更和评测记录见 CHANGELOG 与 Git 历史，不作为当前健康度或质量保证。
 
 ## Notes
 
