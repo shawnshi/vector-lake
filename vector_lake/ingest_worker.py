@@ -2,7 +2,10 @@ import time
 import logging
 import json
 
-from vector_lake.db_store import claim_pending_jobs, get_connection, mark_job_awaiting_subagent, update_job_status
+from vector_lake.db_store import (
+    claim_pending_jobs, get_connection, mark_job_awaiting_subagent,
+    update_job_status, DispatchClaimLost, fail_dispatch_claim,
+)
 from vector_lake.native_llm import create_subagent_task
 from vector_lake.output_contract import build_output_contract
 from vector_lake.schema_validator import INGEST_INTEGRATION_PREDICATES, VALID_PREDICATES
@@ -67,7 +70,7 @@ def _subagent_ingest_prompt(instructions: str) -> str:
 
 
 def process_jobs():
-    from vector_lake.tool_ingest import requeue_legacy_ingest_jobs
+    from vector_lake.tool_ingest import requeue_legacy_ingest_jobs, refresh_ingest_dispatch_payload
 
     requeue_legacy_ingest_jobs()
     # Short lease: this step only builds a task packet and marks the job awaiting, which is
@@ -90,6 +93,7 @@ def process_jobs():
             log.info(f"Dispatched job {job_id} of type {task_type}")
             
             if task_type == "ingest":
+                payload = refresh_ingest_dispatch_payload(payload)
                 filepath = payload["filepath"]
                 file_hash = payload["hash"]
                 instructions = payload["instructions"]
@@ -126,15 +130,19 @@ def process_jobs():
                         "output_contract": build_output_contract(),
                     },
                 )
-                mark_job_awaiting_subagent(job_id, str(task_path))
+                mark_job_awaiting_subagent(job_id, str(task_path),
+                                          dispatch_payload=payload, dispatch_claim=job)
                 log.info(f"Created subagent ingest task for job {job_id}: {task_path}")
                 
             else:
-                update_job_status(job_id, "failed", f"Unknown task_type {task_type}")
+                fail_dispatch_claim(job, f"Unknown task_type {task_type}")
                 
+        except DispatchClaimLost as e:
+            log.warning("Job %s handoff withheld: %s", job_id, e)
         except Exception as e:
             log.error(f"Job {job_id} failed: {e}")
-            update_job_status(job_id, "failed", str(e))
+            if not fail_dispatch_claim(job, str(e)):
+                log.warning("Job %s failure not recorded: dispatch claim no longer owned", job_id)
 
 #: Normal cadence of the ingest worker loop.
 INGEST_WORKER_INTERVAL_SECONDS = 5.0

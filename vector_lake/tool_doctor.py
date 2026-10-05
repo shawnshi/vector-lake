@@ -368,6 +368,15 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
     except Exception as e:
         checks.append(("Idempotency Index", False, f"Check failed: {e}"))
 
+    try:
+        from vector_lake.db_store import processed_checksum_anomalies
+        anomalies = processed_checksum_anomalies()
+        checks.append(("Source Checksum Observations", True, f"invalid historical checksums={anomalies}; history unchanged"))
+        if anomalies:
+            warnings.append(f"invalid_source_checksums:{anomalies} (automatic dispatch withheld; verify provenance)")
+    except Exception as e:
+        checks.append(("Source Checksum Observations", False, f"Check failed: {e}"))
+
     # ``page_index_edges`` is the read projection of the published ``weighted_edges``.  A partial
     # update rewrites only the nodes it touches, so drift between the file and the projection is
     # invisible until something compares them -- which is what this check does, against the file.

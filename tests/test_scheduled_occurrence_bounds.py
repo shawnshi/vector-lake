@@ -52,7 +52,7 @@ def test_the_maintenance_chain_is_outside_the_lints_try_block():
     assert "WAL checkpoint" not in source[lint_try:lint_except]
     assert "wal_checkpoint" not in source[lint_try:lint_except]
 
-    for marker in ("wal_checkpoint(TRUNCATE)", "maybe_rebuild_memory_gram_index", "prune_backups"):
+    for marker in ("checkpoint_wal(conn)", "maybe_rebuild_memory_gram_index", "prune_backups"):
         assert source.index(marker) > lint_except, f"{marker} is inside the lint's blast radius"
 
 
@@ -140,4 +140,4 @@ def test_the_rebuild_runs_outside_the_global_task_lock():
     after = source.split("# The gram rebuild deliberately runs *outside*", 1)[1]
     assert "maybe_rebuild_memory_gram_index" in after
     # The checkpoint must still follow the rebuild: the rebuild defers its auto-checkpoint.
-    assert after.index("maybe_rebuild_memory_gram_index") < after.index("wal_checkpoint(TRUNCATE)")
+    assert after.index("maybe_rebuild_memory_gram_index") < after.index("checkpoint_wal(conn)")

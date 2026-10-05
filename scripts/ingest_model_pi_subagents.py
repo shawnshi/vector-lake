@@ -40,9 +40,10 @@ from pathlib import Path
 
 PI_BIN = os.environ.get("VECTOR_LAKE_RUNNER_PI_BIN", "pi")
 AGENT = os.environ.get("VECTOR_LAKE_RUNNER_SUBAGENT_AGENT", "reviewer")
-TIMEOUT = int(os.environ.get("VECTOR_LAKE_RUNNER_MODEL_TIMEOUT", "1800"))
-
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from vector_lake.process_control import run_contained, model_timeout_seconds
+TIMEOUT = model_timeout_seconds()
 SCRATCH = ROOT / "scratch"
 # Deliberately not an environment switch: the repo root already locates scratch, and a new
 # VECTOR_LAKE_* literal would have to be registered in the README configuration section
@@ -283,10 +284,11 @@ def main() -> int:
         session_dir = Path(tempfile.mkdtemp(prefix="runner_sessions-"))
     _prune_scratch()
     try:
-        proc = subprocess.run(
+        deadline = float(os.environ.get("VECTOR_LAKE_MODEL_DEADLINE_MONOTONIC", time.monotonic() + TIMEOUT))
+        proc = run_contained(
             _argv(pi_path, brief_path, system_path, session_dir),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=TIMEOUT, shell=False,
+            timeout=min(TIMEOUT, deadline - time.monotonic()), shell=False,
         )
     except subprocess.TimeoutExpired as exc:
         # A hung child is a model failure with evidence, not a traceback.

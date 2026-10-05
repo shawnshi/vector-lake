@@ -56,6 +56,7 @@ exact too.  ``tests/test_memory_gram_index.py`` asserts equality with the
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import math
 import os
@@ -782,13 +783,29 @@ def rebuild_due_reason(conn=None) -> str | None:
     """
     conn = conn or get_connection()
     try:
-        if not gram_index_state()["ready"]:
+        state = gram_index_state()
+        if not state["ready"]:
             return "no usable base (never built, truncated, or an older format version)"
     except sqlite3.OperationalError:
         # The index tables do not exist yet.  That is a real state on a database whose
         # first writer has not run init_db, and a rebuild is what creates them.
         return "the index tables are absent"
     live = writes_since_rebuild(conn)
+    max_age = float(os.environ.get("VECTOR_LAKE_MEMORY_GRAM_MAX_BASE_AGE_SECONDS", "3600"))
+    if max_age < 0:
+        raise ValueError("gram maximum base age must be non-negative")
+    if live > 0 and max_age > 0:
+        stamp = state.get("updated_at")
+        try:
+            parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            # Existing state stamps were written with gmtime(), without an offset.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age = time.time() - parsed.timestamp()
+        except (TypeError, ValueError):
+            return "dirty base has no valid rebuild timestamp"
+        if age >= max_age:
+            return f"dirty base age {age:.0f}s exceeds maximum {max_age:.0f}s ({live} pending documents)"
     if live >= REBUILD_AFTER_WRITES:
         return f"{live} document(s) written since the last rebuild (threshold {REBUILD_AFTER_WRITES})"
     # Interactive host: has the slow path been paid for often enough to justify a rebuild before the

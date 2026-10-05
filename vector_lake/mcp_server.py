@@ -1,3 +1,7 @@
+from vector_lake.runtime_environment import configure_numeric_threads
+
+configure_numeric_threads()
+
 import inspect
 import os
 import sys

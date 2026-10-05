@@ -453,6 +453,110 @@ def test_runner_preserves_standalone_reason_for_finalizer_validation():
     assert merged["integration"]["reason"] == "short"
 
 
+def test_dispatch_source_version_update_is_bound_to_job_and_real_finalizer(isolated_memory):
+    from vector_lake.ingest_worker import process_jobs
+    from vector_lake.tool_ingest import claim_ingest_tasks
+    raw = _raw_and_candidate(isolated_memory)
+    tool_ingest.prepare_ingest_batch(batch_size=1)
+    conn = db_store.get_connection()
+    job = conn.execute("SELECT job_id, payload FROM jobs WHERE task_type='ingest'").fetchone()
+    payload = json.loads(job["payload"])
+    canonical = payload["canonical_name"]
+    execute_mutation_plan(canonical, content=_source_content() + "\nSnapshot A.\n")
+    version_a = governance_store.canonical_page_versions({canonical[:-3]})[canonical[:-3]]
+    payload["source_hash"] = version_a
+    with db_store.transaction():
+        conn.execute("UPDATE jobs SET payload=? WHERE job_id=?", (json.dumps(payload), job["job_id"]))
+    execute_mutation_plan(canonical, content=_source_content() + "\nSnapshot B.\n")
+    version_b = governance_store.canonical_page_versions({canonical[:-3]})[canonical[:-3]]
+    assert version_a != version_b
+    process_jobs()
+    stored = json.loads(conn.execute("SELECT payload FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0])
+    task = json.loads(claim_ingest_tasks(limit=1, lease_seconds=3600))[0]
+    processed = task["task_packet"]["metadata"]["processed_data"]
+    assert processed["source_hash"] == stored["source_hash"] == version_b
+    result = tool_ingest.finalize_ingest(
+        [{"filename": canonical, "content": _source_content()}],
+        {**processed, "integration": {"disposition": "standalone", "reason": "Synthetic independent source with no selected compiled relations."}},
+    )
+    assert "Successfully finalized" in result, result
+    assert conn.execute("SELECT retries FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0] == 0
+    assert conn.execute("SELECT file_hash FROM processed_files WHERE filepath=?", (str(raw),)).fetchone()[0] == payload["hash"]
+
+
+def test_mid_refresh_raw_edit_is_refused_and_real_finalizer_rejects_old_snapshot(isolated_memory, monkeypatch):
+    from vector_lake.ingest_worker import process_jobs
+    from vector_lake.tool_ingest import claim_ingest_tasks
+    raw = _raw_and_candidate(isolated_memory)
+    tool_ingest.prepare_ingest_batch(batch_size=1)
+    conn = db_store.get_connection()
+    payload = json.loads(conn.execute("SELECT payload FROM jobs WHERE task_type='ingest'").fetchone()[0])
+    process_jobs()
+    processed = json.loads(claim_ingest_tasks(limit=1, lease_seconds=3600))[0]["task_packet"]["metadata"]["processed_data"]
+    original_candidates = tool_ingest.ingest_context_and_candidates
+    def edit_between_hash_and_source_read(filepath):
+        context = original_candidates(filepath)
+        raw.write_text(raw.read_text(encoding="utf-8") + "\nMid-refresh edit B.\n", encoding="utf-8")
+        return context
+    monkeypatch.setattr(tool_ingest, "ingest_context_and_candidates", edit_between_hash_and_source_read)
+    with pytest.raises(ValueError, match="source changed during dispatch refresh"):
+        tool_ingest.refresh_ingest_dispatch_payload(payload)
+    result = tool_ingest.finalize_ingest(
+        [{"filename": payload["canonical_name"], "content": _source_content()}],
+        {**processed, "integration": {"disposition": "standalone", "reason": "Synthetic attempted finalization from an outdated input snapshot."}},
+    )
+    assert "Successfully finalized" not in result
+    assert conn.execute("SELECT count(*) FROM processed_files WHERE filepath=?", (str(raw),)).fetchone()[0] == 0
+    assert governance_store.canonical_page_versions({payload["canonical_name"][:-3]}).get(payload["canonical_name"][:-3], "") == ""
+
+
+def test_stale_dispatch_handoff_and_failure_cannot_change_new_owner(isolated_memory):
+    db_store.init_db()
+    payload = {"filepath": "raw/synthetic.md", "hash": "synthetic", "canonical_name": "Source_synthetic.md"}
+    job_id = db_store.enqueue_job("ingest", payload)
+    claim = db_store.claim_pending_jobs(limit=1, lease_seconds=120)[0]
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("UPDATE jobs SET lease_until='2000-01-01T00:00:00+00:00' WHERE job_id=?", (job_id,))
+    new_claim = db_store.claim_pending_jobs(limit=1, lease_seconds=120)[0]
+    assert new_claim["lease_until"] != claim["lease_until"]
+    with pytest.raises(db_store.DispatchClaimLost):
+        db_store.mark_job_awaiting_subagent(job_id, "stale-packet", dispatch_payload=payload, dispatch_claim=claim)
+    assert db_store.fail_dispatch_claim(claim, "old worker failed") is False
+    current = dict(conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
+    assert current == new_claim
+
+
+def test_dispatch_expiry_is_checked_after_write_lock_acquisition(isolated_memory, monkeypatch):
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    db_store.init_db()
+    payload = {"filepath": "raw/synthetic.md", "hash": "synthetic", "canonical_name": "Source_synthetic.md"}
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.claim_pending_jobs(limit=1, lease_seconds=120)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("UPDATE jobs SET lease_until=? WHERE job_id=?", ("2026-10-05T12:02:00+00:00", job_id))
+    before = dict(conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
+    class Clock(datetime):
+        current = datetime(2026, 10, 5, 12, 1, 59, tzinfo=timezone.utc)
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+    actual_transaction = db_store.transaction
+    @contextmanager
+    def lock_acquisition_crosses_expiry():
+        with actual_transaction():
+            # Advance only after actual BEGIN IMMEDIATE: deterministic lock-wait simulation.
+            Clock.current = datetime(2026, 10, 5, 12, 2, 5, tzinfo=timezone.utc)
+            yield
+    monkeypatch.setattr(db_store, "datetime", Clock)
+    monkeypatch.setattr(db_store, "transaction", lock_acquisition_crosses_expiry)
+    with pytest.raises(db_store.DispatchClaimLost):
+        db_store.mark_job_awaiting_subagent(job_id, "expired-packet", dispatch_payload=payload, dispatch_claim=before)
+    assert dict(conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()) == before
+
+
 def test_default_runner_integrates_a_source_through_real_finalizer(isolated_memory, monkeypatch):
     """Only the model call is simulated; leases, version gates and Wiki writes use the temp root."""
     import subprocess
@@ -463,7 +567,8 @@ def test_default_runner_integrates_a_source_through_real_finalizer(isolated_memo
     raw = _raw_and_candidate(isolated_memory)
     assert json.loads(tool_ingest.prepare_ingest_batch(batch_size=1))["filepath"] == str(raw)
     process_jobs()
-    task = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+    # Match the resident runner's lease; short claims intentionally reserve no model window.
+    task = json.loads(claim_ingest_tasks(limit=1, lease_seconds=3600))[0]
     processed = task["task_packet"]["metadata"]["processed_data"]
     candidate = processed["integration_candidates"][0]
     canonical = processed["canonical_name"]
@@ -475,7 +580,7 @@ def test_default_runner_integrates_a_source_through_real_finalizer(isolated_memo
         ]},
     }
     monkeypatch.setattr(
-        runner.subprocess, "run", lambda *args, **kwargs:
+        runner, "run_contained", lambda *args, **kwargs:
         subprocess.CompletedProcess(["model"], 0, json.dumps(model_result), ""),
     )
 

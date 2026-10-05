@@ -28,6 +28,9 @@ PROJECT = Path(__file__).resolve().parents[1]
 # Run as a script, ``sys.path[0]`` is this directory, so the package would not import.
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
+from vector_lake.process_control import start_contained_python, stop_contained
+
+
 def _supervisor_status_path() -> Path:
     """Resolved through the library so no install-specific path ships in the source."""
     from vector_lake.wiki_utils import get_meta_dir
@@ -119,7 +122,7 @@ def main() -> int:
 
     child_env = dict(os.environ)
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
-    child_env.setdefault("VECTOR_LAKE_RUNNER_MODEL_TIMEOUT", "1800")
+    child_env.setdefault("VECTOR_LAKE_RUNNER_MODEL_TIMEOUT", "900")
 
     stopping = {"flag": False}
     child: subprocess.Popen | None = None
@@ -128,7 +131,7 @@ def main() -> int:
         stopping["flag"] = True
         if child is not None and child.poll() is None:
             try:
-                child.terminate()
+                stop_contained(child)
             except OSError:
                 pass
             try:
@@ -163,8 +166,8 @@ def main() -> int:
             child_flags = 0
             if os.name == "nt":
                 child_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-            child = subprocess.Popen(child_argv, cwd=str(PROJECT), env=child_env,
-                                     creationflags=child_flags)
+            child = start_contained_python(child_argv, cwd=str(PROJECT), env=child_env,
+                                           creationflags=child_flags)
         except OSError as exc:
             write_status(status="failed", reason=f"cannot start runner: {exc}",
                          child_pid=None, restarts=restarts)

@@ -2746,6 +2746,15 @@ def get_processed_files() -> dict[str, str]:
     cur = conn.execute("SELECT filepath, file_hash FROM processed_files")
     return {row["filepath"]: row["file_hash"] for row in cur.fetchall()}
 
+def processed_checksum_anomalies(conn=None) -> int:
+    """Read-only count; never bless a legacy digest or expose source contents."""
+    conn = conn or get_connection()
+    return int(conn.execute(
+        "SELECT count(*) FROM processed_files WHERE "
+        "observed_size > 0 AND lower(file_hash) = 'd41d8cd98f00b204e9800998ecf8427e'"
+    ).fetchone()[0])
+
+
 def mark_file_processed(
     filepath: str,
     file_hash: str,
@@ -2942,10 +2951,47 @@ def get_jobs_by_status(statuses: list[str], limit: int = 20) -> list[dict]:
     ).fetchall()
     return [dict(row) for row in rows]
 
-def mark_job_awaiting_subagent(job_id: str, task_packet_path: str):
+class DispatchClaimLost(RuntimeError):
+    """A short dispatch claim was superseded or expired; never mutate its new owner."""
+
+
+def _dispatch_claim_current(conn, claim: dict, now: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM jobs WHERE job_id = ? AND status = 'dispatched' "
+        "AND lease_until = ? AND lease_until > ? AND updated_at = ? AND payload = ?",
+        (claim["job_id"], claim["lease_until"], now, claim["updated_at"], claim["payload"]),
+    ).fetchone() is not None
+
+
+def fail_dispatch_claim(claim: dict, reason: str) -> bool:
+    """Spend an attempt only if this exact dispatch claim still owns the job."""
     conn = get_connection()
-    now_str = datetime.now(timezone.utc).isoformat()
     with transaction():
+        if not _dispatch_claim_current(conn, claim, datetime.now(timezone.utc).isoformat()):
+            return False
+        update_job_status(claim["job_id"], "failed", reason)
+        return True
+
+
+def mark_job_awaiting_subagent(job_id: str, task_packet_path: str, *,
+                              dispatch_payload: dict | None = None,
+                              dispatch_claim: dict | None = None):
+    conn = get_connection()
+    with transaction():
+        # BEGIN IMMEDIATE may wait past expiry. Validate using time after acquisition.
+        now_str = datetime.now(timezone.utc).isoformat()
+        if dispatch_payload is not None:
+            if not dispatch_claim or str(dispatch_claim["job_id"]) != str(job_id):
+                raise ValueError("Refreshed handoff requires its exact dispatch claim")
+            if not _dispatch_claim_current(conn, dispatch_claim, now_str):
+                raise DispatchClaimLost("Dispatch claim expired or was superseded before handoff")
+            original = json.loads(dispatch_claim["payload"])
+            for key in ("filepath", "hash", "canonical_name"):
+                if dispatch_payload.get(key) != original.get(key):
+                    raise ValueError(f"Dispatch refresh cannot change queued {key}")
+            # Payload binding and handoff publish in one transaction. No retry/identity reset.
+            conn.execute("UPDATE jobs SET payload = ? WHERE job_id = ?",
+                         (json.dumps(dispatch_payload, ensure_ascii=False), job_id))
         conn.execute(
             "UPDATE jobs SET status = 'awaiting_subagent', task_packet_path = ?, "
             "error_msg = ?, updated_at = ?, lease_until = NULL, lease_owner = NULL, "

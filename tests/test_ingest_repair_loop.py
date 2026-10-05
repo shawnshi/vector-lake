@@ -176,6 +176,27 @@ def test_a_finalize_rejection_is_handed_back_once_and_then_finalizes(isolated_me
     assert repair["previous_output"]["integration"]["relations"][0]["confidence"] == "high"
 
 
+def test_stale_token_spends_no_model_repair_round(isolated_memory, monkeypatch):
+    raw, candidate, good, _bad = _good_and_bad(isolated_memory)
+    calls = _stub_model(monkeypatch, [{**good, "target_hash": "obsolete-token"}])
+    task = _claimed_task(isolated_memory, raw, candidate)
+    res, err = ingest_runner._process_task(task, False, "fake-model", ingest_runner.raw_publication_index())
+    assert res["finalized"] == 0
+    assert "target_hash is stale" in err
+    assert len(calls) == 1
+
+
+def test_missing_token_is_repairable_and_deadline_is_shared(isolated_memory, monkeypatch):
+    raw, candidate, good, _bad = _good_and_bad(isolated_memory)
+    bad = {key: value for key, value in good.items() if key != "target_hash"}
+    calls = _stub_model(monkeypatch, [bad, good])
+    task = _claimed_task(isolated_memory, raw, candidate)
+    res, err = ingest_runner._process_task(task, False, "fake-model", ingest_runner.raw_publication_index())
+    assert res["finalized"] == 1, err
+    assert len(calls) == 2
+    assert calls[0]["_host_deadline_monotonic"] == calls[1]["_host_deadline_monotonic"]
+
+
 def test_a_source_that_fails_twice_is_not_repaired_forever(isolated_memory, monkeypatch):
     """Bounded on purpose: a repeat rejection is a real problem, not a slip."""
     raw, candidate, _good, bad = _good_and_bad(isolated_memory)

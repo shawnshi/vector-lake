@@ -166,7 +166,8 @@ def _spawn(plan: RunnerPlan) -> "subprocess.Popen | None":
     child_env = dict(os.environ)
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
-        return subprocess.Popen(
+        from vector_lake.process_control import start_contained_python
+        return start_contained_python(
             list(plan.argv),
             cwd=str(get_extension_root()),
             env=child_env,
@@ -191,10 +192,11 @@ def terminate_child(timeout: float = 15.0) -> None:
     with _child_lock:
         child = _child
         _child = None
-    if child is None or child.poll() is not None:
+    if child is None:
         return
     try:
-        child.terminate()
+        from vector_lake.process_control import stop_contained
+        stop_contained(child)
         child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:

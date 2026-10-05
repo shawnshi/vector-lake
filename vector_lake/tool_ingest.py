@@ -1203,8 +1203,10 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
         target_key = target[:-3]
         actual_hash = governance_store.canonical_page_versions({target_key}).get(target_key)
         expected_hash = str(relation.get("target_hash") or "")
-        if not expected_hash or expected_hash != actual_hash:
-            raise ValueError(f"integration target_hash is stale or missing for {target}")
+        if not expected_hash:
+            raise ValueError(f"integration relation requires target_hash for {target}")
+        if expected_hash != actual_hash:
+            raise ValueError(f"integration target_hash is stale for {target}")
         if expected_hash != str(manifest[target].get("target_hash") or ""):
             raise ValueError(
                 f"integration target_hash does not match the candidate manifest for {target}"
@@ -1333,6 +1335,33 @@ def _build_ingest_instructions(
         .replace("{{valid_predicates}}", ", ".join(sorted(VALID_PREDICATES)))
         .replace("{{integration_predicates}}", ", ".join(sorted(INTEGRATION_PREDICATES)))
     )
+
+
+def refresh_ingest_dispatch_payload(payload: dict) -> dict:
+    """Take a fresh proposal baseline at dispatch without resetting attempt history."""
+    filepath = str(payload.get("filepath") or "")
+    if not filepath or calculate_hash(filepath) != str(payload.get("hash") or ""):
+        raise ValueError("source changed before dispatch; refusing the stale raw-input job")
+    refreshed = dict(payload)
+    canonical_name = str(payload["canonical_name"])
+    index_context, candidates = ingest_context_and_candidates(filepath)
+    source_text = read_ingest_item_content({"filepath": filepath})
+    refreshed.update(
+        source_hash=governance_store.canonical_page_versions({canonical_name[:-3]}).get(canonical_name[:-3], ""),
+        source_projection_hash=projection_hash(source_text) if source_text else "",
+        ingest_contract_version=INGEST_CONTRACT_VERSION,
+        integration_candidates=candidates,
+        instructions=_build_ingest_instructions(filepath, payload["hash"], canonical_name,
+                                                index_context=index_context),
+    )
+    # Candidate/prompt construction reads files too. Bind every refreshed snapshot to
+    # the queued raw checksum; never stamp H(A) with observations/projection from B.
+    if calculate_hash(filepath) != str(payload["hash"]):
+        raise ValueError("source changed during dispatch refresh; stale snapshot refused")
+    queued_projection = str(payload.get("source_projection_hash") or "")
+    if queued_projection and queued_projection != refreshed["source_projection_hash"]:
+        raise ValueError("source projection changed during dispatch refresh; stale snapshot refused")
+    return refreshed
 
 
 def requeue_legacy_ingest_jobs() -> int:
@@ -1567,6 +1596,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     abandoned = abandoned_source_keys()
     pending_files = []
     skipped_abandoned: list[str] = []
+    quarantined_checksums: list[str] = []
     reconciled: list[str] = []
     skipped_name_only: list[str] = []
     skipped_undated: list[str] = []
@@ -1588,6 +1618,15 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 # change restored with an older mtime (``cp -p``, ``git checkout``).  The content
                 # hash stays the authority whenever the snapshot disagrees.
                 row = processed[filepath]
+                digest = str(row.get("hash") or "")
+                # Published-source reconciliation also stores non-MD5 marker values.
+                # Quarantine only the evidenced impossible empty-MD5/nonempty case.
+                if (row.get("size") is not None and row["size"] > 0
+                        and digest.lower() == "d41d8cd98f00b204e9800998ecf8427e"):
+                    # Unknown provenance is neither unchanged nor a new model task. Preserve
+                    # the historical row and withhold automatic recompilation until verified.
+                    quarantined_checksums.append(filepath)
+                    continue
                 if (
                     row.get("mtime_ns") is not None
                     and row.get("size") is not None
@@ -1658,8 +1697,15 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
         except OSError:
             log.warning("Skipping unreadable raw source: %s", filepath)
 
+    if quarantined_checksums:
+        log.warning("Withheld %d source(s) with invalid historical checksums; ledger unchanged",
+                    len(quarantined_checksums))
+
     if not pending_files:
         notes: list[str] = []
+        if quarantined_checksums:
+            notes.append(f"{len(quarantined_checksums)} source(s) quarantined for invalid historical checksums; "
+                         "verify original publication provenance before repairing or redispatching.")
         if skipped_name_only:
             log.info(
                 "Skipped %d source(s) matched only by the loose page-name signal: %s",

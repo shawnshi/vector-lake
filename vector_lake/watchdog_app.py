@@ -611,6 +611,17 @@ def _save_last_scheduled_lint(occurrence: str, outcome: str = "completed", detai
         log.warning(f"Could not persist the scheduled-lint marker: {exc}")
 
 
+def checkpoint_wal(conn):
+    """SQLite reports busy through a result row, not necessarily an exception."""
+    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if row is None or len(row) != 3:
+        raise RuntimeError("WAL checkpoint returned no valid status row")
+    busy, log_frames, checkpointed = map(int, row)
+    if busy or log_frames != checkpointed:
+        raise RuntimeError(f"WAL checkpoint incomplete: busy={busy}, frames={log_frames}, checkpointed={checkpointed}")
+    return {"busy": busy, "frames": log_frames, "checkpointed": checkpointed}
+
+
 def scheduled_lint_loop():
     log.info("Scheduled Lint Worker Thread started.")
     if not os.environ.get("VECTOR_LAKE_IGNORE_SCHEDULED_LINT_STATE"):
@@ -687,6 +698,7 @@ def scheduled_lint_loop():
                         memory_gram_index.maybe_rebuild_memory_gram_index(),
                     )
                 except Exception as e:
+                    failures.append(f"gram-index: {type(e).__name__}: {e}")
                     log.error(f"Scheduled gram-index rebuild failed: {e}")
 
                 # Truncate WAL to prevent unbounded growth.  It follows the rebuild because the
@@ -695,9 +707,10 @@ def scheduled_lint_loop():
                 from vector_lake.db_store import get_connection
                 try:
                     conn = get_connection()
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    checkpoint_wal(conn)
                     log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
                 except Exception as e:
+                    failures.append(f"WAL checkpoint: {type(e).__name__}: {e}")
                     log.error(f"Failed to truncate WAL: {e}")
 
                 # Storage: strip the payload weight out of the outbox ledger, then report what a
@@ -719,6 +732,7 @@ def scheduled_lint_loop():
                             stripped["bytes_to_strip"] / 1e6,
                         )
                 except Exception as e:
+                    failures.append(f"outbox retention: {type(e).__name__}: {e}")
                     log.error(f"Outbox payload retention failed: {e}")
 
                 try:
@@ -735,6 +749,7 @@ def scheduled_lint_loop():
                     else:
                         log.info("Database reclaim skipped: %s", reclaim["reason"])
                 except Exception as e:
+                    failures.append(f"database space: {type(e).__name__}: {e}")
                     log.error(f"Database space report failed: {e}")
 
                 # Backups are written by the repair, projection and ingest paths and nothing ever
@@ -754,11 +769,14 @@ def scheduled_lint_loop():
                             len(retention["keep"]),
                         )
                     for failure in retention["failures"]:
+                        failures.append(f"backup retention: {failure}")
                         log.warning(f"Backup retention left {failure}")
                 except Exception as e:
+                    failures.append(f"backup retention: {type(e).__name__}: {e}")
                     log.error(f"Backup retention failed: {e}")
 
-                log.info("Scheduled Autonomous Auto-Lint completed.")
+                lint_failure = "; ".join(failures)
+                log.info("Scheduled maintenance attempt finished; failed stages=%d.", len(failures))
                 # A failing occurrence must not be retried forever: an unbounded retry every
                 # 30 s held ``global_task_lock`` each time, which starved the outbox consumer
                 # behind a permanently failing lint.

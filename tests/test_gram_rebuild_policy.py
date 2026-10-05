@@ -21,7 +21,8 @@ from vector_lake import db_store, memory_gram_index, periodic_catch_up
 
 @pytest.fixture
 def healthy_base(isolated_memory, monkeypatch):
-    """A ready base with a controllable dirty count and search count."""
+    """A ready base with controllable counts; isolate amortisation from the age policy."""
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_GRAM_MAX_BASE_AGE_SECONDS", "0")
     db_store.init_db()
     monkeypatch.setattr(memory_gram_index, "gram_index_state", lambda: {"ready": True, "updated_at": "2026-09-25T00:00:00"})
 

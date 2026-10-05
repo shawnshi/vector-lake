@@ -170,10 +170,14 @@ def test_ingest_job_enqueue_is_idempotent_by_file_hash(isolated_memory):
 
 
 def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
+    _write_purpose_contract(isolated_memory)
     db_store.init_db()
+    raw = isolated_memory / "raw" / "native.md"
+    raw.write_text("Synthetic native source.", encoding="utf-8")
+    from vector_lake.tool_ingest import calculate_hash
     payload = {
-        "filepath": "raw/native.md",
-        "hash": "native-hash",
+        "filepath": str(raw),
+        "hash": calculate_hash(str(raw)),
         "canonical_name": "Source_Native.md",
         "source_hash": "native-source-version",
         "instructions": "compile this source",
@@ -193,8 +197,8 @@ def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
     assert task["task_type"] == "ingest"
     assert task["runtime"] == "current-environment-subagent"
     assert task["metadata"]["job_id"] == job_id
-    assert task["metadata"]["processed_data"]["filepath"] == "raw/native.md"
-    assert task["metadata"]["processed_data"]["source_hash"] == "native-source-version"
+    assert task["metadata"]["processed_data"]["filepath"] == str(raw)
+    assert task["metadata"]["processed_data"]["source_hash"] == "", "dispatch must not reuse the obsolete token"
     assert task["metadata"]["processed_data"]["job_id"] == job_id
     assert "CURRENT-ENVIRONMENT SUBAGENT HANDOFF" in task["prompt"]
     listed = list_ingest_tasks(limit=5, include_queued=False)
@@ -220,7 +224,7 @@ def test_ingest_worker_rebuilds_legacy_awaiting_packet_before_dispatch(isolated_
     )
     payload = {
         "filepath": str(raw_path),
-        "hash": "legacy-awaiting-hash",
+        "hash": __import__("hashlib").md5(raw_path.read_bytes()).hexdigest(),
         "canonical_name": "Source_Legacy-Awaiting.md",
         "instructions": "legacy prompt without integration disposition",
     }

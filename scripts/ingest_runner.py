@@ -33,7 +33,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from vector_lake.runtime_environment import configure_numeric_threads  # noqa: E402
+
+configure_numeric_threads()
+
 from vector_lake import db_store  # noqa: E402
+from vector_lake.process_control import run_contained, model_timeout_seconds  # noqa: E402
 from vector_lake.tool_ingest import (  # noqa: E402
     claim_ingest_tasks,
     finalize_ingest,
@@ -112,12 +117,29 @@ def classify(processed: dict, index: dict) -> str:
     return "needs-model"
 
 
+def _version_conflict(message: str) -> bool:
+    # Preserve optimistic locking. A new dispatch refreshes candidates; never patch tokens
+    # into an old model proposal. Missing tokens are still ordinary model-repair errors.
+    return any(marker in message for marker in (
+        "target_hash is stale", "target_projection_hash is stale", "source_hash is stale",
+        "source_projection_hash is stale", "source changed", "lease is stale",
+        "Canonical version conflict",
+    ))
+
+
 def run_model(packet: dict, model_cmd: str) -> tuple:
     """Invoke the pluggable model seam; return its bounded semantic result or an error."""
-    proc = subprocess.run(
+    timeout = model_timeout_seconds()
+    deadline = float(packet.get("_host_deadline_monotonic", time.monotonic() + timeout))
+    remaining = min(timeout, deadline - time.monotonic())
+    if remaining <= 0:
+        return None, "model execution deadline exhausted"
+    env = dict(os.environ)
+    env["VECTOR_LAKE_MODEL_DEADLINE_MONOTONIC"] = str(deadline)
+    proc = run_contained(
         model_cmd, shell=True, input=json.dumps(packet, ensure_ascii=False),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=int(os.environ.get("VECTOR_LAKE_RUNNER_MODEL_TIMEOUT", "900")),
+        timeout=remaining, env=env,
     )
     if proc.returncode != 0:
         return None, f"model runner exited {proc.returncode}: {proc.stderr.strip()[:300]}"
@@ -145,7 +167,20 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
     """Process a single claimed ingest task in isolation (C7 error containment)."""
     res = {"duplicate": 0, "missing-source": 0, "needs-model": 0, "finalized": 0, "errors": 0, "model-failed": 0}
     last_err = ""
-    packet = task.get("task_packet") or {}
+    packet = dict(task.get("task_packet") or {})
+    # One host deadline includes all repair rounds; retain a lease/finalization margin.
+    budget = model_timeout_seconds()
+    lease_until = task.get("lease_until")
+    if lease_until:
+        expires = datetime.fromisoformat(str(lease_until).replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        budget = min(budget, expires.timestamp() - datetime.now(timezone.utc).timestamp() - 120.0)
+        if budget <= 0:
+            # Do not mutate a potentially expired/newly-owned claim or spend a source attempt.
+            res["needs-model"] += 1
+            return res, "claim has insufficient execution window; awaiting lease recovery"
+    packet["_host_deadline_monotonic"] = time.monotonic() + budget
     processed = (packet.get("metadata") or {}).get("processed_data")
     job_id = str(task.get("job_id") or "")
     if packet.get("error") or not processed:
@@ -191,7 +226,7 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
             rejection = "" if "Successfully finalized" in result else result
             previous_output = model_result
             rounds_used = 0
-            while rejection and rounds_used < REPAIR_ATTEMPTS:
+            while rejection and not _version_conflict(rejection) and rounds_used < REPAIR_ATTEMPTS:
                 rounds_used += 1
                 repaired, repair_error = run_model(
                     _repair_packet(packet, previous_output, rejection), model_cmd

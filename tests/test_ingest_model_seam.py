@@ -63,7 +63,7 @@ def _run(seam, monkeypatch, result=None, raises=None, packet=None):
             raise raises
         return result
 
-    monkeypatch.setattr(seam.subprocess, "run", fake_run)
+    monkeypatch.setattr(seam, "run_contained", fake_run)
     return fake_run
 
 
@@ -168,7 +168,7 @@ def test_runner_passes_model_decision_without_replacing_host_versions(monkeypatc
         if disposition == "integrated" else {"reason": "A complete auditable reason."}
     )
     result = {"files_written": files, "integration": integration}
-    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+    monkeypatch.setattr(runner, "run_contained", lambda *args, **kwargs:
                         subprocess.CompletedProcess(["model"], 0, json.dumps(result), ""))
     monkeypatch.setattr(runner, "classify", lambda *_: "needs-model")
     submitted = []
@@ -194,7 +194,7 @@ def test_runner_passes_model_decision_without_replacing_host_versions(monkeypatc
 def test_runner_fails_closed_on_missing_or_malformed_decision(monkeypatch, output):
     from scripts import ingest_runner as runner
 
-    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+    monkeypatch.setattr(runner, "run_contained", lambda *args, **kwargs:
                         subprocess.CompletedProcess(["model"], 0, output, ""))
     monkeypatch.setattr(runner, "classify", lambda *_: "needs-model")
     failures = []
