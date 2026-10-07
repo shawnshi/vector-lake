@@ -143,10 +143,23 @@ cp config.example.json config.json
 
 `config.json` 核心字段说明：
 
+* `ingest.backend`：后台摄取的模型执行 CLI，可选 `pi`、`gemini`、`codex`，默认 `pi`。这是嵌套字段，不是顶层 `backend`，也不是模型名称或 MCP 客户端类型；所选 CLI 需安装在 Runner 所在主机并完成其原生认证，Pi 后端还需 subagent 能力。
 * `memory_dir`：自定义 `MEMORY` 根目录；优先级为 `VECTOR_LAKE_MEMORY_DIR`、此字段、宿主历史默认路径。新部署建议显式设置绝对路径，避免误用宿主目录。
 * `target_directories`：摄入扫描目录；留空时扫描当前 `MEMORY/raw`，非空时替代默认目录（相对路径基于项目根目录）。
 * `exclude_paths`：默认排除 `stocks/`、`garmin/`、`personal-insights/`；配置会覆盖默认列表。另有代码级规则拒绝 `privacy/.../Diary/...` 来源，不能通过配置解除。
 * `supported_extensions`：允许编译的原始资料后缀（默认 `[".md", ".txt"]`）。
+
+将以下配置合并到 `config.json`；使用 Gemini 或 Codex 时，将 `pi` 改为 `gemini` 或 `codex`，保留其他字段：
+
+```json
+{
+  "ingest": {
+    "backend": "pi"
+  }
+}
+```
+
+后端选择优先级为 `--model-cmd` > `VECTOR_LAKE_RUNNER_MODEL_CMD` > `ingest.backend` > 默认 Pi。非法配置会报错；真实摄取启动时检查 CLI 能力，不可用时明确退出，不自动切换服务。配置在启动时读取，不热切换；修改后需协调重启并核对实际后端。能力检查、锁和安全切换流程见 [Config](#config)。
 
 启用 embedding 或宿主编译会将相关文本交给模型服务。先核对扫描目录、排除项及宿主的数据边界；本地文件优先不等于零外联。
 
@@ -157,7 +170,8 @@ cp config.example.json config.json
 |`PYTHONUTF8`|强制 Python 运行时使用 UTF-8 编码（Windows 强烈推荐）|`1`|
 |`GEMINI_API_KEY`|向量嵌入模型 API Key（Gemini Embedding）；代码从进程环境读取，不从 `config.json` 读取凭据|不在仓库填写|
 |`VECTOR_LAKE_MEMORY_DIR`|显式指定 MEMORY 根路径（优先级高于 `config.json`）|例如 `C:/path/to/MEMORY`|
-|`VECTOR_LAKE_RUNNER_SHADOW`|Watchdog 拉起 Runner 时，设为 `1` 只评估、不写 Wiki 页面；直接运行 `ingest_runner.py` 默认 shadow，需 `--no-shadow` 才写页|默认 `0`（Watchdog 路径）|
+|`VECTOR_LAKE_RUNNER_MODEL_CMD`|覆盖 `ingest.backend` 的模型接缝命令；使用配置文件选择后端时应取消此覆盖|通常不设置|
+|`VECTOR_LAKE_RUNNER_SHADOW`|Watchdog 拉起 Runner 时，设为 `1` 跳过模型调用和写页，但仍认领任务、处理重复来源并写运行状态；直接 Runner 默认 shadow，需 `--no-shadow` 才写页|默认 `0`（Watchdog 路径）|
 |`VECTOR_LAKE_RUNNER_CONCURRENCY`|摄取 Runner 并发模型调用线程数，也可由 `ingest_runner.py --concurrency` 覆盖|默认 `1`；按宿主容量调整|
 |`VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE`|设为 `1` 时 shadow 轮不释放已认领的任务包（保留租约供人工检查；默认释放以便下一轮重试）|默认 `0`|
 |`VECTOR_LAKE_QUERY_CONTEXT_TTL`|Query 上下文临时文件的过期秒数|默认 `7200` (2小时)|
