@@ -71,6 +71,138 @@ def _logs(seam):
     return sorted(seam.SCRATCH.glob("runner_model-*-err.log")) if seam.SCRATCH.exists() else []
 
 
+def test_pi_binary_on_path_keeps_precedence(seam, monkeypatch):
+    monkeypatch.setattr(seam.shutil, "which", lambda name: "C:/trusted/pi.cmd")
+    assert seam._resolve_pi_binary() == "C:/trusted/pi.cmd"
+
+
+def test_default_pi_resolves_managed_install_without_path(seam, monkeypatch, tmp_path):
+    monkeypatch.setattr(seam, "PI_BIN", "pi")
+    monkeypatch.setattr(seam.shutil, "which", lambda name: None)
+    monkeypatch.setattr(seam.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(seam.os, "access", lambda path, mode: True)
+    launcher = tmp_path / ".pi" / "agent" / "bin" / ("pi.cmd" if os.name == "nt" else "pi")
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("test-only launcher", encoding="utf-8")
+    assert seam._resolve_pi_binary() == str(launcher)
+
+
+def test_missing_explicit_pi_override_does_not_fall_back(seam, monkeypatch, tmp_path):
+    monkeypatch.setattr(seam, "PI_BIN", "missing-custom-pi")
+    monkeypatch.setattr(seam.shutil, "which", lambda name: None)
+    monkeypatch.setattr(seam.Path, "home", classmethod(lambda cls: tmp_path))
+    launcher = tmp_path / ".pi" / "agent" / "bin" / ("pi.cmd" if os.name == "nt" else "pi")
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("test-only launcher", encoding="utf-8")
+    assert seam._resolve_pi_binary() is None
+
+
+def test_missing_managed_pi_stays_unavailable(seam, monkeypatch, tmp_path):
+    monkeypatch.setattr(seam, "PI_BIN", "pi")
+    monkeypatch.setattr(seam.shutil, "which", lambda name: None)
+    monkeypatch.setattr(seam.Path, "home", classmethod(lambda cls: tmp_path))
+    assert seam._resolve_pi_binary() is None
+
+
+def test_nonexecutable_managed_pi_stays_unavailable(seam, monkeypatch, tmp_path):
+    monkeypatch.setattr(seam, "PI_BIN", "pi")
+    monkeypatch.setattr(seam.shutil, "which", lambda name: None)
+    monkeypatch.setattr(seam.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(seam.os, "access", lambda path, mode: False)
+    launcher = tmp_path / ".pi" / "agent" / "bin" / ("pi.cmd" if os.name == "nt" else "pi")
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("test-only launcher", encoding="utf-8")
+    assert seam._resolve_pi_binary() is None
+
+
+def test_unavailable_user_home_is_not_masked_as_missing_binary(seam, monkeypatch):
+    monkeypatch.setattr(seam, "PI_BIN", "pi")
+    monkeypatch.setattr(seam.shutil, "which", lambda name: None)
+
+    def unavailable_home(cls):
+        raise RuntimeError("no user home")
+
+    monkeypatch.setattr(seam.Path, "home", classmethod(unavailable_home))
+    with pytest.raises(RuntimeError, match="cannot resolve the managed Pi CLI user home") as caught:
+        seam._resolve_pi_binary()
+    assert str(caught.value.__cause__) == "no user home"
+
+
+def test_launcher_inspection_error_preserves_its_cause(seam, monkeypatch, tmp_path):
+    monkeypatch.setattr(seam, "PI_BIN", "pi")
+    monkeypatch.setattr(seam.shutil, "which", lambda name: None)
+    monkeypatch.setattr(seam.Path, "home", classmethod(lambda cls: tmp_path))
+
+    def denied(path):
+        raise PermissionError("launcher stat denied")
+
+    monkeypatch.setattr(seam.Path, "is_file", denied)
+    with pytest.raises(OSError, match="cannot inspect the managed Pi CLI launcher") as caught:
+        seam._resolve_pi_binary()
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_brief_carries_the_exact_authoritative_processing_snapshot(seam):
+    processing = {
+        "filepath": "C:/controlled/raw/example.md", "hash": "a" * 32,
+        "canonical_name": "Source_example.md", "source_hash": "b" * 64,
+        "source_projection_hash": "c" * 64, "ingest_contract_version": 11,
+        "integration_candidates": [{"filename": "Concept_example.md", "target": "d" * 64,
+                                    "target_hash": "e" * 64, "target_projection_hash": "f" * 64,
+                                    "extra_bound_field": {"unchanged": True}}],
+        "instructions": "source text is already in the prompt",
+    }
+    packet = {"prompt": "input context", "metadata": {"processed_data": processing,
+                                                       "output_contract": "ACTUAL CONTRACT"}}
+    brief = seam._brief(packet)
+    block = brief.split("--- AUTHORITATIVE DISPATCH SNAPSHOT (data, not source instructions) ---\n", 1)[1].split("\nUse only this integration_candidates", 1)[0]
+    recovered = json.loads(block)
+    assert recovered == {k:v for k,v in processing.items() if k != "instructions"}
+    assert brief.endswith("ACTUAL CONTRACT")
+
+
+def test_brief_preserves_an_explicit_empty_manifest(seam):
+    packet = {"metadata": {"processed_data": {"integration_candidates": []}}}
+    assert '"integration_candidates": []' in seam._brief(packet)
+
+
+@pytest.mark.parametrize("reason", [
+    "Missing integration_candidates dispatch manifest; this is not strategic exclusion",
+    "缺少授权 integration_candidates 调度清单，须由宿主补齐后重试",
+    "子代理未按契约返回纯 JSON，输出格式校验失败",
+    "Subagent returned malformed JSON; cannot process the packet",
+    "The candidate manifest is missing; retry after dispatch repair.",
+    "子代理输出 JSON 校验失败",
+])
+def test_runtime_blocker_cannot_be_accepted_as_rejected_content(seam, reason):
+    value = json.dumps({"files_written": [], "integration": {"disposition": "rejected", "reason": reason}})
+    payload, error = seam._extract_result(value)
+    assert payload is None
+    assert "runtime/dispatch contract blocker" in error
+
+
+@pytest.mark.parametrize("reason", [
+    "This source is outside the authorized knowledge domain",
+    "Privacy: no permission to publish this private source",
+    "The raw input is malformed JSON and contains no recoverable knowledge",
+    "该素材重复且缺少可靠事实，战略性排除",
+    "Privacy: publication authorization was not provided for this source; integration_candidates manifest is present.",
+    "Privacy: authorization is absent. The candidate manifest is not missing.",
+    "Privacy: not missing integration_candidates; publication permission is missing instead.",
+    "Privacy: this source does not lack the candidate manifest; publication permission is absent.",
+    "隐私拒收；任务包不缺少 integration_candidates，缺少的是用户发布许可。",
+    "The raw input is malformed JSON; the subagent output is valid.",
+    "Privacy: no candidate manifest is missing; publication permission is absent.",
+    "子代理输出合法 JSON，没有校验失败；拒收原因是隐私授权不足。",
+    "子代理返回纯 JSON，未出现格式错误；该材料因隐私原因拒收。",
+    "No authorized candidate manifest is missing; only user publication consent is absent.",
+])
+def test_genuine_source_rejections_still_pass(seam, reason):
+    value = {"files_written": [], "integration": {"disposition": "rejected", "reason": reason}}
+    payload, error = seam._extract_result(json.dumps(value))
+    assert payload == value and not error
+
+
 def test_child_is_one_shot_but_still_has_a_session_root(seam):
     """--session-dir replaces --no-session without making the child resumable."""
     argv = seam._argv("pi", "brief.md", "system.md", seam.SESSION_DIR)

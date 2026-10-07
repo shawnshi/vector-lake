@@ -18,7 +18,8 @@ What it implements from the contract in this session's design note:
 Shadow mode (default) never writes a page: tasks that would need real content are left
 leased and reported as ``needs-model``, so the pass rate can be measured before enabling
 writes.  The model seam is ``--model-cmd`` (receives the packet JSON on stdin, must emit
-``{"files_written": [...], "integration": {...}}`` on stdout); it is unused unless supplied.
+``{"files_written": [...], "integration": {...}}`` on stdout). Built-ins are selected by
+``config.json``; explicit commands keep the legacy override protocol.
 """
 import argparse
 import json
@@ -39,6 +40,10 @@ configure_numeric_threads()
 
 from vector_lake import db_store  # noqa: E402
 from vector_lake.process_control import run_contained, model_timeout_seconds  # noqa: E402
+from vector_lake.ingest_backend import (SELECTION_SOURCES, builtin_model_argv,
+                                        check_ingest_backend, resolve_ingest_backend,
+                                        is_supervisor_child, legacy_runner_is_live,
+                                        report_ingest_conflict)  # noqa: E402
 from vector_lake.tool_ingest import (  # noqa: E402
     claim_ingest_tasks,
     finalize_ingest,
@@ -54,7 +59,6 @@ def _runtime_dir() -> Path:
     return get_meta_dir() / "runtime"
 
 
-STATUS_PATH = _runtime_dir() / "runner_status.json"
 REJECT_DUPLICATE = (
     "该原始文件的 Source 页已发布（frontmatter sources 已声明此 raw 路径），"
     "此任务为重复准备；由 ingest runner 自动关闭以免重复入库。"
@@ -101,10 +105,13 @@ def write_status(**fields) -> None:
     file only leaked stale keys (a leftover ``reason: "once"`` was reported while the
     resident runner was mid-cycle).
     """
-    STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path = _runtime_dir() / "runner_status.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(fields)
     payload["updated_at"] = _utc_now()
-    STATUS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def classify(processed: dict, index: dict) -> str:
@@ -136,8 +143,9 @@ def run_model(packet: dict, model_cmd: str) -> tuple:
         return None, "model execution deadline exhausted"
     env = dict(os.environ)
     env["VECTOR_LAKE_MODEL_DEADLINE_MONOTONIC"] = str(deadline)
+    builtin = builtin_model_argv(model_cmd)
     proc = run_contained(
-        model_cmd, shell=True, input=json.dumps(packet, ensure_ascii=False),
+        builtin or model_cmd, shell=builtin is None, input=json.dumps(packet, ensure_ascii=False),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=remaining, env=env,
     )
@@ -302,13 +310,69 @@ def main() -> int:
                         help="concurrent worker threads for model execution (default 1)")
     parser.add_argument("--shadow", action="store_true", default=True)
     parser.add_argument("--no-shadow", dest="shadow", action="store_false",
-                        help="allow real writes (requires --model-cmd)")
-    parser.add_argument("--model-cmd", default=os.environ.get("VECTOR_LAKE_RUNNER_MODEL_CMD", ""))
+                        help="allow real writes through the configured model backend")
+    parser.add_argument("--model-cmd", default=None)
+    parser.add_argument("--model-source", choices=SELECTION_SOURCES, help=argparse.SUPPRESS)
+    parser.add_argument("--check", action="store_true", help="Check backend capabilities without claiming tasks.")
     args = parser.parse_args()
+    try:
+        selection = resolve_ingest_backend(args.model_cmd)
+        if args.check:
+            print(json.dumps(check_ingest_backend(selection), ensure_ascii=False))
+            return 0
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"Ingest backend unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    args.model_cmd = selection.model_command
 
+    # Direct launches reserve the same root gate as the service; only its actual child
+    # may proceed through an already-held gate. Every consumer also takes its own lock.
+    from filelock import FileLock, Timeout
+
+    runtime = _runtime_dir()
+    runtime.mkdir(parents=True, exist_ok=True)
+    gate = FileLock(str(runtime / ".runner_service.lock"))
+    consumer = FileLock(str(runtime / ".runner_consumer.lock"))
+    gate_owned = False
+    consumer_owned = False
+    try:
+        try:
+            gate.acquire(timeout=0)
+            gate_owned = True
+        except Timeout:
+            if not is_supervisor_child():
+                report_ingest_conflict(selection, "Ingest runner already running for this MEMORY root")
+                return 4
+        try:
+            consumer.acquire(timeout=0)
+            consumer_owned = True
+        except Timeout:
+            report_ingest_conflict(selection, "Ingest consumer already running for this MEMORY root")
+            return 4
+        if legacy_runner_is_live():
+            report_ingest_conflict(selection, "Recorded legacy runner is still live; drain it before startup")
+            return 4
+        if not args.shadow:
+            check_ingest_backend(selection)
+        return _run_consumer(args, selection, None if gate_owned else os.getppid())
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"Ingest startup blocked: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    finally:
+        if consumer_owned:
+            consumer.release()
+        if gate_owned:
+            gate.release()
+
+
+def _run_consumer(args, selection, supervisor_pid) -> int:
+    """Run only while main holds the root gate/consumer lock; never called by contenders."""
     pid_path = _runtime_dir() / "runner.pid"
     stats = {"started_at": _utc_now(), "pid": os.getpid(), "shadow": args.shadow,
-             "model_command": bool(args.model_cmd), "interval": args.interval,
+             "model_command": bool(args.model_cmd), "effective_backend": selection.backend,
+             "selection_source": args.model_source or selection.source,
+             "resolved_model_command": selection.model_command, "supervisor_pid": supervisor_pid,
+             "interval": args.interval,
              "last_error": "", "consecutive_failures": 0, "cycles": 0, "totals": {}}
     try:
         pid_path.parent.mkdir(parents=True, exist_ok=True)

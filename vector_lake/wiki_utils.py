@@ -224,7 +224,7 @@ def is_private_raw_source(path) -> bool:
     return False
 
 
-def load_config() -> dict:
+def load_config(*, repo_root: Path | None = None) -> dict:
     """Extension config merged over the shipped defaults.
 
     A missing ``config.json`` is a supported state.  An unreadable or malformed
@@ -237,7 +237,7 @@ def load_config() -> dict:
         "exclude_paths": list(DEFAULT_EXCLUDE_PATHS),
         "supported_extensions": list(DEFAULT_SUPPORTED_EXTENSIONS),
     }
-    config_path = get_extension_root() / "config.json"
+    config_path = (Path(repo_root) if repo_root is not None else get_extension_root()) / "config.json"
     if not config_path.exists():
         return config
     try:
@@ -249,6 +249,8 @@ def load_config() -> dict:
         ) from exc
     if not isinstance(raw, dict):
         raise RuntimeError(f"Vector Lake config '{config_path}' must contain a JSON object.")
+    from vector_lake.ingest_backend import validate_ingest_config
+    validate_ingest_config(raw)
     config.update(raw)
     return config
 

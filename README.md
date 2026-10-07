@@ -18,10 +18,10 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 |约束|事实|规避|
 |-|-|-|
-|必须常驻守护进程|outbox 消费、增量索引、定时 lint、**到期时的 gram 索引重建**、WAL checkpoint、备份保留、兜底扫描与 Loop 线程监督均在 `watchdog_sync.py` 内，**它同时拉起并看护摄取 Runner**；摄取任务包的**模型调用**在宿主侧 `scripts/ingest_runner.py`（默认写入页面；`VECTOR_LAKE_RUNNER_SHADOW=1` 时只报告），由 `scripts/ingest_runner_service.py` 负责重启，后者自身持有单实例锁|只读检索才可省略守护进程。**没有守护进程时没有任何定时维护会触发**（写入也会在 5 分钟后进入 outbox 积压告警），gram 索引需人工按 `doctor` 的 `due=` 执行 `python cli.py gram-index --if-due --apply`。常驻形态用计划任务 `VectorLake-Watchdog`（见“日常运行入口”），不依赖临时 shell 保持常驻。实例锁可拒绝重复启动，但不能代替进程托管或证明子进程已退出|
+|必须常驻守护进程|outbox 消费、增量索引、定时 lint、**到期时的 gram 索引重建**、WAL checkpoint、备份保留、兜底扫描与 Loop 线程监督均在 `watchdog_sync.py` 内，**它同时拉起并看护摄取 Runner**；摄取任务包的**模型调用**在宿主侧 `scripts/ingest_runner.py`（自动启动默认写入页面；shadow 跳过模型调用，但仍认领任务并记录状态），由 `scripts/ingest_runner_service.py` 负责重启，后者自身持有单实例锁|只读检索才可省略守护进程。**没有守护进程时没有任何定时维护会触发**（写入也会在 5 分钟后进入 outbox 积压告警），gram 索引需人工按 `doctor` 的 `due=` 执行 `python cli.py gram-index --if-due --apply`。常驻形态用计划任务 `VectorLake-Watchdog`（见“日常运行入口”），不依赖临时 shell 保持常驻。实例锁可拒绝重复启动，但不能代替进程托管或证明子进程已退出|
 |摄取是一条中继流水线，各段职责不重叠|`ingest_worker`（守护进程内）只认领 `queued` / `failed`（预算未用尽）/ 租约过期的 `dispatched`，产出任务包并转入 `awaiting_subagent`；宿主侧 `ingest_runner.py` 只认领 `awaiting_subagent` 与租约过期的 `subagent_processing`，因此两段不会争抢同一作业。作业租约、`lease_token` 与 `lease_generation` 保证同一个作业不会被并发提交；被顶替或终态失败的作业不会再被派发（前者的状态被标为 `superseded`）|想让某个源重跑时用 `ingest-tasks --clear-abandoned` 或改源文件（废弃键按内容哈希）；**不要**为“多跑一点”而绕开租约手工改 `jobs`|
 |Runner 健康默认只告警|`runner_absent` / `runner_stalled` / `runner_failing` 默认进 `warnings`，不翻转 `ok`；“从未跑过”与“跑挂了”由 `.meta/runtime/runner_supervisor.json` 区分|需要把这几项并入 `degraded` 列表（依然不阻断写入）时设 `VECTOR_LAKE_RUNNER_STRICT=1`|
-|编译依赖 LLM 宿主|`cli.py sync` 只产出 subagent 任务包，不自行编译；`native_llm.generate_text` 恒抛 `SubagentTaskRequired`|在具备 subagent 能力的宿主内运行摄取流程|
+|文本编译需要模型执行后端|`cli.py sync` 只准备任务包；统一 Runner 选择 Pi / Gemini / Codex 执行模型调用，`native_llm.generate_text` 仍抛 `SubagentTaskRequired`|在 Runner 主机安装并认证所选 CLI；通过 `config.json` 的 `ingest.backend` 选择后端，Pi 才要求 subagent 能力|
 |向量投影需要维护|页面变更会使对应向量失效；常驻守护进程的周期兜底会按批次补齐缺失或过时向量，受嵌入模型与凭据可用性约束|未启用兜底或需立即恢复时执行 `python cli.py embedding-backfill --apply`；缺少嵌入凭据时检索降级，不以向量缺失冒充库中无资料|
 |GC 的孤儿判据是拓扑度数 ≤ 1|度数来自 canonical 的 `links` / 共享来源 / claim 共现；**不是**可视化边集|先 `python cli.py gc` 做 dry-run，它会在同一调用中打印每个页面的实际度数。单次删除超过候选页 50% 时会自动中止，需 `--force` 才继续|
 |删除类命令默认演练|`gc` / `delete` 默认 dry-run，必须 `--apply` 才落盘|保持默认；仅在确认 dry-run 输出后追加 `--apply`|
@@ -34,10 +34,10 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 ```mermaid
 graph TD
-    subgraph relay [摄取中继：模型调用永远在运行时之外]
+    subgraph relay [摄取中继：统一 Runner 调用宿主 CLI]
         RAW["MEMORY/raw<br>immutable sources"] --> SYNC["cli.py sync<br>ingest task packets"]
         SYNC --> WORKER["ingest_worker<br>claim + dispatch"]
-        WORKER --> HOST["host subagent<br>model call"]
+        WORKER --> HOST["ingest_runner<br>Pi / Gemini / Codex CLI"]
         HOST --> FINAL["finalize_ingest"]
     end
     subgraph write [写入：一个 canonical 事务 + 一条持久化 outbox 意图]
@@ -117,7 +117,7 @@ graph TD
 
 * **Python**: `>= 3.10`（推荐 3.11 \~ 3.13）。
 * **操作系统**: Windows (需支持 UTF-8)、macOS、Linux。
-* **嵌入模型凭据（可选）**：`GEMINI_API_KEY` 仅用于 embedding；未配置时检索使用 FTS5 与图拓扑，不能生成或补齐向量。文本编译另需具备 subagent 能力的宿主，配置此 Key 不会使 `sync` 自行调用文本模型。
+* **嵌入模型凭据（可选）**：Vector Lake 的 embedding 使用 `GEMINI_API_KEY`；未配置时检索使用 FTS5 与图拓扑，不能生成或补齐向量。文本编译另需所选 Pi / Gemini / Codex CLI 及其原生认证；`ingest.backend` 不改变 embedding 提供方，配置 Key 也不会让 `sync` 自行调用文本模型。
 
 ### 2. 依赖安装 (Dependencies)
 
@@ -225,7 +225,7 @@ python watchdog_sync.py
 
 ## 核心机制与运行时防护 (Core Runtime & Defense Systems)
 
-> **运行前提**：Vector Lake 不是自包含的编译器。原始信源到 Wiki 页面的“编译”由 LLM 宿主（subagent）执行，`cli.py sync` 只负责生成任务包。因此实际运行需要：**① 单机 ② 常驻 `python watchdog_sync.py`（Windows 上由计划任务 `VectorLake-Watchdog` 托管）③ 具备 subagent 能力的宿主**。守护进程会**自动拉起并看护摄取 Runner**（`scripts/ingest_runner_service.py`，可用 `VECTOR_LAKE_RUNNER_AUTOSTART=0` 关闭），因此不再需要手工常驻第二个进程；只启动 MCP server 而不启动守护进程时，写入会在 5 分钟后进入 outbox 积压告警状态。
+> **运行前提**：完整摄取需要 **① 单机数据根 ② 常驻 `python watchdog_sync.py`（Windows 可由计划任务 `VectorLake-Watchdog` 托管）③ 已安装、已认证的 Pi / Gemini / Codex CLI 后端**。`cli.py sync` 只准备任务包，统一 Runner 执行模型调用并经 `finalize_ingest` 发布。守护进程自动拉起并看护 `scripts/ingest_runner_service.py`，可用 `VECTOR_LAKE_RUNNER_AUTOSTART=0` 关闭；通常无需另开手工监督器。MCP 客户端身份不决定摄取后端，Pi 的 subagent 要求也不适用于 Gemini/Codex。只启动 MCP server 而不启动守护进程时，写入会在 5 分钟后进入 outbox 积压告警状态。
 
 * **双轨看门狗 (Two-Track Watchdog)**：除增量文件外还捕获 `on_deleted` / `on_moved`，因此重命名或删除页面不会在图谱里留下幽灵节点。
 * **写入健康门 (Write Health Gate)**：写入只在**硬故障**下被阻断（数据库不可用、存在 hard-failed 的 `mutation_outbox` 行）。outbox 积压超过 `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`、投影漂移、心跳过期、终态失败作业、时间线 parity 漂移都属于**可修复降级**，只记录告警并继续写入——阻断它们会同时阻断唯一的修复通道。需要严格模式的运维方可分别用 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING` / `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING` 把这些降级提升为阻断。
@@ -247,11 +247,15 @@ python watchdog_sync.py
 
 ### 日常运行入口
 
-1. **常驻守护**：`python watchdog_sync.py`（outbox 消费、增量索引、定时 lint 与 WAL checkpoint 都在这里；只跑 MCP server 会让写入持续积压）。守护进程同时**拉起并看护摄取 Runner**，因此“只启动守护”不会再留下半个流水线：不传任何开关时，观测到的就是本机原本常驻的配置（模型接缝 `python scripts/ingest_model_pi_subagents.py`、真实写页）。用 `VECTOR_LAKE_RUNNER_AUTOSTART=0` 关闭该行为，用 `VECTOR_LAKE_RUNNER_SHADOW=1` 改成只报告。
+1. **常驻守护**：`python watchdog_sync.py`（outbox 消费、增量索引、定时 lint 与 WAL checkpoint 都在这里；只跑 MCP server 会让写入持续积压）。自动拉起的 Runner 按 Config 节的优先级选择后端；未配置时使用 Pi，默认真实写页。`VECTOR_LAKE_RUNNER_AUTOSTART=0` 关闭自动看护；`VECTOR_LAKE_RUNNER_SHADOW=1` 跳过模型调用和写页，但仍认领任务、处理重复来源及记录状态，不是只读预览。
 Windows 常驻入口为计划任务 **`VectorLake-Watchdog`**，执行 `scripts/watchdog_service.ps1`，固定仓库工作目录与 UTF-8，日志写入 `scratch/watchdog_service-*-{out,err}.log`，每个流保留最新 10 份。注册脚本 `scripts/register_watchdog_task.ps1` 会替换同名任务；先核对现有配置，不把它当作无损重启命令。脚本默认配置为登录 + 开机 + 每 5 分钟、`MultipleInstances=IgnoreNew`、`ExecutionTimeLimit=PT0S`、失败重启 3 次且间隔 1 分钟；主体优先 `S4U`，失败后尝试 `Interactive`。现有部署的频率和身份可能不同，以实际任务配置为准。
 
 **更新常驻代码时先安排空闲窗口**：确认摄取作业和 outbox 无在途处理，保留代码与数据库恢复点；控制计划任务的重复触发，再按已核验的 PID、创建时间和父子关系停止受影响的守护/Runner 进程树。`Stop-ScheduledTask` 不会取消后续触发，也不能单独证明 Python 子进程已退出。新守护可能接管已有 Runner，但接管不等于加载新代码。恢复后核对新 PID、心跳、队列与索引；MCP 连接须另行重连。不要按进程名批量终止其他宿主会话。
-2. **摄取 Runner（可选的手工形式）**：`python scripts/ingest_runner_service.py --limit 2 --interval 120 --model-cmd "python scripts/ingest_model_pi_subagents.py"`。Runner 认领任务包、支持通过 `--concurrency / -c`（或 `VECTOR_LAKE_RUNNER_CONCURRENCY`）多线程并发调用宿主模型，再经 `finalize_ingest` 提交。**注意两条路径的默认值相反**：这条手工命令默认只报告 `needs-model`（要真实写入需加 `--no-shadow`），而守护进程自动拉起的 Runner 默认写入（复现本机原本常驻的配置），要改成只报告用 `VECTOR_LAKE_RUNNER_SHADOW=1`。脚本自身持有单实例锁（`<meta>/runtime/.runner_service.lock`），所以手工启动与守护进程启动不会叠成两个消费者；模型调用始终发生在本进程之外的子进程里，运行时自己从不执行它。自定义 `--model-cmd` 必须在 stdout 只返回 `{"files_written": [{"filename": "Source_*.md", "content": "..."}], "integration": {"disposition": "integrated|standalone|rejected", "relations": [...]}}`；standalone/rejected 用 `reason`，rejected 用空文件数组。旧的纯数组输出及缺失判断一律记为模型失败，不会再静默记作 standalone；租约、源哈希和候选清单由宿主任务包提供，不能由模型改写。任务包协议版本 3 会在认领前重建旧版 queued / failed / awaiting\_subagent 提示词，保留 queued / failed 的原有尝试次数，不改动已领取的 subagent\_processing 作业。升级正在运行的 Runner 前，先确认摄入队列无在途任务并保留旧版代码恢复点；磁盘改动不会热更新常驻 Runner。
+2. **摄取 Runner（可选的手工形式）**：`python scripts/ingest_runner_service.py --limit 2 --interval 120`，不指定 `--model-cmd` 才会按环境变量 / `ingest.backend` 选择内置后端。手工监督器及直接 Runner 默认 shadow（报告 `needs-model`，仍有队列与状态副作用）；真实写入需 `--no-shadow`。自动启动则默认真实写页。Runner 用 `--concurrency / -c`（或 `VECTOR_LAKE_RUNNER_CONCURRENCY`）控制模型调用并发；root 所有权锁与消费者锁阻止不同入口并行认领，细节见 Config 节。
+
+   自定义 `--model-cmd` 保留 shell/stdin/stdout 协议，stdout 必须只返回 `{"files_written": [{"filename": "Source_*.md", "content": "..."}], "integration": {"disposition": "integrated|standalone|rejected", "relations": [...]}}`；standalone/rejected 用 `reason`，rejected 用空文件数组。纯数组或缺少集成判断会被拒绝；租约、源哈希和候选清单由宿主提供，不能由模型改写。内置后端共用结果验证、修复预算和 `finalize_ingest`，不另建发布路径。
+
+   任务包协议版本 3 会在认领前重建旧版 queued / failed / awaiting\_subagent 提示词，保留 queued / failed 的原有尝试次数，不改动已领取的 subagent\_processing 作业。升级前先等待在途任务完成并保留恢复点；磁盘改动不会热更新驻留进程。
 3. **检索**：`python cli.py search "<keyword>"`，或 `python cli.py query "<question>"` 走预算受控的上下文组装。
 4. **摄取队列**：`python cli.py ingest-tasks` 查看 queued / awaiting\_subagent 作业；模型或 subagent 只返回包含 `files_written` 和 `integration` 的对象，宿主控制器验证后调用 `finalize_ingest` 入湖。
 5. **被废弃的源**：同一份内容反复确定性失败（例如 `categories` 不是单元素列表、命名或 schema 违规）时，第 3 次尝试后该源会被记为「废弃」并停止派发，避免每轮固定烧掉 3 次模型调用。`python cli.py ingest-tasks --abandoned` 查看清单与原因，`--clear-abandoned [FILE]` 恢复派发。键是 `(路径, 内容哈希)`：**改好源文件即自动恢复**，无需人工清理。`--terminal-failed` 列出耗尽尝试预算的作业，`--close-terminal-failed` 把其中**源已入账**的标记为 superseded（源未入账的会保留，因为那才是真正未完成的工作）。
@@ -524,10 +528,35 @@ python scripts/repair_orphan_memory.py --database $Database --archive $Archive -
 
 `config.json` 与环境变量共同控制运行范围和模型调用。该文件是机器相关配置，**不入 git**：克隆后执行 `cp config.example.json config.json` 再按本机填写。文件缺失时使用代码内置默认值（含默认排除列表 `exclude_paths`），不会退化为“无排除”。
 
+* `ingest.backend`：后台摄取的模型执行 CLI，只接受 `pi` / `gemini` / `codex`；字段缺失或空对象时兼容默认 `pi`，非法值或未知 ingest 字段明确报错。它不等于连接 MCP 的客户端，所选 CLI 须安装在 Runner 所在主机/容器。
 * `target_directories`：raw source 扫描路径。
 * `exclude_paths`：排除目录。
 * `supported_extensions`：当前启用的输入扩展名。
 * `memory_dir`：MEMORY 根目录（机器相关，按安装填写）；可用 `VECTOR_LAKE_MEMORY_DIR` 覆盖。
+
+最小后端配置（合并到本机 `config.json`，不要覆盖其他字段）：
+
+```json
+{"ingest": {"backend": "codex"}}
+```
+
+```bash
+python scripts/ingest_runner.py --check
+python scripts/ingest_runner_service.py --check
+# 直接检查另一后端，不改本机配置：
+python scripts/ingest_model_cli.py --backend gemini --check
+```
+
+`--check` 只解析配置/可执行文件及本地 CLI 帮助与安全参数，不领取作业、写运行状态或调用模型；成功不证明认证或模型服务可用。自定义接缝只报告所选命令，不执行不明自检。非 shadow 启动在领取任务前检查内置后端能力；CLI 缺失或参数不支持时退出并报错，不改用其他服务、不消耗来源尝试次数。
+
+Codex/Gemini 接缝使用原始素材和 dispatch snapshot，不继承 Pi 的 subagent 机制。适配器将工作目录设为任务临时目录，并配置禁用执行/文件工具、扩展、用户 MCP、hooks 与额外上下文读取；Codex 请求只读 sandbox 与 ephemeral 会话，Gemini 使用临时系统设置、空 core tools 和 deny-all policy。这些是 CLI 级限制，不是 OS 隔离，也不以本地参数检查替代实机效果验证。结果只经现有 `finalize_ingest` 入库；临时输出/设置结束后清理，不复制凭证，认证仍由 CLI 自身完成。处理来源前需确认数据与模型服务授权，配置字段不能替代授权。
+
+Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁用 feature gates；Gemini 要求 `--output-format` / `--extensions` / `--policy`。不支持这些能力的版本明确拒绝启动。CLI 探针仅核验本地参数，后端权限和供应商模型的实机行为仍需用脱敏样本独立验收。
+
+配置在启动时读取，不热切换。状态记录 `effective_backend` 和 `selection_source`；Runner 另记 `resolved_model_command`，保留旧 `model_command` 布尔字段。`.runner_service.lock` 是所有入口的 root 级所有权门：直接 Runner 持有它，监督器只允许自己的实际子进程通过已占用的门；每个模型消费者还须持有 `.runner_consumer.lock`。冲突方不领取任务、不覆盖赢家 PID/状态，输出 requested/effective backend 和 `configuration_mismatch`；直接 Runner 冲突返回 `4`，监督器保留既有重复启动返回 `0` 的协议。未知/损坏旧记录报告 unknown，不声称新配置生效。仍在运行的旧无锁 Runner 会由其 PID 记录阻止并行启动；不会自动删除 PID 文件或终止旧进程。状态路径在写入时解析，避免导入时缓存跨越 root 隔离边界。
+
+切换时先让在途任务完成，协调停止当前 root 的 Runner/监督器及其自动看护，避免 watchdog 按旧启动计划重新拉起。修改配置后重新启动相应入口，核对新 PID、`effective_backend`、`selection_source` 与心跳；命令行或环境变量覆盖会优先于配置文件。更新 watchdog 的后端选择代码时，还需重启 watchdog；仅重启其子进程不会更新父进程已加载的代码。不会自动杀掉其他客户端的进程，生产切换/重启需独立授权。
+
 * 入账与去重：`processed_files` 记 `(路径, 内容哈希)`；finalize 时会在**规范 Source 页面**的 frontmatter 写入 `source_hash`，使「这份页面是按哪份内容编译的」可被证明而不是靠 mtime 推断。已发布但缺账目行的源由扫描按证据补齐（有 `source_hash` 则比对哈希，无则比对页面 `created` 与文件 mtime）；证据显示文件已变时**不补行**，而是让它重新摄入，避免修改被静默丢弃。
 * `VECTOR_LAKE_DB_PATH`：覆盖 SQLite 数据库路径（默认 `<MEMORY>/wiki/.meta/vector_lake.db`）。
 * `VECTOR_LAKE_PAYLOAD_ROOT` / `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：MCP `payload_file` 沙箱的可读根与单文件字节上限（默认 5 MiB）。
@@ -545,7 +574,8 @@ python scripts/repair_orphan_memory.py --database $Database --archive $Archive -
 * `VECTOR_LAKE_BACKUP_KEEP` / `VECTOR_LAKE_BACKUP_MAX_BYTES`：`backup-retention` 的默认保留份数（`3`）与字节预算（`12 GiB`）。
 * `VECTOR_LAKE_RUNNER_EXPECTED=0`：不再把缺失的摄取 Runner 报为告警；用于不需要摄取的主机。
 * `VECTOR_LAKE_RUNNER_AUTOSTART=0`：不让 `watchdog_sync.py` 拉起并看护摄取 Runner（保留 `runner_absent` 告警，用于手工管理 Runner 的主机）。默认开启。
-* `VECTOR_LAKE_RUNNER_MODEL_CMD`：自动拉起的 Runner 使用的模型接缝命令，默认 `python scripts/ingest_model_pi_subagents.py`。直接运行 `scripts/ingest_runner.py` 时需用此变量或 `--model-cmd` 提供模型接缝。相关脚本另读 `VECTOR_LAKE_RUNNER_PI_BIN`、`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT`、`VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`、`VECTOR_LAKE_RUNNER_COOLDOWN`。
+* `VECTOR_LAKE_RUNNER_MODEL_CMD`：显式覆盖模型接缝命令。自动启动、手动监督器和直接 Runner 共用 `--model-cmd` > 此环境变量 > `config.json` 的 `ingest.backend` > 默认 Pi 的解析顺序；空白覆盖值忽略，非法配置仍报错。自定义命令维持原有 shell/stdin/stdout 协议，内置接缝按 Python argv 启动。
+* `VECTOR_LAKE_RUNNER_PI_BIN` / `VECTOR_LAKE_RUNNER_GEMINI_BIN` / `VECTOR_LAKE_RUNNER_CODEX_BIN`：对应 CLI 的可执行文件或 PATH 名称，默认 `pi` / `gemini` / `codex`。Pi 保留托管安装路径的后备解析；显式不可用的二进制不回退到其他安装或服务。`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT` 仅适用于 Pi；各接缝共用 `VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`，Runner 另读 `VECTOR_LAKE_RUNNER_COOLDOWN`。
 * `VECTOR_LAKE_RUNNER_REPAIR_ATTEMPTS`：可修正的输出/格式错误在 `finalize_ingest` 拒绝后最多修正的轮数（默认 `2`；`0` 关闭）。各轮共享同一模型截止时间，不另领超时预算；源变化、过期版本或租约冲突不进入模型格式修正，须重新派发。缺失版本字段与真正的陈旧版本不同，仍可由模型修正。重试不能替代校验。
 * `VECTOR_LAKE_RUNNER_SHADOW=1`：让自动拉起的 Runner 不写 Wiki 页面，默认关闭。直接运行 `scripts/ingest_runner.py` 默认 shadow，使用 `--no-shadow` 才写页；shadow 跳过模型调用，但仍会认领任务、处理重复来源并记录运行状态，不是零副作用模式。
 * `VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`：守护进程的周期性兜底间隔（默认 `900` 秒；`0` 关闭）。兜底做三件事：把未摄入的 raw 源重新入队（否则失去事件、被取消或从未入队的源没有回到队列的路径）、把超过时限的陈旧摄取任务作废、以及按批次重建缺失或输入已变的向量。
@@ -665,7 +695,7 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 
 ## Module Map
 
-`vector_lake/` 内是运行时本体：它自行调用嵌入模型，但**不发起任何非嵌入的模型调用**（任务包的 `cost_boundary`）；文本生成一律交给宿主，因此摄取 Runner 放在 `scripts/` 而非包内。
+`vector_lake/` 内包含存储、MCP、调度与可复用适配器。原生任务接口仍只自行调用嵌入模型，文本任务按 `cost_boundary` 交给宿主执行；`scripts/ingest_runner.py` 是统一消费入口，Pi 接缝调用 subagent，Gemini/Codex 接缝复用包内 `ingest_cli` 启动所选 CLI。不能按文件所在目录判断是否发生模型调用。
 
 入口与核心管线：
 
@@ -726,6 +756,9 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 |`vector_lake/tool_ingest.py`|raw 扫描、摄取任务包生成、任务领取与 `finalize_ingest`|
 |`vector_lake/ingest_worker.py`|queued 作业 → subagent 任务包分发|
 |`vector_lake/runner_supervision.py`|守护进程对摄取 Runner 的拉起 / 收养 / 重启与状态上报|
+|`vector_lake/ingest_backend.py`|统一后端选择、CLI 能力检查、root 所有权及冲突报告|
+|`vector_lake/ingest_cli.py`|Gemini/Codex argv、任务临时配置、进程截止时间与 CLI 调用|
+|`vector_lake/ingest_model_contract.py`|各后端共用的源指纹、模型输入与结果验证|
 |`vector_lake/periodic_catch_up.py`|周期性兜底：未入队源重入队、陈旧任务作废、在途标记对账|
 |`vector_lake/native_llm.py`|宿主 subagent 任务包协议（不自行调用文本模型）|
 |`vector_lake/tool_query.py` / `tool_research.py` / `tool_purpose.py`|查询合成、主动研究下发、战略目的复审|
@@ -746,7 +779,7 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 |`templates/`|摄取 / 查询提示词模板与拓扑可视化 HTML|
 |`crates/vector_lake_core/`|Rust 原生加速核心源码（PyO3、pulldown-cmark、rayon、abi3 规范）|
 |`scripts/build_core.py`|原生加速扩展的一键跨平台编译与就地安装脚本|
-|`scripts/`|独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验），以及宿主侧摄取 Runner：`ingest_runner.py` + 常驻监督器 `ingest_runner_service.py` + 模型接缝 `ingest_model_pi_subagents.py`|
+|`scripts/`|独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验），以及宿主侧摄取 Runner：`ingest_runner.py` + 常驻监督器 `ingest_runner_service.py` + 模型接缝 `ingest_model_pi_subagents.py` / `ingest_model_cli.py`|
 |`tests/`|pytest 回归套件|
 
 ## Validation
@@ -754,7 +787,7 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 README 的命令示例、MCP 工具表、依赖说明及配置项可通过定向测试核对；测试使用临时 MEMORY 根，不读写本机知识库：
 
 ```powershell
-$env:PYTHONUTF8='1'; python -m pytest -p no:cacheprovider -q tests/test_command_surface.py tests/test_registries.py tests/test_dependency_manifest.py tests/test_portability.py tests/test_mcp_surface_improvements.py tests/test_runner_supervision.py
+$env:PYTHONUTF8='1'; python -m pytest -p no:cacheprovider -q tests/test_command_surface.py tests/test_registries.py tests/test_dependency_manifest.py tests/test_portability.py tests/test_mcp_surface_improvements.py tests/test_runner_supervision.py tests/test_ingest_backends.py tests/test_ingest_model_seam.py
 ```
 
 完整测试与实例运行检查（`doctor`、`search`、`debt` 面向当前配置的知识库，不是隔离测试）：
@@ -772,5 +805,5 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ## Notes
 
 * Windows 控制台建议设置 `PYTHONUTF8=1`，避免中文路径或中文输出触发编码问题。
-* 长任务由 `filelock` 串行化（`index.json.lock`、`.meta/governance_queue.lock`、`.watchdog.instance.lock`、`<meta>/runtime/ingest_processing.json.lock`、`<meta>/runtime/.runner_service.lock`）。遇到占用时先确认没有残留的 watchdog / MCP / ingest Runner 进程，再重试，不要直接删锁文件。
+* 长任务由 `filelock` 串行化（`index.json.lock`、`.meta/governance_queue.lock`、`.watchdog.instance.lock`、`<meta>/runtime/ingest_processing.json.lock`、`<meta>/runtime/.runner_service.lock`、`<meta>/runtime/.runner_consumer.lock`）。遇到占用时先确认没有残留的 watchdog / MCP / ingest Runner 进程，再重试，不要直接删锁文件。
 * `.gitignore` 排除任务包、临时文件、`scratch/`、构建产物和本机数据。发布前检查暂存清单，不提交数据库、模型 payload、wheel、原生二进制或凭据。

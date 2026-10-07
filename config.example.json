@@ -1,5 +1,8 @@
 {
   "memory_dir": "",
+  "ingest": {
+    "backend": "pi"
+  },
   "target_directories": [],
   "exclude_paths": [
     "stocks/",

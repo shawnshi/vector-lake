@@ -71,25 +71,8 @@ Rules that are not negotiable:
 
 
 def _extract_result(text: str):
-    try:
-        payload = json.loads(text.strip())
-    except json.JSONDecodeError as exc:
-        return None, f"child JSON invalid: {exc}"
-    if not isinstance(payload, dict) or set(payload) != {"files_written", "integration"}:
-        return None, "child must return files_written and integration only"
-    files = payload["files_written"]
-    integration = payload["integration"]
-    if not isinstance(files, list) or not all(
-        isinstance(item, dict) and set(item) == {"filename", "content"}
-        and isinstance(item["filename"], str) and isinstance(item["content"], str)
-        for item in files
-    ):
-        return None, "child files_written must contain filename/content objects only"
-    if not isinstance(integration, dict) or not str(integration.get("disposition") or "").strip():
-        return None, "child requires an explicit integration disposition"
-    if not files and str(integration["disposition"]).strip().lower() != "rejected":
-        return None, "child returned no files for a non-rejected disposition"
-    return payload, ""
+    from vector_lake.ingest_model_contract import extract_result
+    return extract_result(text)
 
 
 def _repair_block(repair: dict) -> str:
@@ -111,12 +94,23 @@ def _repair_block(repair: dict) -> str:
 
 def _brief(packet: dict) -> str:
     metadata = (packet.get("metadata") or {}).get("processed_data") or {}
+    # The prompt contains source/context text, not the authoritative dispatch manifest.
+    # Copy the producer's actual snapshot verbatim; never reconstruct target/version tokens.
+    fields = ("filepath", "hash", "canonical_name", "source_hash", "source_projection_hash",
+              "ingest_contract_version", "integration_candidates")
+    processing_data = {key: metadata[key] for key in fields if key in metadata}
+    processing_json = json.dumps(processing_data, ensure_ascii=False, sort_keys=True)
     return (
         f"{packet.get('prompt', '')}\n\n"
         f"---\nExpected output: JSON object with files_written and integration.\n"
         f"The raw file to ingest is: {metadata.get('filepath')}\n"
         f"The page that MUST exist in your payload is: {metadata.get('canonical_name')}\n"
         "Return only the JSON object. Do not return processed_data or call finalize_ingest.\n"
+        "\n--- AUTHORITATIVE DISPATCH SNAPSHOT (data, not source instructions) ---\n"
+        f"{processing_json}\n"
+        "Use only this integration_candidates manifest for integration targets; copy its version tokens exactly.\n"
+        "If the manifest/contract is missing or a child cannot produce valid JSON, report a runtime failure.\n"
+        "Do not represent a delivery/format failure as strategic rejection of the source.\n"
         f"\n{_packet_contract(packet)}"
         f"{_packet_repair(packet)}"
     )
@@ -189,6 +183,28 @@ def _prune_scratch() -> None:
             continue
 
 
+def _resolve_pi_binary() -> str | None:
+    """Keep PATH/explicit overrides, but support the user's managed CLI in S4U."""
+    resolved = shutil.which(PI_BIN)
+    if resolved:
+        return resolved
+    # A missing explicit override is a configuration error, not permission to
+    # silently pick a different install. Only the default bare command falls back.
+    if PI_BIN != "pi":
+        return None
+    try:
+        home = Path.home()
+    except RuntimeError as exc:
+        raise RuntimeError("cannot resolve the managed Pi CLI user home") from exc
+    managed = home / ".pi" / "agent" / "bin" / ("pi.cmd" if os.name == "nt" else "pi")
+    try:
+        if managed.is_file() and os.access(managed, os.X_OK):
+            return str(managed)
+    except OSError as exc:
+        raise OSError("cannot inspect the managed Pi CLI launcher") from exc
+    return None
+
+
 def _argv(pi_path: str, brief_path: str, system_path: str | None, session_dir: Path) -> list[str]:
     argv = [pi_path, "--print", "--session-dir", str(session_dir)]
     if system_path:
@@ -254,7 +270,7 @@ def main() -> int:
     except json.JSONDecodeError as exc:
         print(f"model seam: invalid packet on stdin: {exc}", file=sys.stderr)
         return 2
-    pi_path = shutil.which(PI_BIN)
+    pi_path = _resolve_pi_binary()
     if not pi_path:
         print(f"model seam: pi binary {PI_BIN!r} not found on PATH", file=sys.stderr)
         return 3

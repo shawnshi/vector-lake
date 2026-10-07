@@ -29,6 +29,7 @@ which case this loop reports that and waits instead of spawning a second one.
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import subprocess
@@ -40,13 +41,14 @@ from pathlib import Path
 
 from vector_lake import get_extension_root
 from vector_lake.watchdog_status import write_status
+from vector_lake.ingest_backend import (BACKEND_COMMANDS, resolve_ingest_backend,
+                                        supervisor_selection_status, read_ingest_owner_record,
+                                        normalize_pid)
 
 log = logging.getLogger("vector-lake-runner")
 
-#: The command recorded as running on this host (``runner_supervisor.json``,
-#: ``model_command``), and the one the README documents.  It is a shell string because
-#: ``ingest_runner.run_model`` runs it with ``shell=True``.
-DEFAULT_MODEL_COMMAND = "python scripts/ingest_model_pi_subagents.py"
+# Legacy command strings remain accepted; built-in seams execute as an argv, not a shell.
+DEFAULT_MODEL_COMMAND = BACKEND_COMMANDS["pi"]
 #: Seconds between batches.  Operator-set (2026-09-19): 120 rather than 180, which is
 #: ~20 files/hour instead of ~14 at ``--limit 1``.  This is the throughput knob, not a
 #: bound -- a batch that finds no work costs one claim query.
@@ -82,6 +84,8 @@ class RunnerPlan:
     model_command: str = ""
     shadow: bool = False
     supervisor_script: str = ""
+    backend: str = "pi"
+    selection_source: str = "default"
 
 
 def _truthy(value: str | None) -> bool:
@@ -127,7 +131,8 @@ def plan_runner_autostart(
             reason=f"the runner supervisor script is not present at {supervisor}",
         )
 
-    model_command = str(env.get("VECTOR_LAKE_RUNNER_MODEL_CMD") or "").strip() or DEFAULT_MODEL_COMMAND
+    selection = resolve_ingest_backend(env=env, repo_root=root)
+    model_command = selection.model_command
     # Writes are the production behaviour this host was already running (shadow=false in
     # runner_supervisor.json); report-only is the opt-in, so a fresh host cannot start
     # mutating the wiki merely because the watchdog came up.
@@ -139,6 +144,7 @@ def plan_runner_autostart(
         "--limit", str(DEFAULT_LIMIT),
         "--interval", str(DEFAULT_INTERVAL_SECONDS),
         "--model-cmd", model_command,
+        "--model-source", selection.source,
     ]
     if not shadow:
         argv.append("--no-shadow")
@@ -150,6 +156,8 @@ def plan_runner_autostart(
         model_command=model_command,
         shadow=shadow,
         supervisor_script=str(supervisor),
+        backend=selection.backend,
+        selection_source=selection.source,
     )
 
 
@@ -247,10 +255,15 @@ def runner_supervisor_loop(stop_event: threading.Event | None = None) -> None:
         if supervisor_is_running():
             pid = _adopted_supervisor_pid()
             suffix = f" (pid {pid})" if pid else ""
+            selection_status = supervisor_selection_status(plan, _adopted_supervisor_record())
+            mismatch = selection_status["configuration_mismatch"]
+            matches = mismatch is not None and not mismatch
             write_status(
-                "processing", 0, 0,
-                f"Ingest runner supervised by an existing supervisor{suffix}",
-                "", component=COMPONENT,
+                "processing" if matches else "error", 0, 0,
+                f"Ingest runner supervised by an existing supervisor{suffix}; "
+                + json.dumps(selection_status),
+                "" if matches else "Existing supervisor backend differs or cannot be verified; drain/stop it before switching.",
+                component=COMPONENT,
             )
             if _sleep(event, FAST_EXIT_POLL_SECONDS):
                 break
@@ -380,12 +393,18 @@ def _adopted_supervisor_pid() -> "int | None":
 
     from vector_lake.wiki_utils import get_meta_dir
 
-    path = get_meta_dir() / "runtime" / "runner_supervisor.json"
+    data = read_ingest_owner_record()
+    if not data:
+        path = get_meta_dir() / "runtime" / "runner_supervisor.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        return normalize_pid(data.get("pid")) if isinstance(data, dict) else None
+    except ValueError:
         return None
-    try:
-        return int(data.get("pid"))
-    except (TypeError, ValueError):
-        return None
+
+
+def _adopted_supervisor_record() -> dict:
+    return read_ingest_owner_record()

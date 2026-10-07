@@ -29,6 +29,9 @@ PROJECT = Path(__file__).resolve().parents[1]
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 from vector_lake.process_control import start_contained_python, stop_contained
+from vector_lake.ingest_backend import (SELECTION_SOURCES, check_ingest_backend,
+                                        resolve_ingest_backend, report_ingest_conflict,
+                                        legacy_runner_is_live)
 
 
 def _supervisor_status_path() -> Path:
@@ -38,7 +41,6 @@ def _supervisor_status_path() -> Path:
     return get_meta_dir() / "runtime" / "runner_supervisor.json"
 
 
-SUPERVISOR_STATUS = _supervisor_status_path()
 BACKOFF = [5, 15, 60, 300]
 HEALTHY_RUN_SECONDS = 900  # a run this long resets the restart ladder
 #: How often to refresh ``updated_at`` while a child is running.
@@ -58,10 +60,11 @@ def _utc_now() -> str:
 
 def write_status(**fields) -> None:
     """Merge-write the supervisor status so a crash never wipes the last known state."""
+    status_path = _supervisor_status_path()
     payload = {"pid": os.getpid(), "updated_at": _utc_now()}
     try:
-        if SUPERVISOR_STATUS.exists():
-            existing = json.loads(SUPERVISOR_STATUS.read_text(encoding="utf-8"))
+        if status_path.exists():
+            existing = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(existing, dict):
                 payload.update(existing)
     except (OSError, ValueError):
@@ -69,10 +72,10 @@ def write_status(**fields) -> None:
     payload.update({"pid": os.getpid(), "updated_at": _utc_now()})
     payload.update(fields)
     try:
-        SUPERVISOR_STATUS.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SUPERVISOR_STATUS.with_suffix(".json.tmp")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = status_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, SUPERVISOR_STATUS)
+        os.replace(tmp, status_path)
     except OSError:
         pass
 
@@ -81,10 +84,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Resident supervisor for the ingest runner.")
     parser.add_argument("--limit", type=int, default=2)
     parser.add_argument("--interval", type=int, default=120)
-    parser.add_argument("--model-cmd", required=True)
+    parser.add_argument("--model-cmd", default=None)
+    parser.add_argument("--model-source", choices=SELECTION_SOURCES, help=argparse.SUPPRESS)
+    parser.add_argument("--check", action="store_true", help="Check backend capabilities without starting a runner.")
     parser.add_argument("--no-shadow", action="store_true", help="Let the runner write real pages.")
     parser.add_argument("--max-restarts", type=int, default=0, help="0 = unlimited.")
     args = parser.parse_args()
+    try:
+        selection = resolve_ingest_backend(args.model_cmd)
+        if args.check:
+            print(json.dumps(check_ingest_backend(selection), ensure_ascii=False))
+            return 0
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"Ingest backend unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    args.model_cmd = selection.model_command
+    selection_source = args.model_source or selection.source
 
     # One supervisor per MEMORY root.  The watchdog starts this script automatically, so a
     # second instance started by hand would publish a second runner against the same task
@@ -107,8 +122,39 @@ def main() -> int:
         # that overwrote it with its own pid and status="duplicate" made health show a dead
         # pid as the owner.  Exiting 0 is the signal the watchdog reads as "another
         # supervisor is live"; it does not need this file to learn that.
-        print(f"Ingest runner supervisor already running for this MEMORY root ({lock_path}).", flush=True)
+        report_ingest_conflict(selection, f"Ingest runner supervisor already running for this MEMORY root ({lock_path})")
         return 0
+
+    try:
+        consumer_probe = FileLock(str(lock_path.parent / ".runner_consumer.lock"))
+        try:
+            consumer_probe.acquire(timeout=0)
+        except Timeout:
+            report_ingest_conflict(selection, "Ingest consumer already running for this MEMORY root")
+            return 0
+        else:
+            consumer_probe.release()
+        if legacy_runner_is_live():
+            report_ingest_conflict(selection, "Recorded legacy runner is still live; drain it before startup")
+            return 0
+        return _run_supervisor(args, selection, selection_source)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"Ingest startup blocked: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    finally:
+        instance_lock.release()
+
+
+def _run_supervisor(args, selection, selection_source) -> int:
+    """Only the root owner may publish supervisor state or launch its consumer."""
+    if args.no_shadow:
+        try:
+            check_ingest_backend(selection)
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            write_status(status="failed", reason=f"backend unavailable: {type(exc).__name__}: {exc}",
+                         **selection.as_dict())
+            print(f"Ingest backend unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 3
 
     child_argv = [
         sys.executable or "python",
@@ -116,6 +162,7 @@ def main() -> int:
         "--limit", str(args.limit),
         "--interval", str(args.interval),
         "--model-cmd", args.model_cmd,
+        "--model-source", selection_source,
     ]
     if args.no_shadow:
         child_argv.append("--no-shadow")
@@ -153,7 +200,8 @@ def main() -> int:
 
     restarts = 0
     write_status(status="starting", child_pid=None, restarts=restarts,
-                 model_command=args.model_cmd, shadow=not args.no_shadow,
+                 model_command=args.model_cmd, effective_backend=selection.backend,
+                 selection_source=selection_source, reason="", shadow=not args.no_shadow,
                  interval=args.interval, limit=args.limit)
 
     while not stopping["flag"]:
@@ -188,6 +236,12 @@ def main() -> int:
         elapsed = time.monotonic() - started
         if stopping["flag"]:
             break
+        if exit_code == 4:
+            # A pre-lock/extra consumer refused startup: never restart against the live owner.
+            report_ingest_conflict(selection, "Ingest consumer owner conflict; supervisor will not restart")
+            write_status(status="stopped", reason="consumer owner conflict", child_pid=None,
+                         last_exit_code=exit_code)
+            return 0
         if elapsed >= HEALTHY_RUN_SECONDS:
             restarts = 0
         restarts += 1
