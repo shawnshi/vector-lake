@@ -586,8 +586,8 @@ def _published_source_verdict(filepath: str, index: dict) -> str:
     return "record" if raw_date <= created_date else "stale"
 
 
-def calculate_hash(filepath: str) -> str:
-    hasher = hashlib.md5()
+def calculate_hash(filepath: str, *, algorithm: str = "md5") -> str:
+    hasher = hashlib.new(algorithm)
     try:
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
@@ -1625,13 +1625,21 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                     continue
 
                 file_hash = calculate_hash(filepath)
-                if file_hash == row["hash"]:
+                matches_processed_content = file_hash == row["hash"]
+                if digest.startswith("sha256:"):
+                    # A trusted SHA-256 baseline must not be compared against an MD5 digest.
+                    # New ingest packets still use file_hash under the existing MD5 contract.
+                    sha256 = calculate_hash(filepath, algorithm="sha256")
+                    if not sha256:
+                        continue
+                    matches_processed_content = digest == f"sha256:{sha256}"
+                if matches_processed_content:
                     # Content is unchanged.  Backfill a missing snapshot so later scans can skip
                     # without hashing; rows kept by the pre-2026-09-17 writer already carry one.
                     if row.get("mtime_ns") is None or row.get("size") is None:
                         mark_file_processed(
                             filepath,
-                            file_hash,
+                            digest,
                             mtime_ns=stat.st_mtime_ns,
                             size=stat.st_size,
                         )

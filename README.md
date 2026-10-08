@@ -292,8 +292,8 @@ python watchdog_sync.py
 * **持久化增量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台变更先写 durable outbox，Watchdog 合并批次后更新索引；`_calculate_weighted_edges` 使用稀疏遍历并限制每节点投影边数。
 * **跨平台进程防护**：后台子脚本使用 UTF-8；模型调用与被看护的 Runner 使用 `process_control`。Windows 子进程在启动门闩放行前加入带 `KILL_ON_JOB_CLOSE` 的 Job Object；POSIX 使用独立进程组。超时后收束受控进程族，但 POSIX 不覆盖主动 `setsid()` 逃离的进程。
 * **派发与版本绑定**：派发时刷新候选与版本快照，再在同一事务中更新任务载荷和交接状态；获写锁后重新检查租约与所有权。保留原作业身份、源路径、内容哈希和重试历史；刷新前后源校验或投影不一致时拒绝旧快照，不向旧提案补写新版本令牌。
-* **历史校验异常隔离**：账本记录的大小非零、却对应空文件 MD5 时，扫描跳过该源并由 `doctor` 报告；不自动改写历史哈希或批量重派。历史大小为零的文件后来新增内容，仍按正常变更检测入队；非 MD5 的版本化摘要不会仅因格式不同被拒绝。
-* **定时确定性维护 (Scheduled Deterministic Maintenance)**：每天 10:00 与 23:00 刷新脏图拓扑、执行只读 lint、在索引落后时重建 gram 倒排、做 SQLite WAL checkpoint 并执行备份保留；各维护阶段分别执行并汇总失败，lint 失败不妨碍后续阶段；checkpoint 会核对 SQLite 返回的 busy/帧数结果，不把“调用未抛异常”当作完成。另有一条独立节拍的兜底扫描（`VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`，默认 900 秒）负责把未入队的 raw 源重新入队、作废陈旧任务、释放失去 job 的在途标记，并按批次重建缺失或**输入已变**的向量。研究、去重、聚类等独立脚本不会被该循环隐式启动。
+* **内容校验与历史异常隔离**：新摄入任务和 Source 的 File Hash 仍使用 MD5；已有 `sha256:<digest>` 处理账本在观察快照缺失或变化时，按 SHA-256 验证内容，不因仅修改时间变化而重复入队。补齐缺失观察字段时保留原摘要格式；SHA-256 校验不可用时不派发，内容不匹配仍按变更入队。账本记录的大小非零、却对应空文件 MD5 时，扫描跳过该源并由 `doctor` 报告；不自动改写历史哈希或批量重派。历史大小为零的文件后来新增内容，仍按正常变更检测入队。
+* **定时确定性维护 (Scheduled Deterministic Maintenance)**：每天 10:00 与 23:00 刷新脏图拓扑、执行只读 lint、在索引落后时重建 gram 倒排、做 SQLite WAL checkpoint 并执行备份保留；各维护阶段分别执行并汇总失败，lint 失败不妨碍后续阶段；checkpoint 会核对 SQLite 返回的 busy/帧数结果，不把“调用未抛异常”当作完成。另有一条独立节拍的兜底扫描（`VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`，默认 900 秒）按扫描规则准备新源或内容已变更的源、作废陈旧任务、释放失去 job 的在途标记，并按批次重建缺失或**输入已变**的向量。研究、去重、聚类等独立脚本不会被该循环隐式启动。
 * **向量投影存于 SQLite (vec\_embeddings)**：向量由 `sqlite-vec` 存放于 `vector_lake.db` 的 `vec_embeddings` 表，不再依赖模型侧的 JSON 载荷；语义去重守护进程只读该表，读取失败时退回**词法/拓扑去重**（不是旧缓存）。向量的**存在不等于有效**：页面被绕过增量索引的路径改写、或全量重建改动了别名与摘要时，旧向量不会被删除，只会默默继续用已经不存在的正文答题。因此每个节点在写入向量的同时记录其嵌入输入的摘要（`vec_embedding_inputs`），周期兜底每轮比对当前节点，把缺失、输入已变、以及未打标的节点一并按批重建；需要一次性全量重建时用显式 `embedding-backfill`。
 * **本体免疫型排重 (Ontology-Immune Deduplication)**：去重守护进程豁免 `Source_*` 等时序不可变信源，避免“相似度过高即合并”把不同日期的研报强行合流。
 * **合并的可回放性 (Merge Durability)**：`resolution=merge` 只能在合并**已落盘**时写下。类型/ID 不匹配不再静默落到 `_mark_resolved`（fail-closed），声明的名字与文件名不一致（`_`/`-`）时回退查别名注册表，落盘时同写 `merge_applied`/`applied_at`；`lint` 按 `unapplied_merge_items()` 报出“已 resolved 但两页俱在”的条数——只看 `type`/`status` 会把早先已判定为 `skip` 的近邻算成待办。**被消费页的键与标题必须进入幸存页的 `aliases`**（`semantic_merge._union_frontmatter` 的既有规则）：链接解析只认文件名、标题与 frontmatter `aliases`，不读 SQLite 别名表。
@@ -614,7 +614,8 @@ Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁�
 
 切换时先让在途任务完成，协调停止当前 root 的 Runner/监督器及其自动看护，避免 watchdog 按旧启动计划重新拉起。修改配置后重新启动相应入口，核对新 PID、`effective_backend`、`selection_source` 与心跳；命令行或环境变量覆盖会优先于配置文件。更新 watchdog 的后端选择代码时，还需重启 watchdog；仅重启其子进程不会更新父进程已加载的代码。不会自动杀掉其他客户端的进程，生产切换/重启需独立授权。
 
-* 入账与去重：`processed_files` 记 `(路径, 内容哈希)`；finalize 时会在**规范 Source 页面**的 frontmatter 写入 `source_hash`，使「这份页面是按哪份内容编译的」可被证明而不是靠 mtime 推断。已发布但缺账目行的源由扫描按证据补齐（有 `source_hash` 则比对哈希，无则比对页面 `created` 与文件 mtime）；证据显示文件已变时**不补行**，而是让它重新摄入，避免修改被静默丢弃。
+* 入账与去重：`processed_files` 记 `(路径, 内容哈希)`，表示来源已被处理，不保证存在 Source 页面。`finalized` 且 `integration.disposition=rejected` 是正常拒收，不出版 Wiki 文件；历史 `operator_trust_hash_baseline_upgrade` 的 `completed` 记录只证明操作者接受了哈希基线，不是模型摄入或出版回执。核查缺页时应绑定当前内容摘要及对应的完成 / 拒收回执；证据缺失保留为待核验，不直接清空账本或批量重摄入。
+* 出版溯源：实际出版时在**规范 Source 页面**的 frontmatter 写入 `source_hash`，记录编译所用内容。已发布但缺账目行的源由扫描按证据补齐；有 `source_hash` 则比对哈希，无则仅按页面 `created` 与文件 mtime 作历史日期推断，不能证明字节一致。证据显示文件已变时**不补行**，而是让它重新摄入，避免修改被静默丢弃。
 * `VECTOR_LAKE_DB_PATH`：覆盖 SQLite 数据库路径（默认 `<MEMORY>/wiki/.meta/vector_lake.db`）。
 * `VECTOR_LAKE_PAYLOAD_ROOT` / `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：MCP `payload_file` 沙箱的可读根与单文件字节上限（默认 5 MiB）。
 * `VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE=1`：跳过写入前健康门（仅用于受控维护，不建议常开）。
@@ -635,7 +636,7 @@ Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁�
 * `VECTOR_LAKE_RUNNER_PI_BIN` / `VECTOR_LAKE_RUNNER_GEMINI_BIN` / `VECTOR_LAKE_RUNNER_CODEX_BIN`：对应 CLI 的可执行文件或 PATH 名称，默认 `pi` / `gemini` / `codex`。Pi 保留托管安装路径的后备解析；显式不可用的二进制不回退到其他安装或服务。`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT` 仅适用于 Pi，默认项目级 `vector-lake-ingestor`（`.pi/agents/vector-lake-ingestor.md`，仅 `read` 工具、fresh 上下文，不继承全局/项目材料或技能）；默认 profile 缺失时拒绝替换为 reviewer。显式代理覆盖仍受所选代理自己的权限与输出契约约束。Pi 接缝从仓库根启动，原生任务包/模型结果验证与 `finalize_ingest` 不变。各接缝共用 `VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`，Runner 另读 `VECTOR_LAKE_RUNNER_COOLDOWN`。
 * `VECTOR_LAKE_RUNNER_REPAIR_ATTEMPTS`：可修正的输出/格式错误在 `finalize_ingest` 拒绝后最多修正的轮数（默认 `2`；`0` 关闭）。各轮共享同一模型截止时间，不另领超时预算；源变化、过期版本或租约冲突不进入模型格式修正，须重新派发。缺失版本字段与真正的陈旧版本不同，仍可由模型修正。重试不能替代校验。
 * `VECTOR_LAKE_RUNNER_SHADOW=1`：让自动拉起的 Runner 不写 Wiki 页面，默认关闭。直接运行 `scripts/ingest_runner.py` 默认 shadow，使用 `--no-shadow` 才写页；shadow 跳过模型调用，但仍会认领任务、处理重复来源并记录运行状态，不是零副作用模式。
-* `VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`：守护进程的周期性兜底间隔（默认 `900` 秒；`0` 关闭）。兜底做三件事：把未摄入的 raw 源重新入队（否则失去事件、被取消或从未入队的源没有回到队列的路径）、把超过时限的陈旧摄取任务作废、以及按批次重建缺失或输入已变的向量。
+* `VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`：守护进程的周期性兜底间隔（默认 `900` 秒；`0` 关闭）。兜底做三件事：按扫描规则准备尚未处理或内容已变更的 raw、把超过时限的陈旧摄取任务作废、以及按批次重建缺失或输入已变的向量。它不把所有“缺少 Source 页面”的已处理记录自动重摄入；拒收、信任基线和历史校验隔离仍按各自规则保留。
 * `VECTOR_LAKE_CATCHUP_EMBEDDING_BATCH`：兜底每轮最多重新嵌入多少个节点（默认 `200`；`0` 关闭该半部）。增量索引在页面变更时会作废其向量且按契约不调用 embedding API，兜底是把这个失效补回来的自动对应物；批大小的上限保证循环不被长时间占用。
 * `VECTOR_LAKE_CATCHUP_EMBEDDING_BUDGET_SECONDS`：兜底单个 embedding 批次允许等待的上限（默认 `120` 秒，含限流窗口与重试）。超出被记为失败批并留给下一轮，而不是占住 900 秒的节拍——配额错误每次重试固定 sleep 60 秒，不设上限时两个批次就能吃掉整轮。
 * `VECTOR_LAKE_STALE_TASK_MAX_AGE_SECONDS`：兜底把多旧的摄取任务视为陈旧（默认 `86400` 秒）。
@@ -830,7 +831,7 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 |`vector_lake/ingest_backend.py`|统一后端选择、CLI 能力检查、root 所有权及冲突报告|
 |`vector_lake/ingest_cli.py`|Gemini/Codex argv、任务临时配置、进程截止时间与 CLI 调用|
 |`vector_lake/ingest_model_contract.py`|各后端共用的源指纹、模型输入与结果验证|
-|`vector_lake/periodic_catch_up.py`|周期性兜底：未入队源重入队、陈旧任务作废、在途标记对账|
+|`vector_lake/periodic_catch_up.py`|周期性兜底：按扫描规则准备新源 / 内容变更源、陈旧任务作废、在途标记对账|
 |`vector_lake/native_llm.py`|宿主 subagent 任务包协议（不自行调用文本模型）|
 |`vector_lake/tool_query.py` / `tool_research.py` / `tool_purpose.py`|查询合成、主动研究下发、战略目的复审|
 |`vector_lake/tool_sync.py`|`sync_vector_lake` 入口：兼容别名，转发到 `prepare_ingest_batch`|
