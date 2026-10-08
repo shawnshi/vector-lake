@@ -5,6 +5,7 @@ import threading
 import time
 from array import array
 from collections import OrderedDict
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 
 import functools
@@ -28,20 +29,20 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-_PPR_INDEX: dict = {"generation": None, "index": None}
+_PPR_INDEX: dict = {"generation": None, "adj": None, "index": None}
 
 
 def _ppr_index(adj, generation: int):
-    """The prepared PPR index for this graph generation, built at most once per graph.
-
-    Keyed on the projection's generation, not on ``id(adj)``: a freed dict can be replaced by a new
-    one at the same address, which would serve a stale index for a changed graph -- silently, since
-    the result would still look like a valid ranking.
-    """
-    if _PPR_INDEX["generation"] != generation or _PPR_INDEX["index"] is None:
-        _PPR_INDEX["index"] = vector_lake_core.PprIndex(adj)
-        _PPR_INDEX["generation"] = generation
-    return _PPR_INDEX["index"]
+    """Cache a graph snapshot by its actual adjacency object and projection generation."""
+    global _PPR_INDEX
+    cached = _PPR_INDEX
+    # VL-S03: file fallback graphs do not advance the SQLite generation. A strong reference
+    # distinguishes those snapshots and prevents recycled object IDs; one assignment also
+    # keeps concurrent readers from pairing an index with another snapshot's metadata.
+    if cached["generation"] != generation or cached.get("adj") is not adj or cached["index"] is None:
+        cached = {"generation": generation, "adj": adj, "index": vector_lake_core.PprIndex(adj)}
+        _PPR_INDEX = cached
+    return cached["index"]
 log = logging.getLogger("vector-lake-tool-search")
 
 BUDGET_SHARES = {
@@ -258,6 +259,8 @@ def _passes_filters(node: dict, domain: str | None, cluster: str | None, include
 QUERY_EMBEDDING_CACHE_SIZE = 256
 _QUERY_EMBEDDING_CACHE: "OrderedDict[tuple[str, int, str], array]" = OrderedDict()
 _QUERY_EMBEDDING_CACHE_LOCK = threading.Lock()
+QUERY_EMBEDDING_MAX_IN_FLIGHT = 256
+_QUERY_EMBEDDING_IN_FLIGHT: "dict[tuple[str, int, str], Future]" = {}
 
 
 def _embedding_cache_key(query: str) -> tuple[str, int, str]:
@@ -276,37 +279,75 @@ def _cached_query_embedding(query: str):
         return cached
 
 
-def _store_query_embedding(query: str, values) -> None:
-    key = _embedding_cache_key(query)
+def _store_query_embedding_by_key(key, values) -> None:
+    vector = array("f", values)
     with _QUERY_EMBEDDING_CACHE_LOCK:
-        _QUERY_EMBEDDING_CACHE[key] = array("f", values)
+        _QUERY_EMBEDDING_CACHE[key] = vector
         _QUERY_EMBEDDING_CACHE.move_to_end(key)
         while len(_QUERY_EMBEDDING_CACHE) > QUERY_EMBEDDING_CACHE_SIZE:
             _QUERY_EMBEDDING_CACHE.popitem(last=False)
 
 
+def _store_query_embedding(query: str, values) -> None:
+    _store_query_embedding_by_key(_embedding_cache_key(query), values)
+
+
 def _get_query_embedding(query: str) -> tuple[list[float], str | None]:
-    """Query vector plus an explicit degradation reason when it is unavailable."""
+    """Share concurrent misses by model/dimension/query; each caller keeps its own deadline."""
     if not os.environ.get("GEMINI_API_KEY"):
         return [], "GEMINI_API_KEY is not set"
-    cached = _cached_query_embedding(query)
-    if cached is not None:
-        return list(cached), None
-    try:
-        from vector_lake.embedding_scheduler import embed_texts
+    deadline = time.monotonic() + QUERY_EMBEDDING_BUDGET_SECONDS
+    key = _embedding_cache_key(query)
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        cached = _QUERY_EMBEDDING_CACHE.get(key)
+        if cached is not None:
+            _QUERY_EMBEDDING_CACHE.move_to_end(key)
+            return list(cached), None
+        flight = _QUERY_EMBEDDING_IN_FLIGHT.get(key)
+        owner = flight is None
+        if owner:
+            if len(_QUERY_EMBEDDING_IN_FLIGHT) >= QUERY_EMBEDDING_MAX_IN_FLIGHT:
+                return [], "query embedding in-flight capacity reached"
+            flight = Future()
+            _QUERY_EMBEDDING_IN_FLIGHT[key] = flight
 
-        embeddings = embed_texts(
-            [query],
-            budget_seconds=QUERY_EMBEDDING_BUDGET_SECONDS,
-            durable_reservation=False,
-        )
-        if not embeddings:
-            return [], "embedding provider returned no vector"
-        _store_query_embedding(query, embeddings[0])
-        return embeddings[0], None
-    except Exception as e:
-        log.warning(f"Failed to get query embedding: {e}")
-        return [], f"{type(e).__name__}: {e}"
+    if not owner:
+        try:
+            values, error = flight.result(timeout=max(0.0, deadline - time.monotonic()))
+            return list(values), error
+        except FutureTimeoutError:
+            # A follower leaving must not cancel work still owned by another live request.
+            return [], "query embedding in-flight wait budget exceeded"
+
+    try:
+        try:
+            from vector_lake.embedding_scheduler import embed_texts
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result = ((), "query embedding budget exhausted before provider call")
+            else:
+                embeddings = embed_texts([query], budget_seconds=remaining, durable_reservation=False)
+                if not embeddings:
+                    result = ((), "embedding provider returned no vector")
+                else:
+                    values = tuple(embeddings[0])
+                    _store_query_embedding_by_key(key, values)
+                    result = (values, None)
+        except Exception as exc:
+            log.warning("Failed to get query embedding: %s", exc)
+            result = ((), f"{type(exc).__name__}: {exc}")
+        flight.set_result(result)
+        return list(result[0]), result[1]
+    except BaseException as exc:
+        # Host cancellation/interrupt must release followers rather than leave a pending Future.
+        if not flight.done():
+            flight.set_exception(exc)
+        raise
+    finally:
+        with _QUERY_EMBEDDING_CACHE_LOCK:
+            if _QUERY_EMBEDDING_IN_FLIGHT.get(key) is flight:
+                del _QUERY_EMBEDDING_IN_FLIGHT[key]
 
 
 def _vector_projection_error() -> str | None:
@@ -540,7 +581,8 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
             # The same sanitized term list the FTS5 arm searches, so the comparison isolates the
             # engine.  Term queries carry no syntax, so the `.`/`'` inputs that make FTS5 raise
             # "syntax error near" simply match literally here.
-            ranked = tantivy_index.search(query_tok.split(), limit=limit)
+            # Term queries bypass Tantivy's lowercase analyzer; match its indexed token form.
+            ranked = tantivy_index.search([term.lower() for term in query_tok.split()], limit=limit)
             if not ranked:
                 _LAST_FTS_ERROR.msg = None
                 return []
@@ -586,6 +628,53 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
         log.warning(msg)
         _LAST_FTS_ERROR.msg = msg
         return []
+
+def _get_fts_recall_results(query: str, limit: int = 50) -> list[dict]:
+    """Original-query hits first; bounded contextual substitutions fill unused slots."""
+    primary = _get_fts_search_results(query, limit=limit)
+    primary_error = getattr(_LAST_FTS_ERROR, "msg", None)
+    if primary_error or len(primary) >= limit:
+        return primary
+
+    # VL-S01: conjunction belongs within each query, not between synonyms. Replacing a
+    # dictionary term preserves the other qualifiers; unrelated expansions cannot erase originals.
+    variants = []
+    seen_queries = {query.casefold()}
+    for term, replacements in QUERY_EXPANSION_DICT.items():
+        if term not in query:
+            continue
+        for replacement in replacements:
+            variant = query.replace(term, replacement)
+            if variant.casefold() not in seen_queries:
+                seen_queries.add(variant.casefold())
+                variants.append(variant)
+
+    primary_keys = {row["node_key"] for row in primary}
+    supplemental = {}
+    errors = []
+    for variant in variants[:8]:
+        rows = _get_fts_search_results(variant, limit=limit)
+        error = getattr(_LAST_FTS_ERROR, "msg", None)
+        if error:
+            errors.append(error)
+            continue
+        for row in rows:
+            key = row["node_key"]
+            if key in primary_keys:
+                continue
+            previous = supplemental.get(key)
+            if previous is None or row["rank"] < previous["rank"]:
+                supplemental[key] = row
+
+    # Negative BM25 ranks are shared by FTS5 and Tantivy. Related terms are a weaker signal,
+    # not additional votes; max over substitutions avoids rewarding dictionary redundancy.
+    secondary = sorted(supplemental.values(), key=lambda row: (row["rank"], row["node_key"]))
+    _LAST_FTS_ERROR.msg = "; ".join(dict.fromkeys(errors)) or None
+    return primary + [
+        {**row, "rank": row["rank"] * 0.5}
+        for row in secondary[:max(0, limit - len(primary))]
+    ]
+
 
 @functools.lru_cache(maxsize=128)
 def _keyword_intent(query: str) -> str:
@@ -940,6 +1029,17 @@ def _entity_name_priority() -> float:
     return min(1.0, max(0.0, value))
 
 
+RERANK_TOKEN_CACHE_MAX_CHARS = 4096
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_rerank_tokens(text: str, backend: str) -> tuple[str, ...]:
+    """Pool metadata tokens; backend identity participates in cache invalidation."""
+    from vector_lake import tokenizer as _tokenizer
+
+    return tuple(token.lower() for token in _tokenizer.tokenize_joined(text).split())
+
+
 def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
     """Phase 2: local reranking of the retrieved candidate pool with BM25.
 
@@ -958,10 +1058,10 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
     afford it.  Without the symbol the rerank degrades to the documented no-op
     (``VECTOR_LAKE_RERANK_WEIGHT=0`` semantics: keep the upstream order) and says so at WARNING.
 
-    Scores are **pool-normalised**, not absolute: min-max within the pool means
-    the leading candidate always reports 1.0, and a pool with no lexical signal
-    at all reduces to a monotone rescaling of the upstream order. Ties at the
-    pool maximum stay tied.
+    Scores are **pool-relative**, not absolute: each input signal is min-max
+    normalised before blending, so the leading blended score need not be 1.0.
+    Without lexical signal the blend is a monotone rescaling of upstream scores.
+    The scores are ranking signals, not calibrated confidence.
 
     ``VECTOR_LAKE_RERANK_WEIGHT`` (default 0.4) blends the two normalised score
     sets; set it to 0 to reproduce the previous ordering exactly. The weight
@@ -1000,15 +1100,24 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
     # Pre-tokenize with the project tokenizer and hand the core whitespace-split tokens; the Rust
     # side scores them and blends the upstream signal, so no second engine and no Python-side
     # re-normalisation is involved.
-    documents = [_tokenizer.tokenize_joined(_document(node)) for _, node in candidates]
-    query_tokens = _tokenizer.cut(query)
-    if not query_tokens or not any(documents):
+    query_tokens = [token.lower() for token in _tokenizer.cut(query)]
+    if not query_tokens:
+        return candidates
+    backend = _tokenizer.backend_name()
+    documents = []
+    for _, node in candidates:
+        text = _document(node)
+        # Bound retained metadata as well as entry count; unusually large pages still rerank,
+        # but must not pin their token payload in a long-lived server's hot cache.
+        tokenize = _cached_rerank_tokens if len(text) <= RERANK_TOKEN_CACHE_MAX_CHARS else _cached_rerank_tokens.__wrapped__
+        documents.append(tokenize(text, backend))
+    if not any(documents):
         return candidates
 
     try:
         rerank_indices = vector_lake_core.fast_bm25_rerank(
             list(query_tokens),
-            [document.split() for document in documents],
+            documents,
             [float(score) for score, _ in candidates],
             weight,
         )
@@ -1157,6 +1266,38 @@ def _filtered_recall(fetch, catalog, depth: int, domain, cluster, include_histor
         limit = min(limit * 2, MAX_FILTERED_RECALL_CANDIDATES)
 
 
+def _filtered_graph_expansions(ranked, catalog, limit, domain, cluster, include_history, filter_expr):
+    """Select the first eligible graph hits, reading metadata in bounded batches."""
+    selected = []
+    if limit <= 0:
+        return selected
+    has_selectors = bool(domain or cluster or not include_history or filter_expr)
+    needs_full = not has_selectors or bool(filter_expr) or not hasattr(catalog, "filter_fields")
+    # An unfiltered request needs no separate metadata round trip; fetch only its next quota.
+    batch_size = 32 if has_selectors else min(32, limit)
+    for start in range(0, len(ranked), batch_size):
+        batch = ranked[start:start + batch_size]
+        keys = [key for key, _weight in batch]
+        fields = catalog.nodes_by_key(keys) if needs_full else catalog.filter_fields(keys)
+        eligible = [
+            (key, weight) for key, weight in batch
+            if key in fields and _passes_filters(fields[key], domain, cluster, include_history, filter_expr)
+        ]
+        # Metadata can change or disappear before its payload read. Count only still-eligible
+        # materialised pages toward the quota rather than leaking a changed selector or shortening it.
+        while eligible and len(selected) < limit:
+            remaining = limit - len(selected)
+            shortlist, eligible = eligible[:remaining], eligible[remaining:]
+            nodes = fields if needs_full else catalog.nodes_by_key([key for key, _ in shortlist])
+            selected.extend(
+                (key, weight, nodes[key]) for key, weight in shortlist
+                if key in nodes and (needs_full or _passes_filters(nodes[key], domain, cluster, include_history, filter_expr))
+            )
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def _search_scored_pages(
     query: str,
     top_k: int,
@@ -1166,6 +1307,8 @@ def _search_scored_pages(
     filter_expr: str = None,
     catalog=None,
     projection_note: str | None = None,
+    *,
+    timings: dict[str, float] | None = None,
 ):
     """Ranked pages plus retrieval notes.
 
@@ -1177,10 +1320,23 @@ def _search_scored_pages(
     Nodes and the personalised-PageRank adjacency come from the SQLite projection
     (``page_index_projection``) instead of a full ``index.json`` parse per process
     and a full 30 140-edge dict rebuild per query.
+
+    ``timings`` is an optional caller-owned output dictionary of phase milliseconds;
+    it is reset per call and does not change result formatting or the persistent ledger.
     """
     from vector_lake import page_index_projection
 
     started = time.perf_counter()
+    phase_started = started
+    if timings is not None:
+        timings.clear()
+
+    def _mark(phase):
+        nonlocal phase_started
+        if timings is not None:
+            now = time.perf_counter()
+            timings[phase] = (now - phase_started) * 1000.0
+            phase_started = now
 
     # Resolved before ``_record`` is defined: the ledger closure references it, and the early exits
     # (a missing index, unreadable tokens) record through that same closure -- referencing a local
@@ -1200,6 +1356,9 @@ def _search_scored_pages(
             fusion=fusion_mode,
             fts_backend=_fts_backend_name(),
         )
+        _mark("ledger")
+        if timings is not None:
+            timings["total"] = (time.perf_counter() - started) * 1000.0
 
     # Read-only source selection.  A reader never repairs the projection: the
     # rebuild needs the write lock, and a reader that lost that race used to give
@@ -1212,6 +1371,7 @@ def _search_scored_pages(
     # request (``assemble_context``) does not parse the file a second time.
     if catalog is None:
         catalog, projection_note = page_index_projection.read_catalog()
+    _mark("catalog")
     if catalog is None:
         if page_index_projection.index_file_stamp() is None:
             answer = "Lake is drying. No index.json found, please ingest sources first."
@@ -1224,6 +1384,7 @@ def _search_scored_pages(
     intent = _keyword_intent(query)
     scored = []
     tokens = _expand_query_locally(query)
+    _mark("query_processing")
     if not tokens:
         _record([], [], error="No valid search tokens.")
         return [], [], "No valid search tokens."
@@ -1237,11 +1398,9 @@ def _search_scored_pages(
     # 1. FTS5 Search
     fts_ranked: list[str] = []
     try:
-        # Use expanded tokens as the query basis to preserve LLM synonym expansions
-        expanded_query = query + " " + " ".join(tokens)
         if domain or cluster or filter_expr or not include_history:
             def fetch_fts(limit):
-                rows = _get_fts_search_results(expanded_query, limit=limit)
+                rows = _get_fts_recall_results(query, limit=limit)
                 return rows, getattr(_LAST_FTS_ERROR, "msg", None)
 
             fts_results, fts_error, fts_note = _filtered_recall(
@@ -1251,11 +1410,11 @@ def _search_scored_pages(
             if fts_note:
                 vector_notes.append(f"FTS: {fts_note}")
         else:
-            fts_results = _get_fts_search_results(expanded_query, limit=_candidate_depth())
+            fts_results = _get_fts_recall_results(query, limit=_candidate_depth())
             fts_error = getattr(_LAST_FTS_ERROR, "msg", None)
         if fts_error:
             vector_notes.append(fts_error)
-            if hasattr(catalog, "_nodes") and isinstance(catalog._nodes, dict):
+            if not fts_results and hasattr(catalog, "_nodes") and isinstance(catalog._nodes, dict):
                 fallback_hits = []
                 q_lower = query.lower()
                 toks_lower = [t.lower() for t in tokens if len(t) >= 2]
@@ -1288,10 +1447,13 @@ def _search_scored_pages(
     except Exception as e:
         log.error(f"FTS5 Search failed: {e}")
 
+    _mark("fts")
+
     # 2. Vector Search (Hybrid blending)
     vector_ranked: list[str] = []
     projection_error = _vector_projection_error()
     query_vector, embedding_error = ([], projection_error) if projection_error else _get_query_embedding(query)
+    _mark("embedding")
     if query_vector:
         vector_note = None
         if domain or cluster or filter_expr or not include_history:
@@ -1344,6 +1506,7 @@ def _search_scored_pages(
     else:
         vector_notes.append(embedding_error or "query embedding unavailable")
 
+    _mark("vector_search")
     fts_hits = set(fts_ranked)
     vector_hits = set(vector_ranked)
 
@@ -1369,6 +1532,8 @@ def _search_scored_pages(
         scored.append((score, node))
 
     scored.sort(key=lambda item: item[0], reverse=True)
+
+    _mark("materialize")
 
     # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
     top_keys = {node["_key"] for _, node in scored[:5]}
@@ -1410,24 +1575,19 @@ def _search_scored_pages(
                 ppr_scores = next_scores
 
             sorted_expansions = sorted(
-                [(k, v) for k, v in ppr_scores.items() if k not in existing_keys], 
+                [(k, v) for k, v in ppr_scores.items() if k not in existing_keys and v > 0.0],
                 key=lambda x: x[1], 
                 reverse=True
             )
         if HAVE_CORE:
-            sorted_expansions = [(k, v) for k, v in sorted_ppr if k not in existing_keys]
+            # VL-S02: graph-wide zero entries are not reachable candidates. In RRF a zero
+            # would otherwise become a positive vote merely because it has a list position.
+            sorted_expansions = [(k, v) for k, v in sorted_ppr if k not in existing_keys and v > 0.0]
 
-        expansion_keys = [key for key, _ in sorted_expansions[:expansion_limit]]
-        expanded_nodes = catalog.nodes_by_key(expansion_keys)
-        
-        for expansion_rank, (expanded_key, ppr_weight) in enumerate(sorted_expansions[:expansion_limit]):
-            expanded_node = expanded_nodes.get(expanded_key)
-            if expanded_node is None:
-                continue
-            # Graph expansion is an additional candidate source, not an exemption
-            # from the caller's filters.
-            if not _passes_filters(expanded_node, domain, cluster, include_history, filter_expr):
-                continue
+        expansions = _filtered_graph_expansions(
+            sorted_expansions, catalog, expansion_limit, domain, cluster, include_history, filter_expr,
+        )
+        for expansion_rank, (expanded_key, ppr_weight, expanded_node) in enumerate(expansions):
             if fusion_mode == "rrf":
                 # The expansion ordering is a third *ranked list*, expressed in the same units as
                 # the fused ones.  Scaling it by 15 instead put it in the space the other two no
@@ -1441,6 +1601,8 @@ def _search_scored_pages(
             scored.append((expansion_score, {"_key": expanded_key, **expanded_node, "_origin": "ppr"}))
 
     scored.sort(key=lambda item: item[0], reverse=True)
+
+    _mark("ppr")
 
     # Phase 1: Expand candidate pool for reranking.  Pool size is fixed, so the reranker's
     # pool-local min-max normalisation no longer depends on how many answers the caller asked for.
@@ -1480,9 +1642,12 @@ def _search_scored_pages(
         candidate_pool.sort(key=lambda item: item[0], reverse=True)
     else:
         candidate_pool = _fill(scored, pool_size)
+    _mark("pool")
+
     # Phase 2: Local deterministic ranking. Text-model reranking is delegated
     # to the host agent when explicitly requested, not performed by runtime code.
     reranked = _rerank_candidates_locally(query, candidate_pool)
+    _mark("rerank")
 
     # Phase 3: Final top_k extraction.  Sources are demoted, not counted: a fixed multiplicative
     # penalty keeps the ordering a function of the pool (so top-k remains a pure window) and keeps
@@ -1530,6 +1695,7 @@ def _search_scored_pages(
     # expressed inside the reranker (which only reorders, it does not rescore) was overwritten by
     # this very statement -- measured, the switch changed no rank at all.
     final_scored = _entity_first_order(query, penalised)[:top_k]
+    _mark("final_order")
 
     if projection_note:
         vector_notes.append(projection_note)

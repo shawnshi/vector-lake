@@ -5,6 +5,7 @@ import re
 import time
 
 from vector_lake import get_extension_root, provenance
+from vector_lake.template_loader import read_template, render_template_text
 from vector_lake.tool_search import assemble_context
 from vector_lake import stub_creator
 from vector_lake.wiki_utils import (
@@ -99,7 +100,7 @@ def _render_context_payload(query_str: str, context: dict) -> str:
     def render() -> str:
         parts = []
         if COMPARATIVE_QUERY_PATTERN.search(query_str):
-            parts.append("\n[SYSTEM NOTE: This is a comparative query. Ensure equal retrieval weighting for both sides to avoid skew.]\n")
+            parts.append(read_template("prompts/query/comparison.md", root=get_extension_root()))
         if context.get("memory_packet"):
             parts.append(
                 f"\n\n--- OPERATIONAL MEMORY PACKET "
@@ -156,23 +157,19 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
     # afterwards, and a missing template merely set the template text to its own error message --
     # which was then returned as the instruction with no placeholder substituted at all.  The
     # ingest prompt builder already resolves this by raising; the query path was the outlier.
-    templates_dir = get_extension_root() / "templates"
-    prompt_path = templates_dir / "query_prompt.md"
-    if not prompt_path.exists():
-        raise FileNotFoundError("templates/query_prompt.md not found")
-    prompt_template = prompt_path.read_text(encoding="utf-8")
+    prompt_template = read_template("prompts/query/main.md", root=get_extension_root())
 
     # Write context to a temporary payload file
     tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    _prune_stale_query_contexts(tmp_dir)
-    
     # Create a unique hash for this query with anti-collision
     import uuid
     unique_str = f"{query_str}_{time.time()}_{uuid.uuid4().hex}"
     query_hash = hashlib.md5(unique_str.encode("utf-8")).hexdigest()[:12]
     payload_path = tmp_dir / f"query_context_{query_hash}.md"
     
+    instructions = render_template_text(prompt_template, payload_path=str(payload_path), query_str=query_str)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    _prune_stale_query_contexts(tmp_dir)
     with open(payload_path, "w", encoding="utf-8") as f:
         f.write(context_block)
         
@@ -184,9 +181,6 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
     # removed rather than given a home in the template: this prompt's own trust model forbids the
     # model from naming paths at all ("Do not return paths..."), so handing it a directory to
     # write into would contradict the contract it is being asked to honour.
-    instructions = prompt_template.replace("{{payload_path}}", str(payload_path)) \
-        .replace("{{query_str}}", query_str)
-        
     return instructions
 
 def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:

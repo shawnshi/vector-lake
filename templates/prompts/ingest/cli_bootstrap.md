@@ -1,0 +1,1 @@
+Complete the ingest from stdin; return only the contracted JSON.

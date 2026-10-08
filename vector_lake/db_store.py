@@ -3050,6 +3050,16 @@ def claim_subagent_jobs(
         return claimed
 
 
+def ingest_tasks_ready() -> bool:
+    """Cheap read-only availability probe; never claim, refresh or bypass a lease."""
+    now = datetime.now(timezone.utc).isoformat()
+    return get_connection().execute(
+        "SELECT 1 FROM jobs WHERE task_type = 'ingest' AND "
+        "(status = 'awaiting_subagent' OR (status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?)) LIMIT 1",
+        (now,),
+    ).fetchone() is not None
+
+
 def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     """Bind finalization to the exact leased job payload."""
     init_db()
@@ -3282,7 +3292,45 @@ def clear_abandoned_sources(filepath: str | None = None) -> int:
     return int(cursor.rowcount or 0)
 
 
-def release_job_for_retry(job_id: str, reason: str) -> None:
+def _ingest_failure_claim_current(row: dict, claim: dict | None, now: str) -> bool:
+    """Failure/release must hold the same ownership fence as successful finalization."""
+    if row["task_type"] != "ingest":
+        return False
+    try:
+        retries = int(row["retries"] or 0)
+        current_generation = int(row["lease_generation"] or 0)
+    except (TypeError, ValueError):
+        return False
+    if claim is None:
+        # Preserve unleased administrative callers, never infer a live owner's token.
+        return (
+            row["status"] in {"queued", "failed"} and retries < MAX_INGEST_ATTEMPTS
+            and not any(row[key] for key in ("lease_owner", "lease_token", "lease_until"))
+        )
+    if str(claim.get("job_id") or "") != str(row["job_id"]):
+        return False
+    if row["status"] == "dispatched":
+        return all(row[key] == claim.get(key) for key in ("lease_until", "updated_at", "payload")) and bool(
+            row["lease_until"] and row["lease_until"] > now
+        )
+    if row["status"] != "subagent_processing":
+        return False
+    if not all(row[key] and row[key] == claim.get(key) for key in ("lease_owner", "lease_token")):
+        return False
+    generation_token = claim.get("lease_generation")
+    if isinstance(generation_token, bool) or not isinstance(generation_token, (int, str)):
+        return False
+    try:
+        generation = int(generation_token)
+        expiry = datetime.fromisoformat(str(row["lease_until"] or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return generation == current_generation and expiry > datetime.fromisoformat(now)
+
+
+def release_job_for_retry(job_id: str, reason: str, *, claim: dict | None = None, delay_seconds: float = 5.0) -> bool:
     """Make a job dispatchable again *without* spending its terminal attempt budget.
 
     The budget exists to stop a deterministic rejection being retried forever (a schema
@@ -3299,21 +3347,34 @@ def release_job_for_retry(job_id: str, reason: str) -> None:
     from datetime import datetime, timezone
 
     conn = get_connection()
-    now_str = datetime.now(timezone.utc).isoformat()
-    immediate = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    import math
+
+    if not math.isfinite(delay_seconds) or not 1 <= delay_seconds <= 3600:
+        raise ValueError("Retry delay must be finite and between 1 and 3600 seconds")
     with transaction():
+        now_dt = datetime.now(timezone.utc)
+        now_str = now_dt.isoformat()
+        immediate = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None or not _ingest_failure_claim_current(dict(row), claim, now_str):
+            return False
         conn.execute(
             "UPDATE jobs SET status = 'failed', error_msg = ?, updated_at = ?, available_at = ?, "
             "lease_until = NULL, lease_owner = NULL, lease_token = NULL WHERE job_id = ?",
             (f"{str(reason)[:460]} [transient, retry does not spend the attempt budget]", now_str, immediate, job_id),
         )
+        return True
 
 
-def update_job_status(job_id: str, status: str, error_msg: str = ""):
+def update_job_status(job_id: str, status: str, error_msg: str = "", *, claim: dict | None = None):
     from datetime import datetime, timezone
     conn = get_connection()
-    now_str = datetime.now(timezone.utc).isoformat()
     with transaction():
+        now_str = datetime.now(timezone.utc).isoformat()
+        if claim is not None:
+            current = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if current is None or not _ingest_failure_claim_current(dict(current), claim, now_str):
+                return False
         if status == "failed":
             row = conn.execute("SELECT retries FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             next_retry = int(row["retries"] or 0) + 1 if row else 1
@@ -3331,6 +3392,7 @@ def update_job_status(job_id: str, status: str, error_msg: str = ""):
                     completed_at = COALESCE(?, completed_at)
                 WHERE job_id = ?
             """, (status, error_msg, now_str, completed_at, job_id))
+        return True
 
 
 

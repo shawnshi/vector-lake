@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 from vector_lake.wiki_utils import get_purpose_path, read_ingest_item_content
 from vector_lake.yaml_utils import load_yaml
+from vector_lake.template_loader import render_template
 
 
 class PurposeContractError(ValueError):
@@ -132,26 +134,30 @@ def purpose_vectors(contract: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def render_strategy_directive(contract: dict[str, Any] | None = None) -> str:
-    contract = contract or load_purpose_contract()
+    # Render exactly the validated policy; do not mutate a caller-owned snapshot.
+    contract = validate_purpose_contract(deepcopy(contract)) if contract is not None else load_purpose_contract()
     scope = contract["scope"]
     tier_names = ", ".join(contract["evidence_tiers"].keys())
     sir_lines = [
-        f"- {sir['id']} ({sir['status']}): {', '.join(sir['signal_keywords'])}; review after {sir['review_after']}"
+        render_template(
+            "prompts/strategy_sir.md", id=sir["id"], status=sir["status"],
+            keywords=", ".join(sir["signal_keywords"]), review_after=sir["review_after"],
+        )
         for sir in contract["sir_registry"]
         if str(sir["status"]).lower() == "active"
     ]
-    return "\n".join([
-        "[STRATEGIC PURPOSE CONTRACT]",
-        f"Core scope: {', '.join(scope['core'])}.",
-        f"Edge scope: {', '.join(scope['edge'])}.",
-        f"Reject from the graph: {', '.join(scope['excluded'])}.",
-        f"Marketing noise requires hard evidence: {', '.join(scope['marketing_noise'])}.",
-        f"Evidence tiers: {tier_names}. Never promote a claim across tiers.",
-        "Every new node must declare strategic_scope: core|edge and evidence_tier, and every metric needs an inline Source_* anchor.",
-        "For a tension with two independent sources at the configured intensity, create a Synthesis-Proposal; do not write a conclusion directly.",
-        "Active SIRs:",
-        *sir_lines,
-    ])
+    tier_definitions = "\n".join(
+        render_template("prompts/strategy_tier.md", tier=name, definition=definition)
+        for name, definition in contract["evidence_tiers"].items()
+    )
+    policy = contract["synthesis_policy"]
+    return render_template(
+        "prompts/strategy.md", version=contract["purpose_version"],
+        tier_definitions=tier_definitions, min_sources=policy["min_distinct_sources"],
+        min_intensity=policy["min_tension_intensity"], core=", ".join(scope["core"]), edge=", ".join(scope["edge"]),
+        excluded=", ".join(scope["excluded"]), marketing=", ".join(scope["marketing_noise"]),
+        tiers=tier_names, sirs="\n" + "\n".join(sir_lines) if sir_lines else "",
+    )
 
 
 def _normalise_sources(value: Any) -> list[str]:
@@ -185,13 +191,13 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
         # ``render_strategy_directive`` scopes this requirement to *new* nodes
         # ("Every new node must declare ...").  Full validation also runs when an
         # existing page is re-saved, and 6311 of the 7178 live pages predate the
-        # evidence_tier vocabulary, so an absent field is treated as legacy rather
-        # than as a contradiction with the purpose contract.  A *present* value
+        # evidence_tier vocabulary. Administrative memory/recovery also must not
+        # fabricate a business grade, so absence is not a purpose contradiction.  A *present* value
         # outside the contract vocabulary is still a hard error -- that is a real
         # conflict with purpose.md, and ``validation_mode="schema"`` remains the
         # escape hatch for bounded legacy maintenance.
         evidence_tier = str(frontmatter.get("evidence_tier", "")).strip()
-        if evidence_tier and evidence_tier not in permitted_tiers:
+        if "evidence_tier" in frontmatter and evidence_tier not in permitted_tiers:
             raise PurposeContractError(f"{filename}: evidence_tier must be one of {sorted(permitted_tiers)}.")
             
         aliases = frontmatter.get("aliases")

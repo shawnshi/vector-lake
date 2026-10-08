@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vector_lake import get_extension_root  # noqa: E402
+from vector_lake.template_loader import render_template  # noqa: E402
 from vector_lake.governance_store import load_governance_queue  # noqa: E402
 
 # Maximum governance items per subagent shard.
@@ -46,18 +47,13 @@ def main():
         shard_items = merge_items[i * SHARD_SIZE : (i + 1) * SHARD_SIZE]
         shard_file = os.path.join(TMP_DIR, f"shard_{i+1}.md")
         
+        item_text = "".join(render_template(
+            "prompts/janitor_item.md", id=item.get("item_id", "Unknown"),
+            title=item.get("title", ""), description=item.get("description", ""),
+        ) for item in shard_items)
+        shard_text = render_template("prompts/janitor.md", shard=i + 1, items=item_text)
         with open(shard_file, "w", encoding="utf-8") as f:
-            f.write(f"# Vector Lake Janitor Swarm - Shard {i+1}\n\n")
-            f.write("## DIRECTIVE\n")
-            f.write("You are an autonomous Janitor Subagent. Your task is to process the following governance items and merge duplicate entities.\n")
-            f.write("For each item, use `resolve_governance_item` MCP tool with resolution 'merge', or use `bulk_reconciliation` MCP tool to physically merge them.\n")
-            f.write("CRITICAL for bulk_reconciliation: The payload MUST be a JSON string, NOT a Python list. Ensure each operation uses 'source_entity' and 'target_entity' keys (not 'source_node').\n")
-            f.write("CRITICAL: You are running in autonomous background mode. Do NOT ask the user for permission. Execute all merges directly.\n\n")
-            f.write("## Governance Items to Process:\n")
-            for item in shard_items:
-                f.write(f"- Item ID: {item.get('item_id', 'Unknown')}\n")
-                f.write(f"  Title: {item.get('title', '')}\n")
-                f.write(f"  Description: {item.get('description', '')}\n\n")
+            f.write(shard_text)
 
         manifest["shards"].append({
             "index": i + 1,

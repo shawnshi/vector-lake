@@ -122,8 +122,8 @@ def test_daemon_no_longer_depends_on_python_louvain():
 
 def test_community_page_template_carries_required_frontmatter():
     """The generated System_Community page must satisfy the schema validator."""
-    source = (ROOT / "scripts" / "community_clustering_daemon.py").read_text(encoding="utf-8")
-    template = source.split('content = f"""---', 1)[1].split('---', 1)[0]
+    from vector_lake.template_loader import read_template
+    template = read_template("wiki/community.md").split('---', 2)[1]
     for field in ("id:", "title:", "type: system", "status:", "categories:", "updated:"):
         assert field in template, f"community template is missing {field!r}"
 
@@ -131,24 +131,13 @@ def test_community_page_template_carries_required_frontmatter():
 def test_community_page_template_passes_schema_validation(isolated_memory, monkeypatch):
     from vector_lake.schema_validator import validate_schema
 
-    body = "\n".join([
-        "---",
-        "id: System_Community_L0_deadbeef",
-        'title: "L0 Comm: A / B"',
-        "type: system",
-        "status: Active",
-        "categories: [System]",
-        "updated: 2026-01-01T00:00:00+00:00",
-        "community_id: deadbeef",
-        "level: L0",
-        "aliases:",
-        '- "L0 Comm: A / B"',
-        "---",
-        "# L0 Comm: A / B",
-        "",
-        "## 核心节点 (Hubs)",
-        "- [[A]]",
-    ])
+    from vector_lake.template_loader import render_template
+    body = render_template(
+        "wiki/community.md", id="System_Community_L0_deadbeef",
+        label_yaml=DAEMON._yaml_scalar("L0 Comm: A / B"), updated="2026-01-01T00:00:00+00:00",
+        community_id="deadbeef", level="L0", label="L0 Comm: A / B", zoom="Global",
+        hubs="- [[A]]", members="", summary="", delta="",
+    )
     frontmatter, _ = __import__("vector_lake.wiki_utils", fromlist=["split_frontmatter"]).split_frontmatter(body)
 
     validate_schema(frontmatter, body, "System_Community_L0_deadbeef.md", None)

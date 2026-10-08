@@ -17,6 +17,7 @@ from vector_lake.claim_extractor import extract_page_objects
 from vector_lake.db_store import backup_database, get_connection, get_db_path, init_db
 from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.schema_validator import VALID_H3_SLOTS
+from vector_lake.template_loader import render_template
 from vector_lake.yaml_utils import dump_yaml
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_meta_dir, get_wiki_dir, read_markdown_file
 
@@ -321,7 +322,7 @@ def _frontmatter_from_entity(entity: dict) -> dict:
     categories = entity.get("categories") or ["Uncategorized"]
     if isinstance(categories, str):
         categories = [categories]
-    return {
+    frontmatter = {
         "id": entity.get("id") or entity.get("entity_id") or page_key,
         "title": entity.get("title") or entity.get("canonical_name") or page_key,
         "type": entity_type,
@@ -332,8 +333,12 @@ def _frontmatter_from_entity(entity: dict) -> dict:
         "updated": _iso_datetime(entity.get("updated") or entity.get("updated_at")),
         "sources": entity.get("sources") or [],
         "strategic_scope": entity.get("strategic_scope") or "core",
-        "evidence_tier": entity.get("evidence_tier") or "primary",
     }
+    # A projection repairs presentation, not evidence: preserve a recorded grade,
+    # but do not upgrade missing metadata to an invented "primary" classification.
+    if "evidence_tier" in entity:
+        frontmatter["evidence_tier"] = entity["evidence_tier"]
+    return frontmatter
 
 
 def _body_from_entity(entity: dict, frontmatter: dict) -> str:
@@ -341,28 +346,20 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
     entity_type = str(frontmatter.get("type") or "concept").lower()
     title = str(frontmatter.get("title") or entity.get("canonical_name") or entity.get("page_key"))
     restored_note = (
-        f"{title}：canonical 记录存在，但 Markdown 投影缺失。本页由维护流程从 canonical 元数据恢复，"
-        "需要后续补充原始证据与完整编译事实。"
+        render_template("wiki/restored_note.md", title=title)
     )
     if entity_type == "source":
         return raw_text or restored_note
     if entity_type == "synthesis":
         return raw_text or (
-            "## 核心合成论点 (Core Synthesized Claims)\n\n"
-            f"- {restored_note}\n\n"
-            "## 支撑拓扑 (Supporting Topology)\n\n"
-            "- [mentions:: [[Concept_Agent_Code_Cleanliness]]]\n"
+            render_template("wiki/restored_synthesis.md", note=restored_note)
         )
     if raw_text and "## 1. 编译事实" in raw_text and "## 2. 证据时间线" in raw_text:
         return raw_text
     slot = (VALID_H3_SLOTS.get(entity_type) or VALID_H3_SLOTS["concept"])[0]
     restored_at = datetime.now(timezone.utc).date().isoformat()
     return (
-        "## 1. 编译事实 (Compiled Truth - READ MODEL)\n\n"
-        f"{slot}\n\n"
-        f"{restored_note}\n\n"
-        "## 2. 证据时间线\n\n"
-        f"- [{restored_at}] [Observation] Markdown projection restored from canonical metadata during maintenance.\n"
+        render_template("wiki/restored_entity.md", slot=slot, note=restored_note, date=restored_at)
     )
 
 

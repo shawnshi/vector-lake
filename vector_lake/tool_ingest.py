@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from vector_lake import get_extension_root
+from vector_lake.template_loader import read_template, render_template
+from vector_lake.runtime_contract import render_schema_contract, schema_snapshot
 from vector_lake.db_store import mark_file_processed
 from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
@@ -75,36 +77,33 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     claimed = claim_subagent_jobs(limit=limit, lease_seconds=lease_seconds)
     tasks = []
     for row in claimed:
-        task_packet = None
         packet_path = row.get("task_packet_path")
+        task_packet = None
         if packet_path:
             try:
                 task_packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                # An unreadable packet is unusable work.  Retiring it here (rather than
-                # handing it back on every claim) stops it consuming a batch slot forever;
-                # with the write gate no longer hard-failing on job health, the terminal
-                # state stays visible without blocking wiki writes.
-                from vector_lake.db_store import update_job_status
-
-                update_job_status(
-                    row.get("job_id"),
-                    "failed",
-                    f"Unreadable task packet ({packet_path}): {exc}",
-                )
-                continue
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                task_packet = {"error": f"Unreadable task packet: {type(exc).__name__}: {exc}"}
+        if packet_path and not isinstance(task_packet, dict):
+            task_packet = {"error": "Task packet must be a JSON object"}
         if isinstance(task_packet, dict) and "error" not in task_packet:
-            metadata = task_packet.setdefault("metadata", {})
-            processed = metadata.setdefault("processed_data", {})
-            processed.update({
-                "job_id": row.get("job_id"),
-                "lease_owner": row.get("lease_owner"),
-                "lease_token": row.get("lease_token"),
-                "lease_generation": row.get("lease_generation"),
-            })
+            metadata = task_packet.get("metadata")
+            processed = metadata.get("processed_data") if isinstance(metadata, dict) else None
+            if not isinstance(processed, dict) or not processed:
+                task_packet = {"error": "Task packet requires metadata.processed_data object"}
+            else:
+                processed.update({
+                    "job_id": row.get("job_id"),
+                    "lease_owner": row.get("lease_owner"),
+                    "lease_token": row.get("lease_token"),
+                    "lease_generation": row.get("lease_generation"),
+                })
+        # Return every acquired lease, including errors. The consumer alone spends its
+        # attempt, so cycle caps and healthy work behind a damaged packet remain visible.
         tasks.append({
             "job_id": row.get("job_id"),
             "status": row.get("status"),
+            "created_at": row.get("created_at"),
             "lease_until": row.get("lease_until"),
             "lease_owner": row.get("lease_owner"),
             "lease_token": row.get("lease_token"),
@@ -115,25 +114,14 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     return json.dumps(tasks, ensure_ascii=False, indent=2)
 
 
-#: Failure reasons that a later attempt can fix, so they must not spend the attempt budget.
-#:
-#: Matched on the message the finalize gates produce, deliberately narrow: a conflict means the
-#: page moved under the model and the next attempt reads the new version, whereas a schema or
-#: naming rejection will reject the same payload every time.
-TRANSIENT_FAILURE_MARKERS = (
-    "canonical version conflict",
-    "version conflict",
-    "is no longer finalizable",
-)
-
-
 def is_transient_failure(reason: str) -> bool:
-    """Whether ``reason`` describes something a retry can resolve."""
-    lowered = str(reason or "").lower()
-    return any(marker in lowered for marker in TRANSIENT_FAILURE_MARKERS)
+    """Whether redispatch can resolve the failure without spending the source budget."""
+    from vector_lake.ingest_errors import failure_is_transient
+
+    return failure_is_transient(reason)
 
 
-def record_ingest_failure(job_id: str, reason: str) -> str:
+def record_ingest_failure(job_id: str, reason: str, *, claim: dict | None = None) -> str:
     """Consume one attempt of a job's bounded budget; report whether it is now terminal.
 
     The runner's failure branches used to increment only a local counter.  The job stayed in
@@ -148,36 +136,37 @@ def record_ingest_failure(job_id: str, reason: str) -> str:
     """
     from vector_lake.db_store import (
         MAX_INGEST_ATTEMPTS,
+        _ingest_failure_claim_current,
         get_connection,
         release_job_for_retry,
+        transaction,
         update_job_status,
     )
+    from datetime import datetime, timezone
 
     reason = str(reason or "unspecified failure")[:500]
-    row = get_connection().execute(
-        "SELECT retries FROM jobs WHERE job_id = ?", (str(job_id),)
-    ).fetchone()
-    if row is None:
-        return f"job {job_id} is not in the jobs table; nothing recorded"
-    if is_transient_failure(reason):
-        release_job_for_retry(str(job_id), reason)
-        return f"job {job_id} released for retry (transient: {reason[:80]}); attempt budget untouched"
-    attempt = int(row["retries"] or 0) + 1
-    update_job_status(str(job_id), "failed", reason)
-    if attempt < MAX_INGEST_ATTEMPTS:
-        return f"job {job_id} failed attempt {attempt}/{MAX_INGEST_ATTEMPTS}: will be re-dispatched"
+    with transaction():
+        row = get_connection().execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+        ).fetchone()
+        if row is None:
+            return f"job {job_id} is not in the jobs table; nothing recorded"
+        if not _ingest_failure_claim_current(dict(row), claim, datetime.now(timezone.utc).isoformat()):
+            return f"job {job_id} failure ignored: claim is stale, unowned or terminal"
+        if is_transient_failure(reason):
+            if not release_job_for_retry(str(job_id), reason, claim=claim):
+                return f"job {job_id} failure ignored: claim expired before release"
+            return f"job {job_id} released for retry (transient: {reason[:80]}); attempt budget untouched"
+        attempt = int(row["retries"] or 0) + 1
+        if not update_job_status(str(job_id), "failed", reason, claim=claim):
+            return f"job {job_id} failure ignored: claim expired before failure update"
+        if attempt < MAX_INGEST_ATTEMPTS:
+            return f"job {job_id} failed attempt {attempt}/{MAX_INGEST_ATTEMPTS}: will be re-dispatched"
 
-    # Terminal: remember the *content* so the scan stops re-dispatching it.  Without this the
-    # source cycles forever -- each new job gets a fresh attempt budget, so "bounded attempts"
-    # only bounds one job, not the source (measured: ``DHWB-20260913.md``, six days of a
-    # deterministic ``categories`` rejection at three model calls per round).
-    payload = get_connection().execute(
-        "SELECT payload FROM jobs WHERE job_id = ?", (str(job_id),)
-    ).fetchone()
-    abandoned = 0
-    if payload:
+        # Failure and content abandonment share the ownership check and transaction.
+        abandoned = 0
         try:
-            fields = json.loads(payload["payload"] or "{}")
+            fields = json.loads(row["payload"] or "{}")
         except (TypeError, ValueError):
             fields = {}
         filepath = str(fields.get("filepath") or "")
@@ -186,16 +175,16 @@ def record_ingest_failure(job_id: str, reason: str) -> str:
             from vector_lake.db_store import record_abandoned_source
 
             abandoned = record_abandoned_source(filepath, file_hash, reason)
-    suffix = (
-        f"; source abandoned after {abandoned} terminal job(s) on this content "
-        "(clear with `cli.py ingest-tasks --clear-abandoned`)"
-        if abandoned
-        else ""
-    )
-    return (
-        f"job {job_id} failed attempt {attempt}/{MAX_INGEST_ATTEMPTS}: attempt budget "
-        f"spent, no further dispatch ({reason}){suffix}"
-    )
+        suffix = (
+            f"; source abandoned after {abandoned} terminal job(s) on this content "
+            "(clear with `cli.py ingest-tasks --clear-abandoned`)"
+            if abandoned
+            else ""
+        )
+        return (
+            f"job {job_id} failed attempt {attempt}/{MAX_INGEST_ATTEMPTS}: attempt budget "
+            f"spent, no further dispatch ({reason}){suffix}"
+        )
 
 
 def reconcile_ingest_in_flight(grace_seconds: float = 120.0) -> dict:
@@ -1317,23 +1306,23 @@ def _build_ingest_instructions(
             schema_content += "\n\n" + category_path.read_text(encoding="utf-8")
     except OSError:
         pass
-    prompt_path = get_extension_root() / "templates" / "ingest_prompt.md"
-    if not prompt_path.exists():
-        raise FileNotFoundError("templates/ingest_prompt.md not found")
-    return (
-        prompt_path.read_text(encoding="utf-8")
-        .replace("{{filepath}}", str(filepath))
-        .replace("{{file_hash}}", file_hash)
-        .replace("{{canonical_name}}", canonical_name)
-        .replace("{{skeleton_block}}", parse_static_skeleton(filepath))
-        .replace("{{schema_content}}", schema_content)
-        .replace(
-            "{{index_summary}}",
-            _read_relevant_index_context(filepath) if index_context is None else index_context,
-        )
-        .replace("{{purpose_content}}", _read_purpose())
-        .replace("{{valid_predicates}}", ", ".join(sorted(VALID_PREDICATES)))
-        .replace("{{integration_predicates}}", ", ".join(sorted(INTEGRATION_PREDICATES)))
+    root = get_extension_root()
+    runtime = schema_snapshot()
+    return render_template(
+        "prompts/ingest/main.md", root=root, runtime_schema=render_schema_contract(runtime, root=root),
+        max_tags=runtime["max_tags"],
+        filepath=str(filepath), file_hash=file_hash, canonical_name=canonical_name,
+        skeleton_block=parse_static_skeleton(filepath), schema_content=schema_content,
+        index_summary=_read_relevant_index_context(filepath) if index_context is None else index_context,
+        purpose_content=_read_purpose(), valid_predicates=", ".join(runtime["page_predicates"]),
+        integration_predicates=", ".join(runtime["integration_predicates"]),
+        event_tags=", ".join(runtime["event_tags"]),
+        timeline_tags=", ".join(f"[{tag}]" for tag in runtime["event_tags"]),
+        entity_template=read_template("wiki/entity.md", root=root),
+        source_template=render_template(
+            "wiki/source.md", root=root, filepath=str(filepath),
+            file_hash=file_hash, canonical_name=canonical_name,
+        ),
     )
 
 

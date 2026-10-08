@@ -91,7 +91,30 @@ def find_cli_binary(backend: str) -> str | None:
 
 def check_ingest_backend(selection: IngestBackend) -> dict:
     """Local capability check only; never claim jobs or make a model/authentication call."""
-    report = selection.as_dict()
+    boundaries = {
+        "pi": {
+            "capability_scope": "executable_resolution_only",
+            "execution_boundary": "read_only_ingestor_child; parent_uses_host_pi_policy",
+            "local_retention": "pi_sessions_and_complete_failure_logs",
+        },
+        "gemini": {
+            "capability_scope": "headless_flags",
+            "execution_boundary": "tool_deny_policy; no_os_sandbox_added_by_adapter",
+            "local_retention": "temporary_adapter_files; host_cli_provider_policy_is_separate",
+        },
+        "codex": {
+            "capability_scope": "headless_flags_and_feature_gates",
+            "execution_boundary": "tools_disabled; cli_read_only_sandbox_requested",
+            "local_retention": "ephemeral_cli_and_temporary_adapter_files; provider_policy_is_separate",
+        },
+        "custom": {
+            "capability_scope": "not_checked",
+            "execution_boundary": "custom_shell_command; privileges_and_tools_unverified",
+            "local_retention": "custom_command_defined",
+        },
+    }
+    report = {**selection.as_dict(), **boundaries[selection.backend],
+              "boundary_verified": False}
     if selection.backend == "custom":
         return {**report, "capability_checked": False, "authentication_verified": False}
     if selection.backend == "pi":

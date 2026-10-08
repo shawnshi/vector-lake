@@ -110,11 +110,11 @@ def test_a_conforming_name_is_still_synced(isolated_memory):
 
 
 def test_a_missing_template_fails_instead_of_becoming_the_instruction(tmp_path, monkeypatch):
-    """It used to return ``Error: templates/query_prompt.md not found.`` as the prompt itself."""
+    """It used to return ``Error: templates/main.md not found.`` as the prompt itself."""
     monkeypatch.setattr(tool_query, "get_extension_root", lambda: tmp_path)
     monkeypatch.setattr(tool_query, "assemble_context", lambda query: _context())
 
-    with pytest.raises(FileNotFoundError, match="query_prompt.md"):
+    with pytest.raises(FileNotFoundError, match="main.md"):
         tool_query.prepare_query_context("q")
 
 
@@ -132,8 +132,8 @@ def test_the_template_is_validated_before_the_payload_is_written(tmp_path, monke
 
 def test_a_present_template_still_renders(tmp_path, monkeypatch):
     """Positive control for the fail-closed change."""
-    (tmp_path / "templates").mkdir(parents=True)
-    (tmp_path / "templates" / "query_prompt.md").write_text(
+    (tmp_path / "templates" / "prompts" / "query").mkdir(parents=True)
+    (tmp_path / "templates" / "prompts" / "query" / "main.md").write_text(
         "Q={{query_str}} P={{payload_path}}", encoding="utf-8"
     )
     monkeypatch.setattr(tool_query, "get_extension_root", lambda: tmp_path)
@@ -444,13 +444,13 @@ def test_the_template_and_the_code_agree_on_placeholders():
     Both directions matter: a placeholder the code does not handle would ship unsubstituted, and
     one the code handles but the template does not contain is dead weight that hides the drift.
     """
-    template = (REPO_ROOT / "templates" / "query_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "query" / "main.md").read_text(encoding="utf-8")
     assert set(re.findall(r"\{\{([a-z_]+)\}\}", template)) == {"payload_path", "query_str"}
 
 
 def test_a_rendered_prompt_has_no_unsubstituted_placeholder(tmp_path, monkeypatch):
-    (tmp_path / "templates").mkdir(parents=True)
-    (tmp_path / "templates" / "query_prompt.md").write_text(
+    (tmp_path / "templates" / "prompts" / "query").mkdir(parents=True)
+    (tmp_path / "templates" / "prompts" / "query" / "main.md").write_text(
         "{{query_str}}|{{payload_path}}", encoding="utf-8"
     )
     monkeypatch.setattr(tool_query, "get_extension_root", lambda: tmp_path)
@@ -479,7 +479,7 @@ def test_the_prompt_does_not_claim_an_admission_gate_the_code_does_not_have():
 
     A reader takes that for protection that exists, which is worse than an absent gate.
     """
-    template = (REPO_ROOT / "templates" / "query_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "query" / "main.md").read_text(encoding="utf-8")
 
     assert "VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS" not in template
     assert "outside the default read-only query path" not in template
@@ -522,7 +522,7 @@ def test_the_prompt_does_not_promise_checks_the_finalizer_does_not_perform():
     no query hash, no prepared baseline, no content-hash comparison and no stub cap, so the
     prompt must not tell a reader that it does.
     """
-    template = (REPO_ROOT / "templates" / "query_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "query" / "main.md").read_text(encoding="utf-8")
 
     # The defect was a promise of enforcement, so the test targets the promise form.  A bare
     # mention of a nonce is legitimate: line 25 forbids the *model* from inventing one, which is a

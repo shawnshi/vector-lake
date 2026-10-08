@@ -1,6 +1,7 @@
 # Vector Lake Schema Categories (受控词表)
 
-This document defines the rigid ontology for the `categories` field in Vector Lake V8.0 (Schema V8.0 / Strategic Contract V12.1).
+This document explains the code-owned ontology for the `categories` field in Vector Lake V8.0 (Schema V8.0).
+`vector_lake/schema_validator.py` is the executable vocabulary owner; `vector_lake/runtime_contract.py` supplies its current values to model tasks. This catalogue is checked against those values, not parsed by the write gate.
 All entities, concepts, and synthesis logic nodes must carry exactly one of these category values.
 
 Two axes each hold nine values and they are **not** the same list, so the wording below is kept strict: `categories` is the controlled axis of nine **category values** (the list directly under this paragraph); `domain` is the topic/industry facet whose first tier is nine **macro domains**, plus registered **verticals** and **aliases**. "Macro domain" therefore always means the `domain` axis -- the write gate's own error text uses it (`neither a macro domain nor a registered vertical`). 
@@ -19,7 +20,7 @@ Folksonomy and fine-grained labels should go into the `tags` field instead.
 
 ## Enforcement
 Agents should generally use the above categories. However, if a concept fundamentally falls outside these bounds and warrants a new category, an agent **cannot** add it during an ingest run: the write gate refuses any value outside `VALID_CATEGORIES`. 
-The proposal helper `propose_schema_mutation` (`vector_lake/mcp_server.py`) is marked `[CLI-only / Internal]` and carries no `@mcp.tool()` decorator, so no MCP client can reach it; it appends a `schema-mutation` item to the governance queue, which a human reviews. Approval does not rewrite this document automatically -- a human edits `SCHEMA_CATEGORIES.md` and the write gate follows the file.
+The proposal helper `propose_schema_mutation` (`vector_lake/mcp_server.py`) is marked `[CLI-only / Internal]` and carries no `@mcp.tool()` decorator, so no MCP client can reach it; it appends a `schema-mutation` item to the governance queue, which a human reviews. Approval does not rewrite the catalogue or validator automatically. An authorized change must update the code-owned vocabulary and its documentation, then pass consistency and write-gate tests. Editing this Markdown alone never changes what the write gate accepts.
 
 ## Domain Facet (主题/行业 facet，两层登记制)
 

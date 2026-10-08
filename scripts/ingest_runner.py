@@ -28,7 +28,7 @@ import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +40,7 @@ configure_numeric_threads()
 
 from vector_lake import db_store  # noqa: E402
 from vector_lake.process_control import run_contained, model_timeout_seconds  # noqa: E402
+from vector_lake.ingest_execution import BackendCircuit, BackendFailure  # noqa: E402
 from vector_lake.ingest_backend import (SELECTION_SOURCES, builtin_model_argv,
                                         check_ingest_backend, resolve_ingest_backend,
                                         is_supervisor_child, legacy_runner_is_live,
@@ -64,6 +65,12 @@ REJECT_DUPLICATE = (
     "此任务为重复准备；由 ingest runner 自动关闭以免重复入库。"
 )
 REJECT_MISSING_SOURCE = "原始文件在 raw 目录下已不存在，任务无法完成；由 ingest runner 自动关闭。"
+
+RESULT_COUNTERS = (
+    "duplicate", "missing-source", "needs-model", "finalized", "errors", "model-failed",
+    "published", "content-rejected", "duplicate-closed", "missing-source-closed",
+    "backend-failed", "backend-held",
+)
 
 
 def _merge_model_integration(processed: dict, integration: dict) -> dict:
@@ -125,13 +132,9 @@ def classify(processed: dict, index: dict) -> str:
 
 
 def _version_conflict(message: str) -> bool:
-    # Preserve optimistic locking. A new dispatch refreshes candidates; never patch tokens
-    # into an old model proposal. Missing tokens are still ordinary model-repair errors.
-    return any(marker in message for marker in (
-        "target_hash is stale", "target_projection_hash is stale", "source_hash is stale",
-        "source_projection_hash is stale", "source changed", "lease is stale",
-        "Canonical version conflict",
-    ))
+    from vector_lake.ingest_errors import failure_needs_redispatch
+
+    return failure_needs_redispatch(message)
 
 
 def run_model(packet: dict, model_cmd: str) -> tuple:
@@ -140,41 +143,58 @@ def run_model(packet: dict, model_cmd: str) -> tuple:
     deadline = float(packet.get("_host_deadline_monotonic", time.monotonic() + timeout))
     remaining = min(timeout, deadline - time.monotonic())
     if remaining <= 0:
-        return None, "model execution deadline exhausted"
+        return None, BackendFailure("model execution deadline exhausted", "timeout")
     env = dict(os.environ)
     env["VECTOR_LAKE_MODEL_DEADLINE_MONOTONIC"] = str(deadline)
     builtin = builtin_model_argv(model_cmd)
-    proc = run_contained(
-        builtin or model_cmd, shell=builtin is None, input=json.dumps(packet, ensure_ascii=False),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=remaining, env=env,
-    )
+    try:
+        proc = run_contained(
+            builtin or model_cmd, shell=builtin is None, input=json.dumps(packet, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=remaining, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, BackendFailure("model runner timed out; no source verdict accepted", "timeout")
+    except OSError as exc:
+        return None, BackendFailure(f"model runner launch failed: {type(exc).__name__}", "launch_error")
     if proc.returncode != 0:
-        return None, f"model runner exited {proc.returncode}: {proc.stderr.strip()[:300]}"
+        if builtin and "ValueError: source changed before model dispatch" in proc.stderr:
+            return None, BackendFailure("source changed before model dispatch", "source_changed")
+        # Keep authentication/source output out of status and persistent circuit state.
+        return None, BackendFailure(f"model runner exited {proc.returncode}; no source verdict accepted", "process_exit")
     try:
         result = json.loads(proc.stdout.strip())
     except json.JSONDecodeError as exc:
-        return None, f"model runner JSON invalid: {exc}"
+        return None, BackendFailure(f"model runner JSON invalid: {exc.msg}", "output_invalid")
     if not isinstance(result, dict) or set(result) != {"files_written", "integration"}:
-        return None, "model runner must return files_written and integration only"
+        return None, BackendFailure("model runner must return files_written and integration only", "output_invalid")
     files = result["files_written"]
     integration = result["integration"]
     if not isinstance(files, list) or not all(
         isinstance(item, dict) and isinstance(item.get("filename"), str)
         and isinstance(item.get("content"), str) for item in files
     ):
-        return None, "model runner files_written must contain filename/content objects"
+        return None, BackendFailure("model runner files_written must contain filename/content objects", "output_invalid")
     if not isinstance(integration, dict) or not str(integration.get("disposition") or "").strip():
-        return None, "model runner requires an explicit integration disposition"
+        return None, BackendFailure("model runner requires an explicit integration disposition", "output_invalid")
     if not files and str(integration["disposition"]).strip().lower() != "rejected":
-        return None, "model runner produced no files for a non-rejected disposition"
+        return None, BackendFailure("model runner produced no files for a non-rejected disposition", "output_invalid")
     return result, ""
 
 
-def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: dict) -> tuple[dict, str]:
+def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: dict,
+                  execution: BackendCircuit | None = None) -> tuple[dict, str]:
     """Process a single claimed ingest task in isolation (C7 error containment)."""
-    res = {"duplicate": 0, "missing-source": 0, "needs-model": 0, "finalized": 0, "errors": 0, "model-failed": 0}
+    res = dict.fromkeys(RESULT_COUNTERS, 0)
     last_err = ""
+    if execution and task.get("created_at"):
+        try:
+            created = datetime.fromisoformat(str(task["created_at"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            execution.observe("queue_wait", max(0.0, execution.clock() - created.timestamp()) * 1000)
+        except (TypeError, ValueError):
+            execution.observe("queue_wait", float("nan"))
     packet = dict(task.get("task_packet") or {})
     # One host deadline includes all repair rounds; retain a lease/finalization margin.
     budget = model_timeout_seconds()
@@ -196,36 +216,82 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
         res["errors"] += 1
         last_err = reason
         if job_id:
-            record_ingest_failure(job_id, f"unusable task packet: {reason}")
+            record_ingest_failure(job_id, f"unusable task packet: {reason}", claim=task)
         return res, last_err
+
+    def model_round(proposal):
+        if execution and not execution.ready():
+            return None, BackendFailure("backend paused; task retained", "paused")
+        started = time.perf_counter()
+        try:
+            answer, error = run_model(proposal, model_cmd)
+            if execution and not error:
+                execution.success()
+            return answer, error
+        finally:
+            if execution:
+                execution.observe("model", (time.perf_counter() - started) * 1000)
+
+    def submit(files, data):
+        started = time.perf_counter()
+        try:
+            return finalize_ingest(files, data)
+        finally:
+            if execution:
+                execution.observe("finalize", (time.perf_counter() - started) * 1000)
+
+    def backend_failed(error):
+        if getattr(error, "code", "") == "paused":
+            res["backend-held"] += 1
+            res["needs-model"] += 1
+            if job_id:
+                db_store.release_job_for_retry(job_id, "backend paused; task retained", claim=task,
+                                               delay_seconds=execution.delay(120) if execution else 5)
+            return
+        res["model-failed"] += 1
+        if getattr(error, "code", "") == "source_changed":
+            if job_id:
+                record_ingest_failure(job_id, f"model seam: {error}", claim=task)
+            return
+        res["backend-failed"] += 1
+        if execution:
+            execution.failure(getattr(error, "code", "delivery_error"))
+        if job_id:
+            db_store.release_job_for_retry(job_id, "backend delivery failure; source budget untouched", claim=task,
+                                           delay_seconds=execution.delay(120) if execution else 5)
 
     verdict = classify(processed, publication_index)
     try:
         if verdict in {"duplicate", "missing-source"}:
             reason = REJECT_DUPLICATE if verdict == "duplicate" else REJECT_MISSING_SOURCE
-            result = finalize_ingest([], {**processed, "integration": {"disposition": "rejected", "reason": reason}})
+            result = submit([], {**processed, "integration": {"disposition": "rejected", "reason": reason}})
             res[verdict] += 1
             if "Successfully finalized" in result:
                 res["finalized"] += 1
+                res[f"{verdict}-closed"] += 1
             else:
                 res["errors"] += 1
                 last_err = result
                 if job_id:
-                    record_ingest_failure(job_id, f"rejection could not be finalized: {result}")
+                    record_ingest_failure(job_id, f"rejection could not be finalized: {result}", claim=task)
         elif shadow or not model_cmd:
             res["needs-model"] += 1
             if job_id and os.environ.get("VECTOR_LAKE_RUNNER_HOLD_SHADOW_LEASE", "0") != "1":
                 from vector_lake.db_store import release_job_for_retry
-                release_job_for_retry(job_id, "shadow run: model call skipped")
+                release_job_for_retry(job_id, "shadow run: model call skipped", claim=task)
         else:
-            model_result, error = run_model(packet, model_cmd)
+            if execution and not execution.ready():
+                res["backend-held"] += 1
+                res["needs-model"] += 1
+                db_store.release_job_for_retry(job_id, "backend paused; task retained", claim=task,
+                                               delay_seconds=execution.delay(120))
+                return res, "backend paused; task retained"
+            model_result, error = model_round(packet)
             if error:
-                res["model-failed"] += 1
                 last_err = error
-                if job_id:
-                    record_ingest_failure(job_id, f"model seam: {error}")
+                backend_failed(error)
                 return res, last_err
-            result = finalize_ingest(
+            result = submit(
                 model_result["files_written"],
                 _merge_model_integration(processed, model_result["integration"]),
             )
@@ -236,17 +302,13 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
             rounds_used = 0
             while rejection and not _version_conflict(rejection) and rounds_used < REPAIR_ATTEMPTS:
                 rounds_used += 1
-                repaired, repair_error = run_model(
-                    _repair_packet(packet, previous_output, rejection), model_cmd
-                )
+                repaired, repair_error = model_round(_repair_packet(packet, previous_output, rejection))
                 if repair_error or not repaired:
-                    result = (
-                        f"{rejection} [repair round {rounds_used} could not produce an answer: "
-                        f"{repair_error or 'empty model output'}]"
-                    )
-                    break
+                    error = repair_error or BackendFailure("repair produced no model output", "output_invalid")
+                    backend_failed(error)
+                    return res, str(error)
                 previous_output = repaired
-                result = finalize_ingest(
+                result = submit(
                     repaired["files_written"],
                     _merge_model_integration(processed, repaired["integration"]),
                 )
@@ -255,56 +317,104 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
                 result = f"{result} [after {rounds_used} repair round(s)]"
             if "Successfully finalized" in result:
                 res["finalized"] += 1
+                disposition = str(previous_output["integration"]["disposition"]).strip().lower()
+                res["content-rejected" if disposition == "rejected" else "published"] += 1
             else:
                 res["errors"] += 1
                 last_err = result
                 if job_id:
-                    record_ingest_failure(job_id, f"finalize rejected: {result}")
+                    record_ingest_failure(job_id, f"finalize rejected: {result}", claim=task)
     except Exception as exc:
         res["errors"] += 1
-        last_err = f"{type(exc).__name__}: {exc}"
+        last_err = f"host runtime failure: {type(exc).__name__}; source budget untouched"
+        if execution:
+            execution.failure("host_runtime_error")
         if job_id:
-            record_ingest_failure(job_id, f"{type(exc).__name__}: {exc}")
+            db_store.release_job_for_retry(job_id, last_err, claim=task,
+                                           delay_seconds=execution.delay(120) if execution else 5)
     return res, last_err
 
 
-def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict, concurrency: int = 1) -> dict:
-    claimed = json.loads(claim_ingest_tasks(limit=limit))
-    batch = {"claimed": len(claimed), "duplicate": 0, "missing-source": 0,
-             "needs-model": 0, "finalized": 0, "errors": 0, "model-failed": 0}
-    if not claimed:
+def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict, concurrency: int = 1,
+                 execution: BackendCircuit | None = None, progress=None) -> dict:
+    batch = {"claimed": 0, **dict.fromkeys(RESULT_COUNTERS, 0)}
+    if execution and not execution.ready() and not shadow:
         return batch
-    publication_index = raw_publication_index()
+    limit = max(1, int(limit))
+    capacity = min(limit, max(1, int(concurrency)))
+    publication_index = None
 
-    if concurrency > 1 and len(claimed) > 1:
-        workers = min(concurrency, len(claimed))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(_process_task, task, shadow, model_cmd, publication_index)
-                for task in claimed
-            ]
-            for f in futures:
-                task_res, err = f.result()
-                for k, v in task_res.items():
-                    batch[k] += v
-                if err:
-                    stats["last_error"] = err
-    else:
-        for task in claimed:
-            task_res, err = _process_task(task, shadow, model_cmd, publication_index)
-            for k, v in task_res.items():
-                batch[k] += v
-            if err:
-                stats["last_error"] = err
+    def claim_slots(slots):
+        nonlocal publication_index
+        if execution and not execution.ready() and not shadow:
+            return []
+        started = time.perf_counter()
+        try:
+            tasks = json.loads(claim_ingest_tasks(limit=slots))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Ingest task claim response is invalid JSON") from exc
+        finally:
+            if execution:
+                execution.observe("claim", (time.perf_counter() - started) * 1000)
+        if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
+            raise ValueError("Ingest task claim response must be an array of task objects")
+        batch["claimed"] += len(tasks)
+        if tasks and publication_index is None:
+            publication_index = raw_publication_index()
+        return tasks
 
+    def collect(result):
+        task_res, error = result
+        for key, value in task_res.items():
+            batch[key] += value
+        if error:
+            stats["last_error"] = str(error)
+        if execution:
+            stats["backend"] = execution.snapshot()
+            stats["timings"] = execution.timings()
+        if progress:
+            progress(batch)
+
+    if capacity == 1:
+        for _ in range(limit):
+            tasks = claim_slots(1)
+            if not tasks:
+                break
+            collect(_process_task(tasks[0], shadow, model_cmd, publication_index, execution))
+        return batch
+
+    # A queued future must not consume its lease while every execution slot is busy.
+    with ThreadPoolExecutor(max_workers=capacity) as pool:
+        pending = set()
+        while True:
+            slots = min(capacity - len(pending), limit - batch["claimed"])
+            if slots:
+                for task in claim_slots(slots):
+                    pending.add(pool.submit(_process_task, task, shadow, model_cmd, publication_index, execution))
+            if not pending:
+                break
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                collect(future.result())
     return batch
+
+
+def next_cycle_delay(batch: dict, maximum: float, idle_cycles: int,
+                     execution: BackendCircuit, *, shadow: bool = False) -> float:
+    """Continue ready work after a yield; back off empty queues without hot polling."""
+    maximum = max(5.0, maximum)
+    if not shadow and not execution.ready():
+        return execution.delay(maximum)
+    if not shadow and batch["claimed"] and db_store.ingest_tasks_ready():
+        return 1.0
+    return min(maximum, 5.0 * (2 ** min(5, max(0, idle_cycles - 1))))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Vector Lake ingest runner (shadow first)")
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--once", action="store_true", help="run a single batch and exit")
-    parser.add_argument("--interval", type=int, default=60, help="seconds between batches in loop mode")
+    parser.add_argument("--interval", type=int, default=60, help="maximum idle wait; ready backlog continues after a bounded yield")
     parser.add_argument("--concurrency", "-c", type=int,
                         default=int(os.environ.get("VECTOR_LAKE_RUNNER_CONCURRENCY", "1")),
                         help="concurrent worker threads for model execution (default 1)")
@@ -314,7 +424,10 @@ def main() -> int:
     parser.add_argument("--model-cmd", default=None)
     parser.add_argument("--model-source", choices=SELECTION_SOURCES, help=argparse.SUPPRESS)
     parser.add_argument("--check", action="store_true", help="Check backend capabilities without claiming tasks.")
+    parser.add_argument("--reset-backend", action="store_true", help="Explicit owner reset of paused backend after repair; does not verify authentication.")
     args = parser.parse_args()
+    if args.check and args.reset_backend:
+        parser.error("--check cannot reset backend state")
     try:
         selection = resolve_ingest_backend(args.model_cmd)
         if args.check:
@@ -368,12 +481,17 @@ def main() -> int:
 def _run_consumer(args, selection, supervisor_pid) -> int:
     """Run only while main holds the root gate/consumer lock; never called by contenders."""
     pid_path = _runtime_dir() / "runner.pid"
+    execution = BackendCircuit(_runtime_dir() / "runner_backend_state.json", selection.backend,
+                               selection.model_command, reset=getattr(args, "reset_backend", False))
+    idle_cycles = 0
     stats = {"started_at": _utc_now(), "pid": os.getpid(), "shadow": args.shadow,
              "model_command": bool(args.model_cmd), "effective_backend": selection.backend,
              "selection_source": args.model_source or selection.source,
              "resolved_model_command": selection.model_command, "supervisor_pid": supervisor_pid,
              "interval": args.interval,
-             "last_error": "", "consecutive_failures": 0, "cycles": 0, "totals": {}}
+             "last_error": "", "consecutive_failures": 0, "cycles": 0,
+             "totals": {"claimed": 0, **dict.fromkeys(RESULT_COUNTERS, 0)},
+             "backend": execution.snapshot(), "timings": execution.timings()}
     try:
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(str(os.getpid()), encoding="utf-8")
@@ -396,9 +514,19 @@ def _run_consumer(args, selection, supervisor_pid) -> int:
                 pass
     write_status(status="running", **stats)
 
+    def progress(batch):
+        write_status(status="processing", last_batch=batch, **stats)
+
     while True:
+        batch = {"claimed": 0}
+        started = time.perf_counter()
         try:
-            batch = process_once(args.limit, args.shadow, args.model_cmd, stats, args.concurrency)
+            batch = process_once(args.limit, args.shadow, args.model_cmd, stats, args.concurrency,
+                                 execution=execution, progress=progress)
+            execution.observe("cycle", (time.perf_counter() - started) * 1000)
+            stats["backend"] = execution.snapshot()
+            stats["timings"] = execution.timings()
+            idle_cycles = idle_cycles + 1 if batch["claimed"] == 0 else 0
             totals = stats["totals"]
             for key, value in batch.items():
                 totals[key] = int(totals.get(key, 0)) + int(value)
@@ -407,7 +535,8 @@ def _run_consumer(args, selection, supervisor_pid) -> int:
             stats["cycles"] = int(stats.get("cycles", 0)) + 1
             progressed = (batch["finalized"] + batch["needs-model"]) > 0
             stats["consecutive_failures"] = 0 if progressed or batch["claimed"] == 0 else stats["consecutive_failures"] + 1
-            write_status(status="idle" if batch["claimed"] == 0 else "processing",
+            paused = not args.shadow and not execution.ready()
+            write_status(status="backend_paused" if paused else ("idle" if batch["claimed"] == 0 else "processing"),
                          last_batch=batch, last_batch_at=_utc_now(), **stats)
             if args.once:
                 write_status(status="stopped", reason="once", **stats)
@@ -428,11 +557,15 @@ def _run_consumer(args, selection, supervisor_pid) -> int:
                 return 0
         except Exception as exc:  # never die silently
             stats["consecutive_failures"] += 1
-            stats["last_error"] = f"{type(exc).__name__}: {exc}"
+            stats["last_error"] = f"host cycle failure: {type(exc).__name__}"
+            execution.failure("host_runtime_error")
+            execution.observe("cycle", (time.perf_counter() - started) * 1000)
+            stats["backend"] = execution.snapshot()
+            stats["timings"] = execution.timings()
             write_status(status="error", **stats)
             if args.once:
                 return 1
-        time.sleep(max(5, args.interval))
+        time.sleep(next_cycle_delay(batch, args.interval, idle_cycles, execution, shadow=args.shadow))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ from vector_lake.db_store import (
 )
 from vector_lake.native_llm import create_subagent_task
 from vector_lake.output_contract import build_output_contract
-from vector_lake.schema_validator import INGEST_INTEGRATION_PREDICATES, VALID_PREDICATES
+from vector_lake.runtime_contract import schema_snapshot
+from vector_lake.template_loader import render_template
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ingest-worker")
@@ -23,49 +24,13 @@ def _ingest_finalization_proven(filepath: str, file_hash: str) -> bool:
 
 
 def _subagent_ingest_prompt(instructions: str) -> str:
-    return (
-        instructions
-        + "\n\n[CURRENT-ENVIRONMENT SUBAGENT HANDOFF]\n"
-        + "You are the host environment subagent completing this Vector Lake ingest task.\n"
-        + "Do not use external model APIs from Vector Lake library code.\n"
-        + "Return ONLY one JSON object with exactly two keys:\n"
-        + "- files_written: array of filename/content objects (complete Markdown with YAML frontmatter)\n"
-        + "- integration: explicit disposition with auditable reason or validated relations\n"
-        + "Frontmatter rules the validator enforces (violating one refuses the whole ingest):\n"
-        + "- categories: a YAML list with EXACTLY one element, one of the SCHEMA_CATEGORIES domains"
-        + ' (e.g. categories: ["Healthcare_IT"]); never a bare string, never two elements\n'
-        + "- strategic_scope: exactly `core` or `edge`; aliases: a list; epistemic-status is one of"
-        + " sprouting/evergreen/seed; and id/title/type/domain/status/updated/sources present"
-        + " -- the field list the schema gate itself requires. `topic_cluster` is optional (the"
-        + " gate defaults it to `General`), and `ttl`, `memory_type` and `memory_key` are not"
-        + " fields the gate requires of a wiki page\n"
-        + "- tags: at most 3, and none may equal an existing node's `title` or any of its `aliases`"
-        + " (compared lowercased). The gate calls that `Tag Collision` and refuses the whole ingest,"
-        + " so do not tag a term that already has a page -- including under an alias rather than"
-        + " the page's own title: `电子病历评级` and `EMR评级` are both refused because"
-        + " `Policy_电子病历系统功能应用水平分级评价` declares them as aliases. Express the relation"
-        + " as a typed link instead, e.g. `[related_to:: [[Standard_电子病历评级]]]` in Section 1.\n"
-        + "- every typed link must be [predicate:: [[Target]]] with a predicate from this closed"
-        + f" vocabulary: {', '.join(sorted(VALID_PREDICATES))}\n"
-        + "- an integration relation's `predicate` is NOT drawn from that list: it binds a document"
-        + " to an existing page, so only this narrower set is accepted --"
-        + f" {', '.join(sorted(INGEST_INTEGRATION_PREDICATES))}. `has_part` and the other structural"
-        + " predicates are refused here\n"
-        + "- every relation `target` must be copied verbatim from the packet's integration_candidates"
-        + " manifest, `.md` suffix included; a rephrased or suffix-less name is refused\n"
-        + "- a bullet under `## 2. 证据时间线` must be `- [YYYY-MM-DD] [Event_Tag] <event>` with a tag"
-        + " from exactly: [Release], [Pivot], [Conflict], [Validation], [Observation], [Decision],"
-        + " [Execution], [Outcome]; an undated item (an open question, a 未决点) does not belong in"
-        + " that list at all, and no date may be invented to satisfy the shape\n"
-        + "Do not echo or alter processed_data; the host retains the task packet's lease and source_hash.\n"
-        + "Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
-        + "Each integrated relation is a complete checked record: target (verbatim from the manifest,\n"
-        + "`.md` included), target_hash + target_projection_hash (copied from that entry, not computed),\n"
-        + "predicate (from the narrower set above), evidence (>= 12 chars), confidence (a number in\n"
-        + "[0,1]), event_date (YYYY-MM-DD), event_tag (one bare tag, brackets omitted, from Release,\n"
-        + "Pivot, Conflict, Validation, Observation, Decision, Execution, Outcome). One bad field\n"
-        + "refuses the whole ingest.\n"
-        + "Do not call finalize_ingest: the host validates and submits the returned object.\n"
+    runtime = schema_snapshot()
+    return render_template(
+        "prompts/ingest/handoff.md", instructions=instructions, max_tags=runtime["max_tags"],
+        valid_predicates=", ".join(runtime["page_predicates"]),
+        integration_predicates=", ".join(runtime["integration_predicates"]),
+        timeline_tags=", ".join(f"[{tag}]" for tag in runtime["event_tags"]),
+        integration_tags=", ".join(runtime["event_tags"]),
     )
 
 

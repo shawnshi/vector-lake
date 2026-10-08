@@ -152,6 +152,7 @@ def assess_runtime_health(
                 max(0, int((datetime.now(timezone.utc) - runner_dt).total_seconds()))
                 if runner_dt is not None else None
             )
+            totals = runner.get("totals")
             detail["runner"] = {
                 "status": runner.get("status"),
                 "age_seconds": runner_age,
@@ -159,7 +160,19 @@ def assess_runtime_health(
                 "model_command": runner.get("model_command"),
                 "totals": runner.get("totals"),
                 "last_error": runner.get("last_error"),
+                "outcomes": {
+                    key: totals.get(key) if isinstance(totals, dict) else None
+                    for key in ("published", "content-rejected", "duplicate-closed", "missing-source-closed")
+                },
+                # Global outbox work, not a per-job receipt or proof that vectors are current.
+                "projection_outbox_pending": pending_backlog,
+                "projection_outbox_failed": outbox_counts.get("failed", 0),
+                "backend": runner.get("backend"),
+                "timings": runner.get("timings"),
             }
+            backend_state = runner.get("backend")
+            if isinstance(backend_state, dict) and backend_state.get("status") in {"open", "cooldown"}:
+                runner_advisories.append(f"runner_backend_paused:{backend_state['status']}")
             stale_after = max(60, int(os.environ.get("VECTOR_LAKE_RUNNER_STALE_SECONDS", "2400")))
             if runner_age is None or runner_age > stale_after:
                 runner_advisories.append(

@@ -284,6 +284,7 @@ def test_cli_failures_are_not_empty_or_strategic_rejections(backend, output, cod
                                                            isolated_memory, monkeypatch):
     capabilities = ingest_cli.CliCapabilities("fake", tuple(ingest_cli.CODEX_REQUIRED_FEATURES))
     monkeypatch.setattr(ingest_cli, "check_cli", lambda *a, **k: capabilities)
+    monkeypatch.setattr(ingest_cli, "find_cli_binary", lambda *_: capabilities.binary)
     monkeypatch.setattr(ingest_cli, "run_contained", lambda argv, **k: subprocess.CompletedProcess(argv, code, output, "secret-do-not-echo"))
     with pytest.raises((RuntimeError, ValueError), match=error) as caught:
         ingest_cli.invoke_cli(_packet(isolated_memory), backend)
@@ -293,6 +294,7 @@ def test_cli_failures_are_not_empty_or_strategic_rejections(backend, output, cod
 def test_cli_timeout_propagates_without_allocating_another_budget(isolated_memory, monkeypatch):
     capabilities = ingest_cli.CliCapabilities("fake", tuple(ingest_cli.CODEX_REQUIRED_FEATURES))
     monkeypatch.setattr(ingest_cli, "check_cli", lambda *a, **k: capabilities)
+    monkeypatch.setattr(ingest_cli, "find_cli_binary", lambda *_: capabilities.binary)
     calls = []
     def timeout(argv, **kwargs):
         calls.append(kwargs["timeout"])
@@ -412,7 +414,7 @@ def _owner_entries(tmp_path):
         "import json,os,sys,time\nfrom pathlib import Path\n"
         f"sys.path.insert(0,{str(REPO)!r})\nfrom scripts import ingest_runner as runner\n"
         "runner.check_ingest_backend=lambda selection:{}\n"
-        "def hold_model(limit,shadow,command,stats,concurrency):\n"
+        "def hold_model(limit,shadow,command,stats,concurrency,**kwargs):\n"
         f" Path({str(markers)!r},str(os.getpid())+'.json').write_text(json.dumps({{'pid':os.getpid(),'command':command}}),encoding='utf-8')\n"
         " deadline=time.monotonic()+20\n"
         f" while not Path({str(release)!r}).exists() and time.monotonic()<deadline: time.sleep(0.02)\n"

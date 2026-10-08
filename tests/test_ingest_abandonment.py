@@ -164,10 +164,10 @@ def test_both_prompts_state_the_rule_the_validator_enforces():
     """
     from vector_lake.ingest_worker import _subagent_ingest_prompt
 
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     handoff = _subagent_ingest_prompt("base")
 
-    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+    for text, label in ((template, "templates/prompts/ingest/main.md"), (handoff, "handoff prompt")):
         lowered = text.lower()
         assert "exactly one element" in lowered, label
         assert "list" in lowered, label
@@ -177,7 +177,7 @@ def test_both_prompts_state_the_rule_the_validator_enforces():
 
 def test_the_prompt_names_the_shapes_that_are_refused():
     """Spelling out the two wrong shapes is the part that was missing."""
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     assert "bare string" in template
     assert "multi-element list" in template
 
@@ -197,10 +197,10 @@ def test_both_prompts_state_the_tag_rules_the_validator_enforces():
     from vector_lake.ingest_worker import _subagent_ingest_prompt
     from vector_lake.schema_validator import MAX_TAGS
 
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     handoff = _subagent_ingest_prompt("base")
 
-    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+    for text, label in ((template, "templates/prompts/ingest/main.md"), (handoff, "handoff prompt")):
         lowered = text.lower()
         assert "tag collision" in lowered, label
         assert "alias" in lowered, label
@@ -230,7 +230,7 @@ def _make_dispatchable(conn, job_id: str) -> None:
 
 
 def _job_for(source_path: str, job_id: str = "job-1") -> str:
-    """A job for ``source_path`` carrying the hash the scan would compute.
+    """An unleased administrative budget fixture carrying the scan's content hash.
 
     The abandonment key is ``(filepath, calculate_hash(file))`` -- the same value
     ``prepare_ingest_batch`` puts in the payload -- so a fixture with an invented hash would
@@ -243,7 +243,7 @@ def _job_for(source_path: str, job_id: str = "job-1") -> str:
         conn.execute(
             "INSERT OR REPLACE INTO jobs (job_id, task_type, payload, status, retries, error_msg, created_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (job_id, "ingest", json.dumps(payload), "subagent_processing", 0, "",
+            (job_id, "ingest", json.dumps(payload), "queued", 0, "",
              "2026-09-19T00:00:00+00:00", "2026-09-19T00:00:00+00:00"),
         )
     return job_id
@@ -410,7 +410,7 @@ def test_the_predicate_vocabulary_has_one_owner_and_reaches_the_prompts():
     from vector_lake.ingest_worker import _subagent_ingest_prompt
     from vector_lake.schema_validator import VALID_PREDICATES
 
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     assert "{{valid_predicates}}" in template, "the template must not hardcode the vocabulary"
 
     rendered = tool_ingest._build_ingest_instructions(
@@ -441,7 +441,7 @@ def test_the_integration_predicate_set_is_narrower_and_reaches_both_prompts():
     assert "has_part" not in INGEST_INTEGRATION_PREDICATES
     assert tool_ingest.INTEGRATION_PREDICATES == INGEST_INTEGRATION_PREDICATES
 
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     assert "{{integration_predicates}}" in template, "the template must not hardcode the set"
 
     rendered = tool_ingest._build_ingest_instructions(
@@ -468,10 +468,12 @@ def test_both_prompts_state_the_timeline_rules_the_validator_enforces():
     from vector_lake import tool_ingest
     from vector_lake.ingest_worker import _subagent_ingest_prompt
 
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     handoff = _subagent_ingest_prompt("base")
 
-    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+    assert "{{timeline_tags}}" in template, "the validator owns event tags"
+    rendered = tool_ingest._build_ingest_instructions(str(REPO_ROOT / "README.md"), "hash", "Source_x.md")
+    for text, label in ((rendered, "rendered ingest prompt"), (handoff, "handoff prompt")):
         assert "[YYYY-MM-DD]" in text, label
         assert "证据时间线" in text, label
         for tag in ("[Release]", "[Pivot]", "[Conflict]", "[Validation]",
@@ -498,10 +500,12 @@ def test_both_prompts_state_the_integration_relation_record_the_validator_enforc
     from vector_lake import tool_ingest
     from vector_lake.ingest_worker import _subagent_ingest_prompt
 
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
     handoff = _subagent_ingest_prompt("base")
 
-    for text, label in ((template, "templates/ingest_prompt.md"), (handoff, "handoff prompt")):
+    assert "{{event_tags}}" in template, "the validator owns integration event tags"
+    rendered = tool_ingest._build_ingest_instructions(str(REPO_ROOT / "README.md"), "hash", "Source_x.md")
+    for text, label in ((rendered, "rendered ingest prompt"), (handoff, "handoff prompt")):
         assert "bare tag" in text, label
         for field in ("event_tag", "target_projection_hash", "confidence", "evidence"):
             assert field in text, (label, field)

@@ -10,6 +10,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
+from vector_lake.template_loader import render_template
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("compile_domain_overviews")
@@ -82,21 +83,14 @@ def compile_overviews():
         overview_filename = f"Concept_Overview_{domain}.md"
         overview_path = os.path.join(wiki_dir, overview_filename)
 
-        content = [
-            f"# Domain Overview: {domain}",
-            "",
-            "*[System Directive: This is an automatically compiled read model of the domain based on node_score (Centrality * Freshness). Do not manually edit this file.]*",
-        ]
-
-        # Inject Cross-Domain Gravity Anchors
+        related = ""
         if domain in cross_domain_counts and cross_domain_counts[domain]:
             top_related = sorted(cross_domain_counts[domain].items(), key=lambda x: x[1], reverse=True)[:3]
-            links_str = ", ".join([f"[[Concept_Overview_{rd[0]}]] ({rd[1]}次跨域握手)" for rd in top_related])
-            content.append(f"> 🔄 **强关联领域**: {links_str}")
-            content.append("")
-
-        content.append(f"**Total Nodes in Domain:** {len(domain_nodes)}")
-        content.append("")
+            links_str = ", ".join(
+                render_template("wiki/domain_overview/cross_link.md", domain=rd[0], count=rd[1])
+                for rd in top_related
+            )
+            related = render_template("wiki/domain_overview/cross.md", links=links_str)
         
         # Inject Rising Stars (updated within 7 days)
         recent_nodes = []
@@ -109,17 +103,14 @@ def compile_overviews():
             except ValueError:
                 pass
                 
+        rising = ""
         if recent_nodes:
             recent_nodes.sort(key=lambda x: x[0], reverse=True)
-            rising_stars = recent_nodes[:5]
-            content.append("## 🚀 异动榜 (Rising Stars)")
-            for score, key, node in rising_stars:
-                summary = node.get("summary", "")
-                content.append(f"- [[{key}]] (Score: {score:.2f}) - {summary}")
-            content.append("")
-
-        content.append("## 📌 核心实体排行 (Top Entities by Network Relevance)")
-        content.append("")
+            entries = "\n".join(
+                render_template("wiki/domain_overview/rising_entry.md", key=key, score=f"{score:.2f}", summary=node.get("summary", ""))
+                for score, key, node in recent_nodes[:5]
+            )
+            rising = render_template("wiki/domain_overview/rising.md", entries=entries)
 
         # Group by type for Top 50
         grouped_top = defaultdict(list)
@@ -130,28 +121,35 @@ def compile_overviews():
             node_type = node_type.strip().capitalize()
             grouped_top[node_type].append((score, key, node))
             
-        # Render top 50
+        groups = []
         for node_type, nodes_in_type in grouped_top.items():
-            content.append(f"### 🧩 类别: {node_type}")
+            entries = []
             for score, key, node in nodes_in_type:
                 summary = node.get("summary", "")
-                content.append(f"#### [[{key}]]")
-                content.append(f"- **Score**: {score:.2f}")
-                if summary:
-                    content.append(f"- **Summary**: {summary}")
-                content.append("")
+                entries.append(render_template(
+                    "wiki/domain_overview/entry.md", key=key, score=f"{score:.2f}",
+                    summary=render_template("wiki/domain_overview/summary.md", summary=summary) if summary else "",
+                ))
+            groups.append(render_template("wiki/domain_overview/group.md", type=node_type, entries="".join(entries)))
 
-        # Render tail nodes in a collapsible block to prevent orphan islands
+        archive = ""
         if tail_nodes:
-            content.append(f"## 📦 领域归档字典 ({len(tail_nodes)} Nodes)")
-            content.append("<details><summary>点击展开查看长尾归档实体</summary>\n")
-            for score, key, node in tail_nodes:
-                content.append(f"- [[{key}]] (Score: {score:.2f})")
-            content.append("\n</details>")
+            entries = "\n".join(
+                render_template("wiki/domain_overview/archive_entry.md", key=key, score=f"{score:.2f}")
+                for score, key, node in tail_nodes
+            )
+            archive = render_template("wiki/domain_overview/archive.md", count=len(tail_nodes), entries=entries)
+
+        content = render_template(
+            "wiki/domain_overview.md", domain=domain, related=related, total=len(domain_nodes),
+            rising=rising, groups="".join(groups), archive=archive,
+        )
+        if not tail_nodes:
+            content = content.rstrip("\n") + "\n"
 
         try:
             from vector_lake.wiki_utils import safe_write_markdown
-            safe_write_markdown(overview_path, "\n".join(content))
+            safe_write_markdown(overview_path, content)
             log.info(f"Compiled {overview_filename} with {len(top_nodes)} top nodes and {len(tail_nodes)} tail nodes.")
         except Exception as e:
             log.error(f"Failed to write {overview_filename}: {e}")

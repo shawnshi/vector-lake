@@ -76,9 +76,10 @@ def test_ppr_index_is_dropped_when_the_graph_generation_changes(monkeypatch):
     monkeypatch.setattr(tool_search.vector_lake_core, "PprIndex", FakeIndex)
     monkeypatch.setattr(tool_search, "_PPR_INDEX", {"generation": None, "index": None})
 
-    first = tool_search._ppr_index({"a": [("b", 1.0)]}, 1)
-    again = tool_search._ppr_index({"a": [("b", 1.0)]}, 1)
+    adj = {"a": [("b", 1.0)]}
+    first = tool_search._ppr_index(adj, 1)
+    again = tool_search._ppr_index(adj, 1)
     assert first is again and len(calls) == 1
 
-    tool_search._ppr_index({"a": [("b", 1.0)], "b": []}, 2)
+    tool_search._ppr_index(adj, 2)
     assert len(calls) == 2, "a new graph generation must rebuild the index"

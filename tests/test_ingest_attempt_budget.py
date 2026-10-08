@@ -58,9 +58,10 @@ def test_the_attempt_budget_is_consumed_and_then_the_job_is_terminal(isolated_me
 
     # Still inside the budget: the dispatcher may hand it out again.
     _make_dispatchable(conn, job_id)
-    assert [job["job_id"] for job in db_store.claim_pending_jobs(limit=5)] == [job_id]
+    dispatch = db_store.claim_pending_jobs(limit=5)
+    assert [job["job_id"] for job in dispatch] == [job_id]
 
-    tool_ingest.record_ingest_failure(job_id, "finalize rejected: strict naming")
+    tool_ingest.record_ingest_failure(job_id, "finalize rejected: strict naming", claim=dispatch[0])
     final = tool_ingest.record_ingest_failure(job_id, "finalize rejected: strict naming")
     assert "budget spent" in final
     assert conn.execute("SELECT retries FROM jobs WHERE job_id = ?", (job_id,)).fetchone()[0] == db_store.MAX_INGEST_ATTEMPTS
@@ -101,16 +102,16 @@ def test_the_cap_has_one_owner():
     "branch_reason",
     ["unusable task packet", "rejection could not be finalized", "model seam", "finalize rejected"],
 )
-def test_every_runner_failure_branch_consumes_the_budget(branch_reason):
-    """Each branch that reports an error must also record the failure against the job."""
+def test_content_failure_branches_have_bounded_budget_recorders(branch_reason):
+    """Content/packet failures spend source budget; backend/host faults must not."""
     from pathlib import Path
 
     source = (Path(__file__).resolve().parents[1] / "scripts" / "ingest_runner.py").read_text(
         encoding="utf-8"
     )
     assert f'f"{branch_reason}' in source, branch_reason
-    # Four named branches plus the per-task exception guard.
-    assert source.count("record_ingest_failure(") == 5
+    # Packet, source drift and two finalizer rejection branches, not runtime faults.
+    assert source.count("record_ingest_failure(") == 4
 
 
 def test_a_transient_failure_does_not_spend_the_attempt_budget(isolated_memory):

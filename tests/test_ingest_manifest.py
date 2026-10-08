@@ -609,7 +609,7 @@ def test_default_runner_integrates_a_source_through_real_finalizer(isolated_memo
 
 def test_the_prompt_states_the_manifest_rule_the_finalizer_enforces():
     """The rule the refusals above implement has to be legible to the model, too."""
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
 
     assert "integration_candidates" in template
     assert "empty manifest permits none" in template
@@ -620,7 +620,7 @@ def test_the_prompt_states_the_manifest_rule_the_finalizer_enforces():
 
 def test_the_prompt_does_not_promise_a_finalizer_that_never_reads_the_source():
     """It re-reads the claimed source to verify ``source_projection_hash``; saying otherwise is false."""
-    template = (REPO_ROOT / "templates" / "ingest_prompt.md").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "templates" / "prompts" / "ingest" / "main.md").read_text(encoding="utf-8")
 
     assert "Never return or ask the finalizer to read a `filepath`" not in template
     assert "verify `source_projection_hash`" in template

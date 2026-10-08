@@ -59,7 +59,8 @@ def _bound_in_scope(node) -> set[str]:
 
 
 def _module_names(tree) -> set[str]:
-    names = set(dir(builtins))
+    # TARGETS are file-backed modules; Python's loader provides __file__ without an assignment.
+    names = set(dir(builtins)) | {"__file__"}
     for child in ast.walk(tree):
         if isinstance(child, ast.Import):
             for alias in child.names:
@@ -237,6 +238,22 @@ def worker():
 """
     problems = free_names(broken)
     assert problems and sorted(problems[0][2]) == ["sync_pages_to_canonical", "transaction"]
+
+
+def test_checker_accepts_loader_provided_file_global():
+    source = '''
+def module_directory():
+    return __file__
+'''
+    assert free_names(source) == []
+
+
+def test_checker_still_rejects_unbound_name_beside_file_global():
+    source = '''
+def module_directory():
+    return resolve_missing(__file__)
+'''
+    assert free_names(source) == [("module_directory", 2, ["resolve_missing"])]
 
 
 def test_checker_accepts_nested_closure_capture():

@@ -4,6 +4,7 @@ import logging
 from filelock import FileLock
 
 from vector_lake import governance_store
+from vector_lake.template_loader import render_template
 from vector_lake.wiki_utils import get_index_path
 from vector_lake.purpose_contract import PurposeContractError, render_strategy_directive
 
@@ -54,29 +55,12 @@ def research_vector_lake(dry_run: bool = False):
 
     purpose_context = ""
     try:
-        purpose_context = "\nStrategic purpose contract:\n" + render_strategy_directive()
+        purpose_context = render_template("prompts/research_purpose.md", purpose=render_strategy_directive())
     except PurposeContractError as exc:
         return f"Strategic purpose contract is invalid: {exc}"
 
     if dry_run:
-        directive = f"""[DRY RUN]: The following research topics were identified:
-{purpose_context}
-{queries_str}
-
-No autonomous search will be triggered.
-"""
+        directive = render_template("prompts/research_preview.md", purpose_context=purpose_context, queries=queries_str)
     else:
-        directive = f"""[SYSTEM DIRECTIVE]: Autonomous Deep Research Triggered.
-Agent: You must now execute the following steps to heal the knowledge graph:
-{purpose_context}
-
-1. Evaluate the following research topics, contradictions, and knowledge gaps:
-{queries_str}
-
-2. Use your web search tools (e.g., `google_web_search`, `search_web`, or academic skills) to investigate these topics.
-3. Fetch the most authoritative sources (avoid SEO spam).
-4. Use `write_file` to save the distilled clean Markdown content to new files in `MEMORY/raw/research/`. Use descriptive filenames like `MEMORY/raw/research/research_gap_xxx.md`.
-5. Do NOT just answer the question in the console. You MUST write the files so the lake can sync them.
-6. Once the files are written, run `python cli.py sync` to ingest the new knowledge and close the graph gaps.
-"""
+        directive = render_template("prompts/research.md", purpose_context=purpose_context, queries=queries_str)
     return directive

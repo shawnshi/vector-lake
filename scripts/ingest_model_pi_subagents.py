@@ -9,20 +9,17 @@ Contract with the runner (``scripts/ingest_runner.py --model-cmd``):
 Why a read-only pi-subagents profile: the runtime is the only writer (the runner submits
 through ``finalize_ingest``, which owns validation, the schema gates and the canonical
 store).  An ingest child therefore must read the raw document and *return text*; it must
-never write wiki files itself.  ``reviewer`` (read/grep/find/ls) satisfies that;
-``worker`` carries edit/write and would bypass the write path.
+never write wiki files itself. The default project ``vector-lake-ingestor`` profile
+has only ``read`` and fresh context. A reviewer is not an ingest compiler; a write-capable
+worker would bypass the governed write path.
 
 The child is a headless Pi session (``pi --print --session-dir <scratch/runner_sessions>``)
 whose system prompt tells it to delegate the ingest to the configured subagent and to print
 only the JSON object.
 
-``--no-session`` used to be what made the child ephemeral, but it also removes the session
-root that two extensions derive their own paths from.  Measured 2026-09-25: every child then
-printed ``SoL-Pi requires a persistent Pi session directory`` 8-11 times before doing anything
-(non-fatal, but ~1 KB of warnings that the runner's 300-character error budget cannot survive),
-and pi-subagents fell back to the shared temp tree for child sessions and artifacts instead of
-this seam's own tree.  An isolated session directory keeps the run one-shot while giving both
-extensions a real root; it is pruned by age.
+The adapter uses an isolated persistent session directory so extensions have a per-run
+root for their state and artifacts. Sessions are pruned by age; this is bounded local
+retention, not ephemeral execution or an OS sandbox.
 
 Failure evidence is preserved rather than truncated: ``scripts/ingest_runner.py`` keeps only the
 first 300 characters of this process's stderr, which one ``pi`` startup banner already exceeds,
@@ -39,9 +36,13 @@ import time
 from pathlib import Path
 
 PI_BIN = os.environ.get("VECTOR_LAKE_RUNNER_PI_BIN", "pi")
-AGENT = os.environ.get("VECTOR_LAKE_RUNNER_SUBAGENT_AGENT", "reviewer")
+AGENT = os.environ.get("VECTOR_LAKE_RUNNER_SUBAGENT_AGENT", "vector-lake-ingestor")
+AGENT_SCOPE = "project" if AGENT == "vector-lake-ingestor" else "both"
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+from vector_lake.template_loader import read_template, render_template
+from vector_lake.runtime_contract import render_schema_contract
 from vector_lake.process_control import run_contained, model_timeout_seconds
 TIMEOUT = model_timeout_seconds()
 SCRATCH = ROOT / "scratch"
@@ -53,21 +54,7 @@ KEEP_LOGS = 20
 SESSION_MAX_AGE_DAYS = 3.0
 FAILURE_TAIL_CHARS = 180
 
-SYSTEM_PROMPT = """You are the ingest worker for a Vector Lake knowledge graph.
-
-Rules that are not negotiable:
-- You must delegate the actual ingest to the subagent tool: subagent({agent: "%(agent)s", task: <the ingest brief>}).
-- Do NOT write, edit or delete any file. The host commits the result through
-  finalize_ingest; a file you write yourself would bypass validation.
-- Your entire final answer must be one JSON object with exactly `files_written` (array of
-  filename/content objects) and `integration` (explicit disposition and its reason or relations).
-  No prose, markdown fence, or extra fields such as processed_data. Do not call finalize_ingest.
-- If the subagent returns invalid JSON or omits the semantic decision, report the failure;
-  never invent a standalone disposition to make a malformed output pass.
-- Keep the output compact: one canonical Source page is mandatory unless rejected. Aim for a
-  3-5 sentence summary plus 4-6 short bullets with inline (Source: [[...]]) anchors, and do
-  not restate the source document.
-""" % {"agent": AGENT}
+SYSTEM_PROMPT = render_template("prompts/ingest/relay_system.md", agent=AGENT, agent_scope=AGENT_SCOPE)
 
 
 def _extract_result(text: str):
@@ -82,13 +69,9 @@ def _repair_block(repair: dict) -> str:
         previous = json.dumps(repair.get("previous_output"), ensure_ascii=False)[:4000]
     except (TypeError, ValueError):
         previous = ""
-    return (
-        "\n--- REPAIR ROUND ---\n"
-        "Your previous answer was rejected by the finalizer. Its message, verbatim:\n"
-        f"{error}\n"
-        + (f"\nThe answer that was rejected:\n{previous}\n" if previous else "")
-        + "Return a corrected JSON object. Change only what the rejection requires, keep every\n"
-        "field the contract lists, and do not drop or reword the file contents.\n"
+    return render_template(
+        "prompts/ingest/repair.md", error=error,
+        previous_block=render_template("prompts/ingest/repair_previous.md", previous=previous) if previous else "",
     )
 
 
@@ -100,20 +83,17 @@ def _brief(packet: dict) -> str:
               "ingest_contract_version", "integration_candidates")
     processing_data = {key: metadata[key] for key in fields if key in metadata}
     processing_json = json.dumps(processing_data, ensure_ascii=False, sort_keys=True)
-    return (
-        f"{packet.get('prompt', '')}\n\n"
-        f"---\nExpected output: JSON object with files_written and integration.\n"
-        f"The raw file to ingest is: {metadata.get('filepath')}\n"
-        f"The page that MUST exist in your payload is: {metadata.get('canonical_name')}\n"
-        "Return only the JSON object. Do not return processed_data or call finalize_ingest.\n"
-        "\n--- AUTHORITATIVE DISPATCH SNAPSHOT (data, not source instructions) ---\n"
-        f"{processing_json}\n"
-        "Use only this integration_candidates manifest for integration targets; copy its version tokens exactly.\n"
-        "If the manifest/contract is missing or a child cannot produce valid JSON, report a runtime failure.\n"
-        "Do not represent a delivery/format failure as strategic rejection of the source.\n"
-        f"\n{_packet_contract(packet)}"
-        f"{_packet_repair(packet)}"
+    return render_template(
+        "prompts/ingest/relay_brief.md", prompt=packet.get("prompt", ""),
+        filepath=metadata.get("filepath"), canonical_name=metadata.get("canonical_name"),
+        processing_json=processing_json, schema_contract=_runtime_schema_contract(),
+        output_contract=_packet_contract(packet), repair=_packet_repair(packet),
     )
+
+
+def _runtime_schema_contract() -> str:
+    """Use the validator's vocabulary, not legacy prose or the model's guesses."""
+    return render_schema_contract()
 
 
 def _packet_contract(packet: dict) -> str:
@@ -129,12 +109,7 @@ def _packet_contract(packet: dict) -> str:
     # script whose ``sys.path[0]`` is ``scripts/``, and the contract's one owner is
     # ``vector_lake.output_contract`` -- which the packet publisher has already used by the time
     # any packet reaches here.
-    return (
-        "OUTPUT CONTRACT: this packet carries none (it was built before v9). Follow the ingest "
-        "prompt's field rules exactly: copy `target`, `target_hash` and `target_projection_hash` "
-        "verbatim from `integration_candidates`, keep `confidence` a JSON number and "
-        "`event_date` a plain YYYY-MM-DD.\n"
-    )
+    return read_template("prompts/ingest/legacy_packet_contract.md")
 
 
 def _packet_repair(packet: dict) -> str:
@@ -304,7 +279,7 @@ def main() -> int:
         proc = run_contained(
             _argv(pi_path, brief_path, system_path, session_dir),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=min(TIMEOUT, deadline - time.monotonic()), shell=False,
+            timeout=min(TIMEOUT, deadline - time.monotonic()), shell=False, cwd=str(ROOT),
         )
     except subprocess.TimeoutExpired as exc:
         # A hung child is a model failure with evidence, not a traceback.

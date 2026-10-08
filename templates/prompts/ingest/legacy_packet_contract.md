@@ -1,0 +1,1 @@
+OUTPUT CONTRACT: this packet carries none (it was built before v9). Follow the ingest prompt's field rules exactly: copy `target`, `target_hash` and `target_projection_hash` verbatim from `integration_candidates`, keep `confidence` a JSON number and `event_date` a plain YYYY-MM-DD.

@@ -1,0 +1,1 @@
+- [[{{key}}]] (Score: {{score}}) - {{summary}}

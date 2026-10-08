@@ -67,6 +67,7 @@ from vector_lake.node_vocabulary import (
     type_for_node_id,
 )
 from vector_lake.schema_validator import VALID_H3_SLOTS
+from vector_lake.template_loader import render_template
 from vector_lake.wiki_utils import entity_identity_key, read_markdown_file, write_markdown_file
 
 log = logging.getLogger("vector-lake-stub-creator")
@@ -232,15 +233,7 @@ def stub_body(page_stem: str, node_type: str, today: str) -> str:
     core = strip_prefix(page_stem)
     slots = VALID_H3_SLOTS.get(node_type) or [_FALLBACK_SLOT]
     return (
-        f"\n# {core}\n\n"
-        "## 1. 编译事实 (Compiled Truth - READ MODEL)\n"
-        "*[System Directive: This section represents the LATEST consensus.]*\n\n"
-        f"Auto-generated stub for {core}. (Last Reshaped: {today})\n\n"
-        f"{slots[0]}\n- [[{page_stem}]] Auto-generated stub.\n\n"
-        "---\n\n"
-        "## 2. 证据时间线\n"
-        "*[System Directive: This is the immutable event ledger.]*\n\n"
-        f"- [{today}] [Observation] Created stub.\n"
+        render_template("wiki/stub.md", core=core, today=today, slot=slots[0], page_stem=page_stem)
     )
 
 

@@ -59,6 +59,7 @@ def _run(seam, monkeypatch, result=None, raises=None, packet=None):
 
     def fake_run(argv, **kwargs):
         fake_run.argv = argv
+        fake_run.kwargs = kwargs
         if raises is not None:
             raise raises
         return result
@@ -330,14 +331,17 @@ def test_runner_fails_closed_on_missing_or_malformed_decision(monkeypatch, outpu
                         subprocess.CompletedProcess(["model"], 0, output, ""))
     monkeypatch.setattr(runner, "classify", lambda *_: "needs-model")
     failures = []
-    monkeypatch.setattr(runner, "record_ingest_failure", lambda job, reason: failures.append((job, reason)))
+    monkeypatch.setattr(runner, "record_ingest_failure", lambda job, reason, **kwargs: failures.append((job, reason)))
+    releases = []
+    monkeypatch.setattr(runner.db_store, "release_job_for_retry", lambda job, reason, **kwargs: releases.append((job, reason)))
     monkeypatch.setattr(runner, "finalize_ingest", lambda *_: pytest.fail("failed output reached finalizer"))
     task = {"job_id": "synthetic", "task_packet": {"metadata": {"processed_data": {"job_id": "synthetic"}}}}
 
     stats, error = runner._process_task(task, False, "fake-model", {})
 
-    assert error and stats["model-failed"] == 1
-    assert failures[0][0] == "synthetic"
+    assert error and stats["model-failed"] == stats["backend-failed"] == 1
+    assert not failures, "delivery failure is not evidence that the source is bad"
+    assert releases[0][0] == "synthetic"
 
 
 def test_parse_failure_keeps_both_streams(seam, monkeypatch, capsys):
@@ -390,3 +394,55 @@ def test_prune_keeps_newest_logs_and_only_aged_sessions(seam):
         assert (seam.SCRATCH / f"runner_model-20260925-000021-1-{stream}.log").exists()
     assert fresh.exists()
     assert not aged.exists(), "an old session must not accumulate forever"
+
+
+def test_default_ingestor_is_project_scoped_and_not_a_reviewer(monkeypatch):
+    monkeypatch.delenv("VECTOR_LAKE_RUNNER_SUBAGENT_AGENT", raising=False)
+    module = _load_seam()
+    assert module.AGENT == "vector-lake-ingestor"
+    assert module.AGENT_SCOPE == "project"
+    assert 'agentScope: "project"' in module.SYSTEM_PROMPT
+    assert 'context: "fresh"' in module.SYSTEM_PROMPT
+    assert "outputSchema: false" in module.SYSTEM_PROMPT
+    assert "Do not substitute" in module.SYSTEM_PROMPT
+
+
+def test_explicit_agent_override_keeps_user_and_project_discovery(monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_RUNNER_SUBAGENT_AGENT", "custom-ingestor")
+    module = _load_seam()
+    assert module.AGENT == "custom-ingestor"
+    assert module.AGENT_SCOPE == "both"
+
+
+def test_pi_starts_in_repository_for_project_agent_discovery(seam, monkeypatch):
+    answer = {"files_written": [], "integration": {"disposition": "rejected", "reason": "Synthetic source is outside scope"}}
+    run = _run(seam, monkeypatch, result=subprocess.CompletedProcess(["pi"], 0, json.dumps(answer), ""))
+    assert seam.main() == 0
+    assert run.kwargs["cwd"] == str(REPO)
+
+
+def test_project_ingestor_profile_has_only_read_and_no_ambient_context():
+    import yaml
+    profile = REPO / ".pi" / "agents" / "vector-lake-ingestor.md"
+    parts = profile.read_text(encoding="utf-8").split("---", 2)
+    metadata = yaml.safe_load(parts[1])
+    assert metadata["tools"] == "read"
+    assert metadata["defaultContext"] == "fresh"
+    assert metadata["acceptanceRole"] == "read-only"
+    assert metadata["extensions"] == ""
+    assert all(metadata[key] is False for key in ["inheritProjectContext", "inheritGlobalContext", "inheritSkills"])
+    assert not metadata.get("outputSchema")
+    assert "not a reviewer" in parts[2]
+    assert "never write it yourself" in parts[2]
+
+
+def test_schema_contract_tracks_runtime_required_fields_and_vocabularies():
+    from vector_lake import schema_validator as schema
+    text = _load_seam()._runtime_schema_contract()
+    values = json.loads(text.splitlines()[1])
+    assert values["required_frontmatter"] == list(schema.REQUIRED_FIELDS)
+    assert set(values["categories"]) == schema.VALID_CATEGORIES
+    assert set(values["domain"]) == schema.VALID_DOMAINS | schema.DOMAIN_VERTICALS
+    assert set(values["status"]) == schema.VALID_STATUS
+    assert set(values["epistemic-status"]) == schema.VALID_EPISTEMIC_STATUS
+    assert "categories (plural)" in text

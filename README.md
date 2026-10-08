@@ -68,6 +68,49 @@ graph TD
 
 核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是 Agent 运行层**；投影可重建，而唯一的写入顺序是「canonical 事务 → outbox → 投影」。
 
+### 摄取中继的执行、恢复与完成边界
+
+图中的箭头不是一次同步调用。`sync` 写入 SQLite `jobs`，Worker 持有 120 秒派发租约，生成任务包并转入 `awaiting_subagent`；Runner 再持有默认 3600 秒模型租约。`awaiting_subagent` 是共享队列状态，Gemini/Codex 使用它也不代表实际创建了子代理。`sync` 返回入队成功不等于编译完成；常驻 Runner 会继续消费，因此也不能把入队当作无后续写入的预览。
+
+Runner 只在执行槽位空闲时认领任务：串行逐项认领，并发最多认领空闲槽位数。`--limit` 是本轮最多处理的任务数，不再提前占用整个批次的租约。默认单任务模型预算 900 秒（配置上限 3300 秒），初始执行和修复共享 deadline，且为租约结束前保留 120 秒余量。Windows Job Object / POSIX 进程组负责拥有的子进程生命周期，不等于文件或网络隔离。
+
+模型返回的 `files_written` 是文件名和内容组成的草案，不是已经落盘的文件。宿主保留来源、候选清单和租约字段；`finalize_ingest` 校验版本、权限范围、页面契约后才提交。失败与租约释放同样需要当前 claim：旧 token/generation、过期租约或终态作业均不得回写。内部失败记录/释放调用传入 `claim=claimed_task`；未提供 claim 的旧式管理调用仅可处理未认领的 `queued` / 预算内 `failed`，不能推断当前所有者的令牌。
+
+修复和重试共用 `ingest_errors` 分类：候选 canonical/投影版本过期不让模型修补旧令牌，重新派发且不消耗来源失败预算；缺字段、命名或 Schema 错误允许有界修复。默认每个作业 3 次失败预算，每次最多 1 次初始执行加 2 轮修复，即确定性校验持续失败时最多 9 次适配器调用。版本冲突不消耗预算，此数不是所有故障的全局调用上限，也不是 Pi 父会话和子代理的底层模型请求数。
+
+Runner 状态中的 `finalized` 保留为成功关闭作业总数；另有 `published`、`content-rejected`、`duplicate-closed`、`missing-source-closed` 四项互斥结果。`duplicate` / `missing-source` 旧字段仍是检测次数，不保证关闭成功；执行失败看 `errors` 与 `model-failed`。这些都是当前 Runner 进程的计数，不是数据库历史总量。Health 的 `runner.outcomes` 对旧快照缺失字段返回 `null`，不把未知补成零。`projection_outbox_pending` / `projection_outbox_failed` 单独展示全库 outbox 工作，不是某个作业的投影完成回执；outbox 清空也不证明向量全部更新。
+
+### 模型后端的权限与留存边界
+
+统一的是任务 JSON 和 `finalize_ingest` 提交协议，不是执行权限或模型服务。三个内置后端均没有默认失败切换；切换已运行的后端需要先停止/排空原消费者，修改配置不证明运行态已经切换。
+
+|后端|执行与来源输入|工具及文件边界|本地适配器留存|
+|-|-|-|-|
+|Pi|无界面父 Pi 会话要求委派给项目 `vector-lake-ingestor`；子代理读取明确指定的原始来源|默认摄取子代理仅有 `read`，fresh context，不继承全局/项目上下文；父会话仍使用宿主 Pi 策略，适配器未给整个执行链增加 OS 沙箱。显式 agent override 需单独核验，不能套用默认子代理保证|会话保存在 `scratch/runner_sessions`（不可写时使用临时目录）；失败时保存完整 stdout/stderr。按年龄/数量清理不是立即删除，也不是凭证脱敏|
+|Gemini|宿主读取来源、核对内容指纹，将正文及授权候选送入 stdin|请求 deny-all 工具策略，禁用 MCP、扩展、hooks 和项目上下文；适配器未增加 OS 沙箱|适配器临时文件自动清理，不主动保存模型输出；CLI 自身与提供方留存另行遵循其策略|
+|Codex|同上|请求禁用工具/功能、MCP、插件和项目文档；CLI 使用 `read-only` sandbox 与 `--ephemeral`|结果 Schema/最后消息临时文件自动清理；提供方留存不由适配器控制|
+|自定义 `--model-cmd`|宿主通过 shell 执行，并检查返回 JSON|命令本身的权限、工具、额外写入与联网没有被内置适配器验证；仅适用于明确受信的宿主命令|由自定义命令决定|
+
+`--check` 不认领任务、不验证认证，也不发送真实模型请求。输出的 `capability_scope` 区分 Pi 的可执行文件解析、Gemini 的 headless 参数检查、Codex 的参数/功能门检查和自定义命令的未检查状态；`execution_boundary` / `local_retention` 描述静态边界，`boundary_verified=false` 表示不能将这些描述或 help 探针当作运行态安全验收。`authentication_verified=false` 不代表认证失败，而是本次没有验证。
+
+本地 CLI 不等于本地推理：正文和候选上下文仍可能发送到宿主 CLI 配置的模型提供方。CLI/提供方留存、日志外发和来源传输需要遵守数据授权；Pi 完整失败日志可能含来源内容或其他敏感信息，不可直接作为可公开分享的诊断包。后端边界核验不通过时应停止，不得通过换 CLI 绕过认证、生命周期或授权限制。
+
+### 后端暂停、续批、耗时与探针缓存
+
+`claim_ingest_tasks` 返回每一个实际认领的作业；不可读/损坏的包以错误任务返回，不在认领时预先扣失败预算。缺失任务包路径仍返回 `null`，保持原数组协议；Runner 消费错误任务时才按当前租约记录一次失败。因此坏任务不会隐藏健康任务，也不会让本轮实际认领数超过 `--limit`。
+
+来源/页面校验失败仍使用原有来源预算。模型进程退出、超时、无效交付 JSON 和宿主运行故障则保留来源预算，通过带围栏的释放等待重试；它们不是内容拒绝。Runner 将后端状态写入 `.meta/runtime/runner_backend_state.json`：前两次连续执行故障分别退避 5、10 秒，第三次进入 `open`，不再认领或发起新模型调用，重启也不自动清零。已经运行的并发调用可以结束，迟到成功不能自动解除 `open`。在途请求可能多于三次，三次是暂停触发阈值，不是并发时的总请求数上限。
+
+状态损坏/不可读时停止启动，不伪造健康。修复后可由所有者显式使用 Runner 的 `--reset-backend` 清除暂停；此操作必须取得同一根的消费者锁，不能与 `--check` 合用，不验证认证，也不能重置已有来源失败次数。该标志随后会按正常 Runner 模式执行工作，故实际运行/服务重启须另有授权；本次代码修改不会自动激活生产服务或清除其状态。Health 单独报告 `runner_backend_paused`，默认告警/strict 降级规则保持不变。
+
+`--interval` 现在是最大空闲等待：有可执行积压时让步 1 秒后续批；空队列按 5、10、20、40、80 秒退避到配置上限（至少 5 秒）。仅探测 `awaiting_subagent` 或租约已过期的模型任务，不跳过派发/重试的 `available_at`，不将仍有有效租约的任务视为积压。长期空闲后新任务仍可能等待一次最大空闲间隔；这里未引入跨进程事件推送。每个任务完成时由主线程刷新状态，避免长批次直到结束才更新进度。
+
+`runner.timings` 分别记录 `queue_wait`、`claim`、`model`、`finalize`、`cycle` 的毫秒耗时；每阶段只保留最近 128 个样本，并展示累计计数、窗口样本数及窗口 p50/p95。未知或非法样本不补零。`model` 包含适配器/CLI 启动、能力探针和本轮模型执行，不是提供方纯推理时间；一次修复单独计为一次模型阶段。数据不含来源正文、凭据、命令内容或文件路径，不能把各阶段 p95 相加当作端到端 p95。
+
+Gemini/Codex 实际执行可复用安全能力探针；显式 `--check` 仍做完整新探针。缓存每根每后端最多一条（仅两个后端），有效期 300 秒、生成条目最多 64 KiB，以文件锁串行发布。身份绑定原生 executable 或可识别 npm 的启动器、manifest、声明入口，以及可识别 Codex 原生组件的路径/文件元数据；同时绑定适配器策略摘要。身份/策略变化、过期、时钟回退、损坏或缺失所需功能门时重新完整检查；检查中身份变化拒绝结果；失败探针不缓存。未知包装器/安装布局不缓存；缓存 IO/锁失败只降级为完整安全探针，不跳过工具限制。缓存不保存认证、正文、运行安全验收或 CLI/模型结果。它不能替代安装完整性验证，也不能识别未改变绑定组件的任意传递依赖篡改。
+
+合成启动开销可用 `scripts/benchmark_ingest_relay.py --output <task-report.json>` 测量：它只创建并运行本地模拟 CLI/临时 MEMORY，比较独立适配器进程的 uncached/warm 输出、探针次数和时延，绝不调用真实模型服务或生产知识库。该回执不代表真实提供方响应速度，也不覆盖整个 canonical→投影链路。
+
 ## 📂 受控类型与文件结构规范 (Controlled Types & File Structures)
 
 为了保持图谱检索的高信噪比与一致性，Wiki 目录下的 Markdown 文件必须遵循严格的**受控命名前缀**，并被划分为两种完全不同的文件组织结构规范。
@@ -101,10 +144,10 @@ graph TD
   1. **`## 1. 编译事实 (Compiled Truth)`**：Read Model，只保留当前共识。特征点必须落在类型专属的 `###` 固化插槽内（例如 Vendor 的 `### 组织架构与商业模式`），插槽名不匹配会被 `schema_validator` 拒绝。
   2. **`## 2. 证据时间线 (Evidence Timeline)`**：Event Store，只能追加。格式形如 `- [YYYY-MM-DD] [Event_Tag] ...`。时间线条目按这个格式读取：日期与 `Event_Tag` 取自该前缀（claim 的结构化字段优先，前缀兜底）；标题不含 `证据时间线`/`时间线`/`timeline` 的段落进不了账本（`证据边界` 这类章节是边界声明，不是事件）；源文未给出日期的条目在投影里 `event_date` 为 NULL、排序置于末尾，显示为 `Unknown Date`，绝不拿入库时间冒充发生时间；事件精度由 `event_date_source`（`day`/`coarse`/`unknown`）记录，`YYYY-MM` 与 `YYYY-Qn` 不会被当成某一天。
 
-#### B. 豁免类 (Free-Form)
+#### B. 信源与合成类 (Semi-Structured)
 
 * **适用类型**：`Source_`, `Synthesis_`
-* **结构要求**：自由格式，不切割“事实 / 时间线”，用于单篇文献精读、书籍伴读笔记与横向战略研报。
+* **结构要求**：不套用实体页的“编译事实 / 证据时间线”。新 Source 页采用 `templates/wiki/source.md` 的推荐骨架；历史自由格式摘要仍可读，不新增历史标题门。结构化输入的 Static Skeleton 与 Graph Integration 由宿主供给或管理。Synthesis 页使用下述必需骨架，分析正文可以自由组织。
 * **`Synthesis_` 的骨架（只强制存在，不强制位置）**：必须含 `## 核心合成论点 (Core Synthesized Claims)` 与 `## 支撑拓扑 (Supporting Topology)` 两节（`schema_validator.SYNTHESIS_SKELETON_HEADINGS`）。门禁检查的是**存在**：把骨架放在文末仍是合法页面，因为按位置强制会一次性拒绝存量页面；位置由 lint 报告（`synthesis_skeleton_order_report`），于是文档与实现的差异只会出现在报告里，而不是被写成一条并未实现的保护。
 
 #### 两个命名空间不要混（实体名 vs 标签）
@@ -190,7 +233,7 @@ python cli.py doctor
 
 ### 5. 宿主 Agent 接入 (MCP Client Configuration)
 
-Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 19 个核心认知与知识工具。
+Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 19 个工具；准确注册面由 `mcp_server.py` 与 `tests/test_command_surface.py` 核验。
 
 **在客户端配置文件（如 `claude_desktop_config.json` 或 `.mcp.json`）中添加：**
 
@@ -348,7 +391,7 @@ MEMORY/
 
 > **MCP 是主接口**：Agent 直接调用 `vector_lake/mcp_server.py` 注册的工具，不经过终端模拟。本仓库**不随附**任何 slash command 兼容层（`commands/` 目录已不存在）；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
 >
-> MCP 暴露 19 个工具，由 `doctor` 与 `tests/test_command_surface.py` 核验。全量恢复、内部调度和重建端点保留在 CLI，避免 Agent 在常规检索中误触重型维护。
+> 全量恢复、内部调度和重建端点保留在 CLI，避免 Agent 在常规检索中误触重型维护。
 
 |职责分类|工具|说明|
 |-|-|-|
@@ -589,7 +632,7 @@ Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁�
 * `VECTOR_LAKE_RUNNER_EXPECTED=0`：不再把缺失的摄取 Runner 报为告警；用于不需要摄取的主机。
 * `VECTOR_LAKE_RUNNER_AUTOSTART=0`：不让 `watchdog_sync.py` 拉起并看护摄取 Runner（保留 `runner_absent` 告警，用于手工管理 Runner 的主机）。默认开启。
 * `VECTOR_LAKE_RUNNER_MODEL_CMD`：显式覆盖模型接缝命令。自动启动、手动监督器和直接 Runner 共用 `--model-cmd` > 此环境变量 > `config.json` 的 `ingest.backend` > 默认 Pi 的解析顺序；空白覆盖值忽略，非法配置仍报错。自定义命令维持原有 shell/stdin/stdout 协议，内置接缝按 Python argv 启动。
-* `VECTOR_LAKE_RUNNER_PI_BIN` / `VECTOR_LAKE_RUNNER_GEMINI_BIN` / `VECTOR_LAKE_RUNNER_CODEX_BIN`：对应 CLI 的可执行文件或 PATH 名称，默认 `pi` / `gemini` / `codex`。Pi 保留托管安装路径的后备解析；显式不可用的二进制不回退到其他安装或服务。`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT` 仅适用于 Pi；各接缝共用 `VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`，Runner 另读 `VECTOR_LAKE_RUNNER_COOLDOWN`。
+* `VECTOR_LAKE_RUNNER_PI_BIN` / `VECTOR_LAKE_RUNNER_GEMINI_BIN` / `VECTOR_LAKE_RUNNER_CODEX_BIN`：对应 CLI 的可执行文件或 PATH 名称，默认 `pi` / `gemini` / `codex`。Pi 保留托管安装路径的后备解析；显式不可用的二进制不回退到其他安装或服务。`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT` 仅适用于 Pi，默认项目级 `vector-lake-ingestor`（`.pi/agents/vector-lake-ingestor.md`，仅 `read` 工具、fresh 上下文，不继承全局/项目材料或技能）；默认 profile 缺失时拒绝替换为 reviewer。显式代理覆盖仍受所选代理自己的权限与输出契约约束。Pi 接缝从仓库根启动，原生任务包/模型结果验证与 `finalize_ingest` 不变。各接缝共用 `VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`，Runner 另读 `VECTOR_LAKE_RUNNER_COOLDOWN`。
 * `VECTOR_LAKE_RUNNER_REPAIR_ATTEMPTS`：可修正的输出/格式错误在 `finalize_ingest` 拒绝后最多修正的轮数（默认 `2`；`0` 关闭）。各轮共享同一模型截止时间，不另领超时预算；源变化、过期版本或租约冲突不进入模型格式修正，须重新派发。缺失版本字段与真正的陈旧版本不同，仍可由模型修正。重试不能替代校验。
 * `VECTOR_LAKE_RUNNER_SHADOW=1`：让自动拉起的 Runner 不写 Wiki 页面，默认关闭。直接运行 `scripts/ingest_runner.py` 默认 shadow，使用 `--no-shadow` 才写页；shadow 跳过模型调用，但仍会认领任务、处理重复来源并记录运行状态，不是零副作用模式。
 * `VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`：守护进程的周期性兜底间隔（默认 `900` 秒；`0` 关闭）。兜底做三件事：把未摄入的 raw 源重新入队（否则失去事件、被取消或从未入队的源没有回到队列的路径）、把超过时限的陈旧摄取任务作废、以及按批次重建缺失或输入已变的向量。
@@ -598,7 +641,7 @@ Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁�
 * `VECTOR_LAKE_STALE_TASK_MAX_AGE_SECONDS`：兜底把多旧的摄取任务视为陈旧（默认 `86400` 秒）。
 * `VECTOR_LAKE_RUNNER_STALE_SECONDS`：Runner / 监督器心跳过期阈值，默认 `2400` 秒。
 * `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
-* `VECTOR_LAKE_FTS`：词法检索后端，默认 `fts5`；`tantivy` 使用派生镜像。两者接收项目分词器的预切词串，采用 AND 查询，并沿用负数 rank 约定。FTS5 仍是权威投影，镜像失败只告警；可用 `python -c "from vector_lake import tantivy_index as t; t.rebuild_from_sqlite()"` 重建镜像。切换后端前需验证相关性，不能仅凭吞吐量替换默认值。
+* `VECTOR_LAKE_FTS`：词法检索后端，默认 `fts5`；`tantivy` 使用派生镜像。两者接收项目分词器的预切词串，每条查询内部采用 AND，并沿用负数 rank 约定。页面检索先保留原始查询命中；未填满召回深度时，最多执行 8 条保留其他限定词的词典替换查询，去重后补位（sum 模式的补充 BM25 贡献减半；RRF 中补充项排在原始命中之后）。不把全部扩展词拼成一个 AND。FTS5 仍是权威投影，镜像失败只告警；可用 `python -c "from vector_lake import tantivy_index as t; t.rebuild_from_sqlite()"` 重建镜像。切换后端前需验证相关性，不能仅凭吞吐量替换默认值。
 * `VECTOR_LAKE_CLAIM_BLOCKS`：claim 块提取器，默认 `rust`（`vector_lake_core.fast_extract_blocks`）；`python` 使用 mistune。含 NUL 或 U+FFFD 的正文走 mistune，避免解析器差异改变 claim 文本与标识。
 * `VECTOR_LAKE_RERANK_WEIGHT`：同池重排权重，默认 `0.4`，混合上游归一化分与 Rust BM25 分；`0` 禁用重排。缺少 `fast_bm25_rerank` 时保留上游顺序并告警，没有 Python 重排回退。重排不增加候选，也不等于经过人工相关性验收。
 * `VECTOR_LAKE_ENTITY_NAME_PRIORITY`：是否优先提升被查询点名的实体页，默认 `0`；开启后按实体名在查询中的位置分层，层内按混合分排序。点名某实体不一定意味着想要它的主体页，故不默认开启。
@@ -662,11 +705,25 @@ Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁�
 
 同池重排（`tool_search._rerank_candidates_locally`）由 Rust 核心完成，不再有 Python 引擎：
 
-* **候选集成员不变**（召回由上游 FTS5 + 图扩展决定），只改变池内顺序。
-* 词汇信号来自 `title + summary + aliases`（不读正文：否则每次查询都要逐候选读文件），预先用项目分词器切好后交给核心。
-* 分数为**池内归一化**（min-max），不是绝对相关度：因此首位候选通常显示 `1.000`，并列最大的候选保持并列。
+* **候选集成员不变**（召回由上游 FTS5、可用向量与图扩展决定），只改变池内顺序；最终 Recall@k 仍可能随排序改变。
+* 词汇信号来自 `title + summary + aliases`（不读正文：否则每次查询都要逐候选读文件），预先用项目分词器切好后交给核心。查询与文档词统一 lowercase，与 FTS 的英文大小写语义保持一致；不改展示文本、实体键或 embedding 查询原文。
+* 元数据分词使用进程内 LRU，最多 256 项，以完整文本与分词器身份为键；单项文本超过 4096 字符时仍重排但不入缓存。内容或后端改变即失效，不新增持久化投影。
+* 上游分与词法分分别做**池内 min-max 归一化**后混合，混合分不保证首位为 `1.000`，也不是可信度或可跨查询比较的绝对相关度。
 * 默认权重 0.4 保留上游影响力，避免把**本就无词汇重叠的图扩展候选项**压到底部。
 * 缺核心或缺符号时保留上游顺序并告警，不使用第二套打分引擎。
+* 图扩展只接收正 PPR 质量的节点；先按领域、聚类、历史状态或表达式过滤，再计入 5/12 项扩展上限并计算 RRF 名次。普通选择器最多每批读取 32 项元数据，只为合格项加载正文以外的完整节点；表达式过滤读取其需要的完整字段，节点消失或状态改变时继续补位。无选择器时跳过额外的元数据查询。预构建 PPR 缓存同时绑定图代际与实际邻接表对象；`index.json` 回退切换图快照时不能复用旧 SQLite 图。
+
+查询向量保留原有 256 项 LRU，并将同一模型、维度与原文查询的并发未命中合并为一项进行中的请求（最多 256 项）。各调用者保持自己的 20 秒等待预算；跟随者超时不取消其他请求拥有的工作。失败、空响应与容量耗尽均返回明确降级原因，不缓存失败，不新增线程或提供方重试。
+
+内部 `_search_scored_pages(..., timings={})` 可收集各阶段及总计的毫秒耗时，字典按调用重置；不改变 MCP 参数、结果格式或检索 ledger 持久化结构。真实服务的延迟与相关性仍需单独验收，合成提供方的耗时不能当作真实网络基准。
+
+#### 查询语义边界
+
+现有混合检索不是通用的自然语言约束解析器。词典补位、实体优先和作者 facet 是召回或排序策略，不保证中文主体、否定作用域或时间区间作为硬条件保留。时间线工具只查询已记录的事件日期，不能拿页面更新时间替代事件发生时间。
+
+`filter_expr` 使用受限的通用比较语义，不自动校验业务属性类型或日期有效性：例如数字 `0` 与 `False` 的比较、非法 ISO 日期的字符串比较，都不能用作可信布尔/时间约束。调用方需要先验证元数据与来源，再把确认的条件传入过滤路径；缺失数据保持未知，不默认填 `false` 或维护时间。
+
+零命中放宽、结构化约束解析与类型安全适配仍属于隔离研究，未接入生产默认路径；合成或公开阅读笔记的来源定位成绩不能代表真实查询覆盖率。此版本不改变默认融合、候选深度和重排权重。
 
 #### CJK 分词
 
@@ -790,7 +847,7 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 |-|-|
 |`schema.md` / `SCHEMA_CATEGORIES.md`|Wiki 与运行态记忆契约、受控分类表|
 |`skills/`|面向宿主的技能定义（每个能力一份 `SKILL.md`）|
-|`templates/`|摄取 / 查询提示词模板与拓扑可视化 HTML|
+|`templates/`|统一的 Wiki 页面骨架、摄取 / 查询 / 治理提示词与拓扑 HTML；见 [templates/README.md](templates/README.md)。结构词表由 `schema_validator.py` 拥有，`runtime_contract.py` 向各后端提供一致上下文；用户策略仍来自 MEMORY 的 purpose YAML|
 |`crates/vector_lake_core/`|Rust 原生加速核心源码（PyO3、pulldown-cmark、rayon、abi3 规范）|
 |`scripts/build_core.py`|原生加速扩展的一键跨平台编译与就地安装脚本|
 |`scripts/`|独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验），以及宿主侧摄取 Runner：`ingest_runner.py` + 常驻监督器 `ingest_runner_service.py` + 模型接缝 `ingest_model_pi_subagents.py` / `ingest_model_cli.py`|

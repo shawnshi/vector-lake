@@ -1,6 +1,7 @@
 """Tool-free Gemini/Codex execution behind the existing ingest JSON seam."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from vector_lake.ingest_model_contract import build_cli_prompt, extract_result, result_schema
 from vector_lake.process_control import model_timeout_seconds, run_contained
+from vector_lake.template_loader import read_template
 
 CODEX_REQUIRED_FEATURES = frozenset({
     "shell_tool", "unified_exec", "apps", "hooks", "plugins", "multi_agent", "view_image",
@@ -109,10 +111,27 @@ def _gemini_argv(capabilities: CliCapabilities, directory: Path, env: dict) -> l
     # System settings outrank user/project settings without moving or copying credentials.
     env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(settings)
     return [capabilities.binary, "--extensions", "none", "--policy", str(policy),
-            "--output-format", "json", "--prompt", "Complete the ingest from stdin; return only the contracted JSON."]
+            "--output-format", "json", "--prompt", read_template("prompts/ingest/cli_bootstrap.md")]
 
 
-def invoke_cli(packet: dict, backend: str) -> dict:
+def _execution_capabilities(backend: str, deadline: float) -> CliCapabilities:
+    """Cache only recognized host CLI identities; explicit --check still probes fresh."""
+    from vector_lake.ingest_probe_cache import cached_capabilities
+
+    _remaining(deadline)
+    binary = find_cli_binary(backend)
+    if not binary:
+        return check_cli(backend, deadline=deadline)
+    try:
+        policy = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return check_cli(backend, deadline=deadline)
+    return cached_capabilities(backend, binary, policy, deadline,
+                               lambda: check_cli(backend, deadline=deadline), CliCapabilities,
+                               CODEX_REQUIRED_FEATURES if backend == "codex" else frozenset())
+
+
+def invoke_cli(packet: dict, backend: str, *, use_cache: bool = True) -> dict:
     try:
         deadline = float(os.environ.get("VECTOR_LAKE_MODEL_DEADLINE_MONOTONIC",
                                         time.monotonic() + model_timeout_seconds()))
@@ -120,7 +139,8 @@ def invoke_cli(packet: dict, backend: str) -> dict:
         raise ValueError("model deadline must be a finite monotonic timestamp") from exc
     if not math.isfinite(deadline):
         raise ValueError("model deadline must be a finite monotonic timestamp")
-    capabilities = check_cli(backend, deadline=deadline)
+    _remaining(deadline)
+    capabilities = _execution_capabilities(backend, deadline) if use_cache else check_cli(backend, deadline=deadline)
     prompt = build_cli_prompt(packet)
     env = dict(os.environ)
     with tempfile.TemporaryDirectory(prefix=f"vector-lake-{backend}-") as temporary:

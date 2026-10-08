@@ -1,12 +1,14 @@
-# Vector Lake Schema & Governance (Schema V8.0; Strategic Contract V12.1)
+# Vector Lake Schema & Governance (Schema V8.0)
 
 ## 1. Core Mandate
 
-This file is the data contract, not the generator's instructions. It states what a
-conforming page looks like. The directives that consume it live in
-`templates/ingest_prompt.md`; keeping the two apart means a change to the contract
-can be reviewed as a change to the contract, rather than as a change to what the
-model is told.
+This file documents the data contract and authoring conventions, not a second executable rule owner.
+`vector_lake/schema_validator.py` owns enforced structural rules and closed vocabularies;
+`vector_lake/runtime_contract.py` reflects those rules into every ingest backend.
+`SCHEMA_CATEGORIES.md` explains classification; `MEMORY/purpose.md` YAML owns user strategy,
+evidence-tier definitions and synthesis thresholds. Its current version is supplied at runtime,
+not pinned to a minor release in this document. Page skeletons and generator instructions live
+in `templates/wiki/` and `templates/prompts/`; examples cannot expand the write gate's vocabulary.
 
 Bounded Vector Lake page candidates are generated or validated against this contract. Candidates have no direct write authority: the host must commit them through the Mutation Coordinator, which atomically records canonical state and durable outbox intent before publishing Markdown and index projections. The target knowledge base is optimized for Medical IT industry intelligence, topology mapping, and compliance tracking.
 
@@ -21,35 +23,16 @@ Bounded Vector Lake page candidates are generated or validated against this cont
 - **`MEMORY/purpose.md`**: The versioned strategic-purpose control plane. Its YAML contract drives ingestion directives, retrieval context, autonomous research, operational-memory weighting, SIR review proposals, and synthesis thresholds.
 
 ## 3. Markdown Conventions
-- **YAML Frontmatter**: EVERY wiki page MUST contain YAML frontmatter with the following fields:
-  ```yaml
-  ---
-  id: "YYYYMMDD_xxxxxx"  
-  title: "Page Title"
-  aliases: ["Alias1", "Alias2"] 
-  type: "vendor | product | institution | person | event | concept | policy | standard | source | synthesis" # Updated: 'institution' separated from 'vendor'
-  domain: "Medical_IT"  
-  topic_cluster: "General" 
-  status: "Active | Draft | Superseded | Deprecated | Archived | Contested"
-  epistemic-status: "seed | sprouting | evergreen" 
-  ttl: 365 # optional; §7 gives the default that applies when it is absent 
-  memory_type: "fact | preference | decision | task_state" # SQLite `operational_memory` row, not page frontmatter 
-  memory_key: "stable_runtime_key" # SQLite `operational_memory` row, not page frontmatter 
-  categories: ["System_Architecture"] 
-  tags: ["tag1", "tag2"]
-  architecture_patterns: ["微服务", "数据飞轮"] # authoring convention only: no code reads this key
-  created: "YYYY-MM-DD"
-  updated: "YYYY-MM-DD"
-  sources: ["raw/doc1.pdf", "raw/doc2.txt"]
-  strategic_scope: "core | edge" # Required for newly ingested nodes
-  evidence_tier: "code-availability | policy-directive | engineering-performance | commercial-commitment | production-acceptance"
-  tension_edges: 
-    - target: "Concept_Cloud_Native"
-      polarity: -1.0  
-      intensity: 0.85 
-      context: "This concept physically challenges the cloud-native assumption."
-  ---
-  ```
+- **YAML Frontmatter**: Wiki pages must carry frontmatter; exact required fields and artifact exemptions come from the runtime validator contract.
+  - `required_frontmatter`, field vocabularies and generated-artifact exemptions are reflected from the validator, not copied into a second YAML example here.
+  - `aliases` must be a list when present; `tags` obey the code-owned size/collision rules. `topic_cluster` and `ttl` are optional. `created` is an authoring convention, not an additional required-field gate.
+  - `categories` and `domain` are different axes. Use the category values and registered domains/verticals/aliases in the runtime contract; the explanatory catalogue is `SCHEMA_CATEGORIES.md`.
+  - `strategic_scope` is `core` or `edge` for knowledge nodes. New authored knowledge-ingest candidates must declare a source-justified `evidence_tier` from the current purpose YAML, whose definitions are supplied with the task.
+  - A provided evidence grade is validated on full-purpose writes. Absence is accepted for legacy/ungraded administrative metadata; it is not an invitation for a generator to omit the authoring requirement. Operational memory uses `memory_type`/`sources` for provenance and must not fabricate `derived`. Recovery retains a recorded grade and does not default missing metadata to `primary`. Explicit unsupported grades remain errors, including on existing memory pages.
+  - `memory_type` and `memory_key` identify operational-memory records, not mandatory metadata for ordinary knowledge pages; the compiled memory page may mirror its type.
+  - `architecture_patterns` is an authoring convention only: no code consumes it.
+  - `tension_edges` records target, polarity, intensity and context. User-purpose thresholds decide synthesis proposals; their numeric values are not duplicated here.
+
 Semantic Bidirectional Linking (SSOT Rule): ALL topological relations MUST be 100% and uniquely carried by Markdown semantic links. DO NOT use YAML arrays (like parents) for relationships. You MUST use strict relation-typed links from the Controlled Vocabulary: [predicate:: [[Target_Entity_Name]]].
 Ontological & Creation: [is-a::], [part-of::], [evolved-from::], [created::], [founded::], [authored::], [architected::]
 Strategic & Power: [competes-with::], [supplies-to::], [supplied-by::], [blocks::], [conflicts-with::], [controls::], [manages::], [invested-in::], [allied-with::]
@@ -83,83 +66,33 @@ Target Files: Concept_*.md, Vendor_*.md, Institution_*.md, Product_*.md, Person_
 Design Pattern: CQRS (Command Query Responsibility Segregation) & Event Sourcing.
 Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" physical structure.
 
-# [[Title]]
-
-## 1. 编译事实 (Compiled Truth - READ MODEL)
-*[System Directive: This section represents the LATEST consensus. NO historical narrative here. NO marketing fluff.]*
-
-[Provide a concise 50-word ultimate definition. ELI5 style.] (Last Reshaped: YYYY-MM-DD)
-
-> **Date is not a link.** Write the reshape date bare, exactly as the live wiki does
-> (4 564 pages) and as ``stub_creator.stub_body`` explains: ``[[2026-06-02]]`` is a broken
-> link the moment it is written, and the next ``lint --auto-fix`` turns it into a junk
-> ``Concept_2026-06-02.md``. Three pages reached the corpus that way before this line said
-> so; the optional ``timeline anchor`` suffix is kept by 822 pages and is harmless.
-
-> **Chunking Rule (No-Pronoun & Metrics Constraint):**
-> Every bullet point in this section MUST restate the entity's explicit name (e.g., "[[Vendor_Acme]] 的底层架构是...", NOT "它的底层架构是..."). 
-> Every synthesized fact MUST use an INLINE source anchor at the end of the sentence. 
-> Numerical parameters MUST use the `{Metric: Key}` inline prefix from the Controlled Metrics System.
-
-### [Strict Typed Slot 1]
-- [[Entity_Name]] [Fact 1 with explicit semantic links] (Source: [[Source_FilenameA]], p.4)
-
-> **Type-Bound H3 Slots Constraint (NO INVENTING NEW HEADINGS):**
-> You MUST use ONLY the following H3 headers based on the YAML `type`:
-> - If `Vendor` (Supply Side): `### 组织架构与商业模式 (Business Model)` | `### 核心护城河 (Moat)` | `### 市场占位与竞争态势 (Market & Competition)` | `### 生态位与战略联盟 (Ecosystem & Alliances)` | `### 关键产品线 (Key Products)` | `### 核心团队与权力拓扑 (Key Personnel)`
-> - If `Institution` (Hospitals, Gov/Regulators): `### 机构定位与核心诉求 (Positioning & Needs)` | `### 数字化演进路线 (Digital Roadmap)` | `### 核心供应商与生态锚定 (Key Suppliers & Lock-ins)` | `### 预算流动与财务状况 (Budget & Financial Health)`
-> - If `Product`: `### 目标客群与应用边界 (Target ICP & Use Cases)` | `### 临床与管理价值流 (Clinical & Admin Value)` | `### 部署架构与底层依赖 (Architecture & Dependencies)` | `### 医疗合规与资质壁垒 (Compliance & Certifications)` | `### 商业化与交付模式 (Monetization & Delivery)`
-> - If `Concept`: `### 物理机制 (Mechanism)` | `### 适用与失效边界 (Boundaries)` | `### 产业落地与代表实例 (Implementations)` | `### 演进关联 (Evolution)`
-> - If `Person`: `### 核心权责与控制域 (Mandates & Domain of Control)` | `### 关键造物与历史印记 (Key Artifacts & Legacy)` | `### 核心主张与商业/技术理念 (Key Stances & Philosophies)` | `### 利益纽带与权力拓扑 (Affiliations & Power Topology)`
-> - If `Event`: `### 动因与前置条件 (Catalysts & Preconditions)` | `### 核心影响与转折 (Impact)` | `### 关键参与方 (Stakeholders)` | `### 后续衍生与未决节点 (Fallout & Unresolved Issues)`
-> - If `Policy` or `Standard`: `### 管辖范围与适用对象 (Jurisdiction & Applicability)` | `### 核心约束与合规要求 (Compliance Mandates)` | `### 奖惩机制与市场影响 (Incentives & Penalties)` | `### 演进与废除条件 (Lifecycle)`
-
-> **STQM Explicit Mapping Constraint:**
-> If the YAML frontmatter contains a `tension_edges` array, you MUST instantiate the following H3 slot at the end of Section 1:
-> `### 认知张力与未决争议 (Controversies & Tensions)`
-> Unpack the polarities and semantic collisions mapping to `tension_edges` here using explicit natural language.
-
-*Rewrite Rule*: OVERWRITE this entire Section 1 whenever a new insight changes the core truth. Keep it lean, dense, and factual.
-
----
-
-## 2. 证据时间线 (Timeline - EVENT STORE)
-*[System Directive: This is a governed knowledge-evidence projection, not a business Event Store. Entries normally append, but governed correction and supersession remain possible. Claims in Section 1 SHOULD trace to source-backed evidence records.]*
-
-> **Syntax Constraint:** 
-> Every entry MUST start with `- [YYYY-MM-DD] [Event_Tag]`. 
-> Valid tags: `[Release]`, `[Pivot]`, `[Conflict]`, `[Validation]`, `[Observation]`, `[Decision]`, `[Execution]`, `[Outcome]`.
-> Every entry MUST end with an inline Source anchor.
-
-- [YYYY-MM-DD] [Event_Tag] Event description, raw extract, or dialogue summary. [validates:: [[Target_Entity]]] (Source: [[Source_X]])
-
-*Rewrite Rule*: APPEND-ONLY. NEVER edit, summarize, or delete old entries.
-
-
+The rendered body skeleton has one owner: `templates/wiki/entity.md`.
+Normative constraints (not a second page template):
+- Two H2 sections distinguish current compiled facts from dated evidence. Entity pages do not receive the Source-only Static Skeleton section.
+- Compiled facts describe the current source-grounded consensus: concise definition, no marketing or historical narrative. Each bullet restates the entity name, not a pronoun, and carries an inline Source anchor.
+- Numeric assertions use the controlled metric syntax below; provenance cannot be deferred to bottom footnotes.
+- H3 slots are closed per type: use `h3_slots` from the runtime validator contract. A declared `tension_edges` requires `### 认知张力与未决争议 (Controversies & Tensions)` in section 1.
+- A reshape date is plain text, never a Wiki link. The generator may replace compiled facts, but does not rewrite existing timeline entries.
+- Timeline bullets begin `- [YYYY-MM-DD] [Event_Tag]`, use the validator's event-tag vocabulary, and end with a source anchor. Never invent a date for an undated question.
+- Evidence timelines are governed knowledge projections, not business Event Stores. Entries normally append; a correction or supersession requires a separately authorized, auditable maintenance operation. This does not grant the generator permission to edit/delete old entries.
 
 B. Exempted & Synthesis Files (Semi-Structured)
 Target Files: Source_*.md, Synthesis_*.md.
 Constraint: DO NOT apply the Dual-Schema timeline format to these files.
 
-For Source_*.md: free-form summaries and extract lists remain allowed, and this exemption is why
-the corpus's `Source_*` pages carry 2 822 distinct H2 headings. A **recommended** skeleton is now
-declared in `templates/Source.md` (`## 来源核验`, `## 概要摘录`, `## 结构化摘录`). These three are
-not the three the corpus uses most: `## Source Summary` (245 pages) is the most used and is
-deliberately not adopted, because the point of the skeleton is a declared shape rather than a
-majority vote.
-It is not enforced, because enforcing it would
-require rewriting 1 816 existing pages; new sources should follow it, and the retrieval layer can
-depend on those three names existing.
+For Source_*.md: the recommended skeleton has one owner, `templates/wiki/source.md`.
+Existing free-form summaries remain readable; the three-section recommendation is not a new historical heading gate.
+For supported structured inputs, the host supplies a Static Skeleton block that is copied exactly to the Source page as an explicit additional H2 exception. Graph Integration is host-managed. Neither exception adds an Entity H2.
 
 For Synthesis_*.md: MUST instantiate a lightweight semantic skeleton. The document MUST contain:
 ## 核心合成论点 (Core Synthesized Claims) (No-Pronoun Constraint enforced).
 ## 支撑拓扑 (Supporting Topology) (Listing critical [predicate:: [[Target]]] vectors driving the synthesis).
 Free-form markdown analysis follows. What `schema_validator.validate_schema` enforces is that these
 two sections are *present*. Opening the document with them is the recommended shape, not an enforced
-one: enforcing the order would reject the legacy synthesis pages that carry the skeleton last, so
+one: enforcing the order would reject legacy synthesis pages that carry the skeleton last, so
 `lint` reports the position instead (`synthesis_skeleton_order_report`) and the difference between the
-documented rule and the enforced rule stays visible. All 21 live synthesis pages satisfy the rule
-that is actually enforced.
+documented rule and the enforced rule stays visible. Current corpus compliance must be measured
+with lint, not inferred from a historical page count.
 
 C. Generated Artifacts (Not Authored)
 Target Files: `System_Community_*.md` (the clustering daemon's community indexes).
@@ -167,11 +100,11 @@ Constraint: these are pages the wiki writes **about itself**, not knowledge node
 from `domain`, `epistemic-status` and `sources`, carry `categories: [System]`, and every other
 layer (indexer, link resolution, governance extraction) skips them.
 
-The namespace is not a knowledge namespace. 229 knowledge pages had been filed under `System_` by
-2026-09-23; because the whole system skips that prefix, they were absent from the index,
-unreachable by link, and exempt from three required fields. The authoring gate therefore refuses
-a **new** node whose filename starts with `System_` unless it is an artifact; existing ones are
-left for a rename pass. Use a knowledge prefix (`Concept_`, `Source_`, `Vendor_`, ...) instead.
+The namespace is not a knowledge namespace. Knowledge nodes misfiled under `System_` can be skipped
+by indexing and linking and evade knowledge-node metadata requirements. The authoring gate therefore
+refuses a **new** node whose filename starts with `System_` unless it is an artifact; existing ones
+require a separately authorized rename pass. Use a knowledge prefix (`Concept_`, `Source_`, `Vendor_`, ...)
+instead.
 
 ## 5. Workflows
 (Standard workflows for Ingestion, Query-to-Page, and Linting remain intact. Trigger MCP tools enqueue_governance_item for conflicts, and resolve_governance_item for node merges.)
@@ -191,6 +124,6 @@ Metadata Decay Mechanism: Handled by AST daemon TTL expiration, which recomputes
 Taxonomy Tyranny:
 Rule 1: NEVER use an existing entity name as a tag.
 Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换). Use architecture_patterns in YAML for technical jargon (an authoring convention: nothing in the code reads this key).
-Rule 3: An entity MUST NOT have more than 3 tags.
+Rule 3: An entity's tag count must not exceed the runtime contract's `max_tags`, reflected from `schema_validator.MAX_TAGS`.
 ***
-*(Schema V8.0 with Strategic Contract V12.1. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*
+*(Schema V8.0. User strategic-policy versions and evidence tiers come from purpose YAML. Controlled metrics are unit-specific, metric claims require Source anchors, and configured thresholds create auditable Synthesis-Proposals.)*

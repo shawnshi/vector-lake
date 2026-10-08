@@ -1,0 +1,1 @@
+{{title}}：canonical 记录存在，但 Markdown 投影缺失。本页由维护流程从 canonical 元数据恢复，需要后续补充原始证据与完整编译事实。

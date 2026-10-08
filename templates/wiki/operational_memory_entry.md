@@ -1,0 +1,1 @@
+- [{{date}}] [Observation] {{content}} (Source: [[Source_Operational-Memory]])

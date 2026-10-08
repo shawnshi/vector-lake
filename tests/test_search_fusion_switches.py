@@ -87,6 +87,13 @@ def _crowded_lake(memory_dir):
             "domain": "AI_Engineering",
             "summary": "向量专属",
         }
+    # Matching terms need non-matching corpus context: with all FTS rows matching, SQLite's
+    # IDF floor makes every lexical score ~1e-6 and cannot model a stronger crowded recall pool.
+    for index in range(50):
+        nodes[f"Concept_Distractor_{index:02d}"] = {
+            "title": f"Distractor {index}", "type": "concept", "status": "Active",
+            "domain": "AI_Engineering", "summary": "unrelated material",
+        }
     for index in range(5):
         nodes[f"Concept_Reach_{index}"] = {
             "title": f"Reach {index}",
@@ -99,12 +106,18 @@ def _crowded_lake(memory_dir):
         {"source": f"Concept_Fill_{index:02d}", "target": f"Concept_Reach_{index % 5}", "weight": 3.0}
         for index in range(45)
     ]
+    # Sum fusion seeds the strongest vector hits. The frontier must be reachable from those
+    # seeds, not merely present as zero-mass entries in the graph-wide PPR result (VL-S02).
+    edges += [
+        {"source": f"Concept_Vec_{index:02d}", "target": f"Concept_Reach_{index}", "weight": 3.0}
+        for index in range(5)
+    ]
     get_index_path().write_text(
         json.dumps({"nodes": nodes, "weighted_edges": edges}, ensure_ascii=False), encoding="utf-8"
     )
     conn = db_store.get_connection()
     with db_store.transaction():
-        for key in [k for k in nodes if k.startswith("Concept_Fill_")]:
+        for key in nodes:
             row = nodes[key]
             conn.execute(
                 "INSERT INTO wiki_search_index (node_key, title, summary, text) VALUES (?, ?, ?, ?)",

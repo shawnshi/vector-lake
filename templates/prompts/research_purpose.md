@@ -1,0 +1,3 @@
+
+Strategic purpose contract:
+{{purpose}}
