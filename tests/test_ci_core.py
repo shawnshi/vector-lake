@@ -125,6 +125,15 @@ def test_native_gate_rejects_well_formed_but_stale_or_unsafe_receipts(tmp_path, 
     assert result.returncode != 0 and not (tmp_path / 'probe.json').exists()
 
 
+def test_ci_declares_hash_pinned_numpy_test_dependency_for_all_lanes():
+    text = (REPO / 'scripts' / 'ci-test-requirements.txt').read_text(encoding='utf-8')
+    assert 'numpy==2.2.6' in text and text.count('--hash=sha256:') == 4
+    workflow = (REPO / '.github' / 'workflows' / 'test.yml').read_text(encoding='utf-8')
+    assert '--no-deps --require-hashes -r scripts/ci-test-requirements.txt' in workflow
+    assert workflow.index('-r scripts/ci-test-requirements.txt') < workflow.index('python scripts/ci_core.py test')
+    assert (REPO / 'requirements.txt').read_text(encoding='utf-8').find('numpy') == -1
+
+
 def test_fixed_ci_build_tool_does_not_add_runtime_dependencies():
     text = (REPO / 'scripts' / 'ci-build-requirements.txt').read_text(encoding='utf-8')
     assert 'maturin==1.15.0' in text and text.count('--hash=sha256:') == 3

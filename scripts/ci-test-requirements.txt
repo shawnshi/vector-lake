@@ -1,0 +1,8 @@
+# Existing metadata/two-stage-index tests require NumPy. CI-only, no extras.
+# Official PyPI 2.2.6 CPython3.10/3.13 x86_64 wheels for Windows/manylinux2014.
+# Requires Python>=3.10; no Requires-Dist. Application requirements stay unchanged.
+numpy==2.2.6 \
+    --hash=sha256:f0fd6321b839904e15c46e0d257fdd101dd7f530fe03fd6359c1ea63738703f3 \
+    --hash=sha256:b0544343a702fa80c95ad5d3d608ea3599dd54d4632df855e4c8d24eb6ecfa1c \
+    --hash=sha256:fc7b73d02efb0e18c000e9ad8b83480dfcd5dfd11065997ed4c6747470ae8915 \
+    --hash=sha256:1bc23a79bfabc5d056d106f9befb8d50c31ced2fbc70eedb8155aec74a45798f
