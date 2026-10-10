@@ -167,7 +167,8 @@ def test_enqueue_mutation_still_returns_the_row_the_repair_keeps(isolated_memory
 
     db_store.repair_idempotency_keys("mutation_outbox", dry_run=False)
 
-    assert db_store.enqueue_mutation("X.md", "update", idempotency_key="dup") == canonical_id
+    filename = conn.execute("SELECT filename FROM mutation_outbox WHERE id=?", (canonical_id,)).fetchone()[0]
+    assert db_store.enqueue_mutation(filename, "update", idempotency_key="dup") == canonical_id
 
 
 def test_repair_rejects_an_unknown_table(isolated_memory):

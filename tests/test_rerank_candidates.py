@@ -48,6 +48,8 @@ def test_reranking_preserves_candidate_membership():
 
 
 def test_lexically_relevant_candidate_rises_to_the_top():
+    if not tool_search.HAVE_CORE:
+        pytest.skip('native BM25 ranking; core fallback contract preserves upstream ordering')
     before = _candidates()
 
     after = tool_search._rerank_candidates_locally("电子病历集成平台", before)
@@ -147,6 +149,8 @@ def test_runs_are_deterministic():
 
 
 def test_scores_are_pool_normalised_to_unit_interval():
+    if not tool_search.HAVE_CORE:
+        pytest.skip('native BM25 score normalization; not provided by core fallback')
     before = _candidates()
 
     after = tool_search._rerank_candidates_locally("电子病历集成平台", before)

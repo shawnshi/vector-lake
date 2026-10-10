@@ -12,6 +12,21 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
 
+## 运行身份与隔离业务验收
+
+MCP `runtime_identity` 返回**实际调用进程**的 PID、Python 版本、磁盘 checkout、选定 Python 函数的已加载代码与当前源文件比较、已加载 core 的版本／路径和磁盘二进制 SHA。它不打开数据库、不导入未加载的业务／core 模块、不重载或重启服务。
+
+`matches_function_code` 仅比较明确列出的解包函数代码，不涵盖装饰器包装、默认参数、globals、导入时状态或整个模块。Git HEAD 与磁盘 SHA 不代表已加载版本；core 磁盘 SHA 也不证明内存映像相同。`not_loaded`、路径不符、代码不符、不可核验分别报告，不能替代健康门或发布绑定。
+
+隔离业务入口复用 CI 后端门，以新目录保存 synthetic MEMORY、后端回执、JUnit 和成功回执；拒绝重用输出目录，单个 lane 130 秒超时后终止其进程树，不生成成功回执：
+
+```bash
+python -B scripts/business_acceptance.py --backend native --native-dir /path/to/fresh-ci-core-build --output /path/to/new-native-artifacts
+python -B scripts/business_acceptance.py --backend fallback --output /path/to/new-fallback-artifacts
+```
+
+覆盖真实 synthetic canonical→outbox→Markdown／索引／FTS 的创建、更新、旧发布拒绝和删除，以及 in-process MCP 的工具发现／调用和定向故障回归。不是生产语料、模型网络、远端协议服务或迁移验收；成功回执仍写 `production_acceptance: not_established`。实际部署仍须单独授权、停止旧 writers、验证完整备份、绑定期望发布构件，并在真实服务进程执行身份和业务验收。远端 CI 与实际生产验收仍须绑定具体发布提交及运行进程；剪枝合同已由 core 0.2.2 统一为每节点最多 15 条 incident 边、同权按端点字典序，不能据此宣称所有评分严格等价。
+
 ## 已知限制与运维要求 (Known Limits & Operational Requirements)
 
 以下约束由当前实现决定，部署前必须满足，否则会出现与预期不符的行为。
@@ -206,6 +221,14 @@ cp config.example.json config.json
 
 启用 embedding 或宿主编译会将相关文本交给模型服务。先核对扫描目录、排除项及宿主的数据边界；本地文件优先不等于零外联。
 
+Outbox 发布协议使用逐页 `projection_generation` 和独立的租约 owner/token/generation。完成与失败回写必须携带当前未过期的认领回执；仅传 outbox ID 不再可用。A→B→A 重放保留幂等行 ID，但分配新的逐页版本，旧重试不能覆盖新投影。canonical 提交、前台物化、后台物化/索引及手工编辑归一化共用按文件名排序的页面锁；等待页面锁时不持有 SQLite 写事务；调用方不得在外层 SQLite 事务中发布页面。锁归属绑定 PID 与线程，文件名别名不能以不同 canonical 名称指向同一物理页面。现有 payload retention 保留 outbox 行及版本，只清空过期 payload。
+
+已有库由 writer 首次使用 outbox 协议时做加列、索引与旧租约迁移；纯 reader 保留旧快照的只读访问。迁移不得与旧版本 writer 混跑：部署前停止全部旧 writer、保存并验证完整数据库备份，在受控环境升级后统一启动新版本。未知版本的历史 intent 若对应现存 canonical 页面会失败关闭，不自动把旧 payload 绑定到当前页面；恢复需通过受控 canonical mutation 重新入队。canonical callback 可以更新关联账本，但不能改变已准备页面，否则整笔事务回滚。绕过协议的原始 SQL/外部文件写者不受合作式页面锁保护。
+
+Watchdog 的 wiki/raw watcher 与后台循环统一接受线程监督，异常退出有界重启；独立的 `watch-wiki` / `watch-raw` 状态不会被主进程心跳清除，正常停机等待当前替代线程结束。
+
+备份回收只处理具有完成回执、SQLite 完整性检查结果及匹配 SHA-256 的备份。生产备份与回收共享目录锁，维护备份先在 `.partial` 目录构建再发布；旧备份、未完成备份、内容变化或包含额外文件的目录均保留并显示为 `PROTECTED`。至少保留最新的验证通过副本；该验证不等同于跨投影恢复演练。历史备份不会被自动补写回执，受保护文件可能使实际磁盘占用超过回收预算。
+
 **关键环境变量（由宿主环境注入；项目不会自动加载 `.env`）：**
 
 |环境变量|作用|推荐值|
@@ -318,6 +341,23 @@ Windows 常驻入口为计划任务 **`VectorLake-Watchdog`**，执行 `scripts/
 5. **被废弃的源**：同一份内容反复确定性失败（例如 `categories` 不是单元素列表、命名或 schema 违规）时，第 3 次尝试后该源会被记为「废弃」并停止派发，避免每轮固定烧掉 3 次模型调用。`python cli.py ingest-tasks --abandoned` 查看清单与原因，`--clear-abandoned [FILE]` 恢复派发。键是 `(路径, 内容哈希)`：**改好源文件即自动恢复**，无需人工清理。`--terminal-failed` 列出耗尽尝试预算的作业，`--close-terminal-failed` 把其中**源已入账**的标记为 superseded（源未入账的会保留，因为那才是真正未完成的工作）。
 6. **周期治理**：`python cli.py review` 处理冲突与候选队列，`python cli.py doctor` 检查运行健康度。
 
+### 显式当前版本重评（限定60份）
+
+`recompile-ingest` 是本地操作者入口，**不是**普通 `sync` 的新扫描策略，也不是认证或 OS 隔离边界。它只接受冻结78项清单中的39份证据缺口与21份隔离资料；18份有效拒收不得纳入。两个输入文件均须提供 SHA-256，源文件的 SHA-256、MD5、大小与 mtime 必须仍匹配清单。
+
+```bash
+python cli.py recompile-ingest --plan <frozen-plan.json> --plan-sha256 <digest> --approval <read-approval.json> --approval-sha256 <digest>
+# 上述只验证，不登记或派发；实际交接再显式增加 --apply --batch-size 1。
+```
+
+读取批准文件的结构为 `{"version":1,"request_id":"<unique-id>","plan_sha256":"<digest>","read_scope":"public_only","entries":[...]}`。`entries` 必须恰好覆盖60份；每项含 `filepath`、当前 `sha256`、`classification:"public"` 和 `classification_evidence`（12–1000字符）。**不能由目录、domain、URL或程序默认值替操作者填充公开性证明**；未知/私人资料不被这个入口接收，SHA-256也只绑定批准制品，不证明其分类主张。当前入口不提供私人资料的隔离授权模式。
+
+交接复用原生任务包、单实例Runner、claim/lease及 `finalize_ingest`；使用独立 `ingest_recompile` 作业类型，旧Runner不会把它领取后按duplicate关闭。只有持久请求、白名单、当前字节与租约全部匹配，才允许本次任务不走C1重复关闭；普通作业的去重不变。Canonical Source命名冲突、其他活跃/待处理任务、新出现的当前版本完成回执、旧账本漂移或不明/共享Source归属均会阻断交接。模型只读取任务目录中的已校验只读源快照，不再打开可变化的原raw；只读属性/工作目录不构成OS安全沙箱。快照在真实finalization后清理，未完成任务的快照保留供恢复。模型不获得混合Wiki候选或私人purpose正文，只能按当前源独立编译或给出真实来源拒收；非Source页保持原生create-only规则。
+
+旧jobs/result_json保留；仅真实finalization才更新processed_files。请求登记的`completed`只是授权记录，**不是模型完成或出版回执**；输出`DISPATCHED_NOT_COMPLETE`也不是完成。新回执另记录request、批准制品及当前SHA-256绑定。失败作业只能通过同一显式入口重交接，保留失败次数与等待时间；更换request_id不会重置同内容的确定性失败预算。先交接1份并验证真实出版/拒收回执，才继续余下对象。新代码须按上文空闲窗口规范加载到常驻Runner；磁盘修改或派发成功不证明新服务已激活。
+
+经操作者明确决定，可用 `--defer-filepath <approved-raw> --defer-sha256 <digest>` 延后一份归属不明的对象，再沿原入口交接其他对象。这不覆盖、改绑或读取该旧Source，不移除60份冻结白名单中的成员，也不改写拒收与处理账本。延后要求当前指纹匹配、没有未完成原生作业，且确实命中归属未证明的门；同一请求仅允许一份，持久记录单列为 `ingest_recompile_deferral`。其 `completed` 只表示延后登记，**不是来源重评完成**；登记后按固定幂等标识校验完整绑定，撤销或损坏必须阻断，旧参数不得复活或换对象，本入口不提供解除延后。交接结果另返回 `deferred` 数量，该对象不能进入模型或finalizer。
+
 历史版本的逐项特性说明不再在本文件维护；版本变更请查 `CHANGELOG.md`，运行契约以本节与上方“已知限制”表为准。
 
 ## Operational Memory
@@ -357,6 +397,15 @@ Windows 常驻入口为计划任务 **`VectorLake-Watchdog`**，执行 `scripts/
 
 包的每行形如 `- [rel 211.6 | mem 0.70 | active] <正文>`：`rel` 为查询相关性分，`mem` 为用于裁决平局的存储分。
 
+## CI Backend & Platform Gates
+
+`.github/workflows/test.yml` 配置 Windows／Ubuntu × `native`／`fallback` × Python 3.10／3.13 八个 job，最多并发两个、每 job 25 分钟；仅授予 contents read，不保存 checkout 凭证。配置存在不等于具体发布提交的远端八个组合已通过。
+
+* `native`：CI 专用清单固定构建工具 maturin 1.15.0 与官方 PyPI x86_64 wheel SHA-256；Python < 3.11 的必需依赖 tomli 2.3.0 单列 marker 与官方 pure-Python wheel 哈希，不依赖偶然传递安装。不增加应用运行时依赖，不升级宿主安装。`scripts/ci_core.py build` 使用 release／locked、全新任务目录构建并提取 wheel，记录构建前后 crate 输入与 DLL／SO 哈希，不 pip install 项目原生模块。测试开始／结束均核验当前源码、任务内二进制、实际加载路径及 `indexer.HAVE_CORE`；缺失、过期、哈希错误或误用宿主模块均失败，不静默回退；任何后端校验前先使旧 probe 失效，失败不能遗留上次的成功回执。当前 checkout 的 graph／prepared PPR ABI 必须具备，不能把缺失 ABI 的 native-only 测试静默 skip。
+* `fallback`：测试进程在导入应用前阻止 `vector_lake_core` 导入，开始／结束确认 `HAVE_CORE=False` 且没有加载 core；这不表示 sqlite-vec／Tantivy／rjieba 等其他原生依赖也被禁用。两条路径均禁用自动 pytest 插件和字节码缓存（CLI 也显式关闭当前解释器写入），并使用隔离 bootstrap MEMORY、清除 provider key 与 DB override。fallback 明确跳过只测试原生 API 的模块，单列 skip／collection 差异，不把减少的用例数称为相同全量覆盖。
+* 可移植小图测试覆盖实际后端的直接／双向链接、来源／邻居证据、阈值与 NaN、零贡献桶。64 节点密集图把 `ci_core_*` 剪枝观测写入 probe JSON 与 stdout，并在两后端强制每节点最多 15 条 incident 边。core 0.2.2 修复旧版分离 source／target 计数和同权不稳定次序；Python 原生调用不再硬编码 50。新增 raw API 的 cap 0／1／2／5／15／64 与反向输入验证。同权小图边集合一致不是所有评分／证据归一化的 parity 证明；本次不改评分、舍入或证据资格规则。
+* 本地可用 `python scripts/ci_core.py build --output <全新任务目录> --offline --timeout 150`，再用 `python scripts/ci_core.py test --backend native --native-dir <构建目录> --receipt <任务内probe.json> -- -q` 或 `--backend fallback` 核验。online 构建只面向已授权的隔离 CI runner；本地验证不触发 hosted workflow、不安装到主环境、不读生产库。
+
 ## Storage Layout & Architecture
 
 Vector Lake uses a CQRS-like layout with canonical SQLite mutations and derived file/search projections.
@@ -364,6 +413,10 @@ Vector Lake uses a CQRS-like layout with canonical SQLite mutations and derived 
 * **Raw sources**: `raw/*` remains the original input.
 * **Markdown wiki**: `wiki/*.md` is the readable publication layer; edits enter the validated mutation path.
 * **Canonical database**: `vector_lake.db` stores entities, claims, graph edges and operational memory. Search indexes and files are derived projections.
+* **SQLite write-lock scope**: 增量索引的读取、分词、图计算、JSON 发布与 claim graph 构建在全局 SQLite 写事务外执行，仍由共享 index 文件锁串行化。该批次的 FTS 修改和旧向量作废共用短事务；提交后才发布文件并刷新 page projection。文件发布失败会向调用方抛出，outbox 保留重试意图；衍生投影可能暂时部分更新，不能把 SQL 提交当作投影完成。索引入口拒绝外层 SQLite 事务，避免 SQLite → index 锁序倒置。写锁竞争诊断在 commit/rollback 释放锁后记录，不通过 `inspect.stack()` 读取源码；BEGIN 等待预算不包含业务 SQL、投影刷新或诊断持久化时间。全量 page projection、批量 SQL 与 best-effort Tantivy 镜像仍可能持有写锁，其成本另行优化；本改动不承诺消除全部写锁竞争。
+* **Projection refresh costs**: page projection 的 full refresh 仍核对所有节点的八列，并删除不在权威键集合中的行，但完全相同的行不再删除／重写；有变化的行沿用 `INSERT OR REPLACE`，不改成保持 rowid 的 UPSERT。行 JSON 与权威键列表在写事务外准备；边 digest、边刷新、状态戳、partial fallback 与缓存失效保持原路径。返回字段 `nodes_written` 保留历史含义（本次准备／处理的行数），不代表实际被 SQLite 修改的行数。此优化降低写放大，不取消全量节点比较／序列化、边摘要或现有跨事务部分发布边界。
+* **Projection health costs**: `projection_registry.status()` 内，同一 connection 的成功 compound COUNT／anti-join 只执行一次，计数仅在该同步调用内共享，结束或异常后丢弃；嵌套调用与并发 context 独立，直接 health／reconcile 在普通独立调用中仍重新读取。失败仍显式报告 degraded，不转换为 no-data／healthy。它不是跨请求健康缓存，也不是覆盖全部投影的一致性数据库快照；不跳过 `runtime_health` 的目录、canonical、JSON 或深度检查。
+* **Graph candidate costs**: Python／Rust 只在保守的、按原评分括号顺序计算且按各后端规则舍入的亲和度上界仍低于入边阈值时，跳过零权邻居桶与零权来源桶；直接链接、非零贡献、可达阈值的亲和度，以及非有限／负乘数／溢出的回退路径保留。Rust 对存在未列入 `links` 的显式 triple 的两个端点禁用此优化，保留原生路径借共享桶计分的既有行为。不截断候选、不改评分／舍入／prune；真实密集证据仍可能二次方展开。两后端既有评分／截断与原生同权边排序差异不在此处宣称修复，保真验证分别对照各自冻结实现；原生全资格集合的对照使用 cap ≥ 节点数，不冒充同权截断结果的确定性证明。
 * **Concurrency & Atomicity**: 多页变更经 `MutationCoordinator` 在单个 `BEGIN IMMEDIATE` 事务内提交 canonical 状态与 `mutation_outbox` 意图，再物化为 Markdown 投影；事务失败整体回滚，投影失败由 outbox 重试。**Wiki 页面本身没有自动 `*.bak` 备份**——删除类命令（`gc` / `delete`）会先写恢复点目录（`backup/gc/`、`backup/delete-source/`），其余写入依赖 canonical 状态重建。数据库副本写在 `.meta/backups/`（`vector_lake_<ts>.db.bak` 及 `-wal` / `-shm` sidecar），其总量由 `backup-retention` 约束。
 
 ```text
@@ -398,7 +451,7 @@ MEMORY/
 |**混合检索与时序**|`search_vector_lake` · `search_timeline` · `trace_vector_lake`|按已记录的模型与维度执行向量、FTS5 和 PPR 混合检索；时间线查询与事实溯源|
 |**推演上下文与记忆**|`preview_query_context` · `query_logic_lake` · `finalize_query_synthesis` · `update_operational_memory`|上下文预览、准备推演任务、核验提案页面与运行态记忆写入|
 |**知识治理与审查**|`review_governance_list` · `resolve_governance_item` · `get_governance_debt` · `trigger_audit_graph` · `merge_suggestions_vector_lake` · `check_duplicate_entity`|治理队列审阅与裁决、知识债务度量、拓扑审计、实体查重与候选合并|
-|**自愈体检与安全写入**|`lint_vector_lake` · `doctor_vector_lake` · `rename_entity` · `write_wiki_page` · `inspect_projections`|Schema 审计与修复、运行环境体检、实体重命名、单页安全写入和派生投影巡检|
+|**自愈体检与安全写入**|`lint_vector_lake` · `doctor_vector_lake` · `runtime_identity` · `rename_entity` · `write_wiki_page` · `inspect_projections`|Schema 审计与修复、运行环境体检、当前进程身份观察、实体重命名、单页安全写入和派生投影巡检|
 |**拓扑可视化**|`visualize_vector_lake`|3D HTML 知识拓扑交互仪表盘|
 
 基础体检：
@@ -622,7 +675,8 @@ Codex 要求 `exec` 的输出 schema/最终消息/ephemeral 参数及工具禁�
 * `VECTOR_LAKE_EMBEDDING_RPM` / `VECTOR_LAKE_EMBEDDING_TPM`：embedding 调度限额，默认分别为 `3000` 和 `1000000`。
 * `VECTOR_LAKE_EMBEDDING_UTILIZATION`：安全水位，默认 `0.8`，即按 2400 RPM / 800k TPM 调度。
 * `VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS` / `VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS`：单批条数与 token 上限，默认 `100` / `200000`。
-* `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
+* `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒，两种传输都按此配置。带 caller budget 时，每次请求只使用剩余预算与该配置的较小值，不再将 REST 的小预算抬至 1 秒。SDK 内部重试设为一次尝试，由调度器统一负责配额分类及有界重试。
+* `embed_texts(..., budget_seconds=...)` 从输入准备及 client 获取前建立单一 monotonic deadline；限流、请求、重试和响应验证共享它。逾期结果不会返回给调用方／写入向量，过期后也不启动新的 provider attempt。它是**协作式 deadline，不是硬墙钟取消**：同步 SDK 初始化、client／SQLite 锁等待、DNS 和持续传输下的 socket inactivity timeout 仍可能超过总预算，结束后才会检查并拒收；不创建无法终止的后台 timeout worker。backfill 的预算仍按 batch 计算，不包含批次前 setup、批次后的数据库发布及整轮多个 batch；不据此承诺整轮或 MCP 请求的硬上限。
 * `VECTOR_LAKE_EMBEDDING_TRANSPORT`：embedding 传输层，默认 `rest`（直接 `batchEmbedContents`），可选 `sdk`（走 `google-genai`）。两条路径使用配置的模型与维度；不要把历史样本的向量一致性当作生产验收。默认 `rest` 不导入 `google.genai`，不构造 SDK client（下面的 `VECTOR_LAKE_EMBEDDING_PREWARM` 也只对 `sdk` 有意义）。
 * `VECTOR_LAKE_EMBEDDING_PREWARM=off`：关闭 MCP server 启动时的 embedding 客户端预热——**仅对 `sdk` 传输有意义**；`rest` 路径从不构造 client，预热线程会被直接跳过。
 * `VECTOR_LAKE_TOKENIZER`：目前只有一个合法值 `rjieba`（保留该开关是为了让已有的环境配置显式表达意图）；写别的值会告警并走自动选择。安装了 rjieba 就用它，反之分词为 `unavailable`（CJK 全文匹配下降，doctor 会报出）。

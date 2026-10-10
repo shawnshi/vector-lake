@@ -100,7 +100,7 @@ def test_the_cap_has_one_owner():
 
 @pytest.mark.parametrize(
     "branch_reason",
-    ["unusable task packet", "rejection could not be finalized", "model seam", "finalize rejected"],
+    ["unusable task packet", "dispatch validation failed", "rejection could not be finalized", "model seam", "finalize rejected"],
 )
 def test_content_failure_branches_have_bounded_budget_recorders(branch_reason):
     """Content/packet failures spend source budget; backend/host faults must not."""
@@ -110,8 +110,9 @@ def test_content_failure_branches_have_bounded_budget_recorders(branch_reason):
         encoding="utf-8"
     )
     assert f'f"{branch_reason}' in source, branch_reason
-    # Packet, source drift and two finalizer rejection branches, not runtime faults.
-    assert source.count("record_ingest_failure(") == 4
+    # Packet/explicit dispatch validation, source drift and finalizer rejection;
+    # OS/backend/host runtime faults do not spend this budget.
+    assert source.count("record_ingest_failure(") == 5
 
 
 def test_a_transient_failure_does_not_spend_the_attempt_budget(isolated_memory):

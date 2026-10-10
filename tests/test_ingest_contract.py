@@ -784,10 +784,10 @@ def test_integration_uses_canonical_outbox_snapshot_when_markdown_projection_is_
     real_materialize = mutation_coordinator.materialize_markdown_projection
     fail_projection = True
 
-    def fail_once_for_target(filename, mutation_type, payload_text=None, validation_mode="full"):
+    def fail_once_for_target(filename, mutation_type, payload_text=None, validation_mode="full", **kwargs):
         if fail_projection and filename == "Concept_Target.md":
             raise OSError("injected projection failure")
-        return real_materialize(filename, mutation_type, payload_text, validation_mode)
+        return real_materialize(filename, mutation_type, payload_text, validation_mode, **kwargs)
 
     monkeypatch.setattr(
         mutation_coordinator,

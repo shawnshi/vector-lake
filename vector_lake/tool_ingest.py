@@ -102,6 +102,7 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
         # attempt, so cycle caps and healthy work behind a damaged packet remain visible.
         tasks.append({
             "job_id": row.get("job_id"),
+            "task_type": row.get("task_type"),
             "status": row.get("status"),
             "created_at": row.get("created_at"),
             "lease_until": row.get("lease_until"),
@@ -964,7 +965,7 @@ def _updated_now(content: str) -> str:
 
 def _read_canonical_target_content(filename: str, expected_version: str) -> str:
     """Read Markdown whose extracted entity state matches the canonical version."""
-    from vector_lake.db_store import get_connection, init_db
+    from vector_lake.db_store import get_connection, init_db, mutation_outbox_revision_order
 
     candidates = []
     target_path = get_wiki_dir() / filename
@@ -974,7 +975,7 @@ def _read_canonical_target_content(filename: str, expected_version: str) -> str:
     rows = get_connection().execute(
         "SELECT payload_text FROM mutation_outbox "
         "WHERE filename = ? AND mutation_type = 'update' AND payload_text IS NOT NULL "
-        "ORDER BY id DESC LIMIT 20",
+        "ORDER BY " + mutation_outbox_revision_order() + " LIMIT 20",
         (filename,),
     ).fetchall()
     candidates.extend(("mutation outbox", str(row["payload_text"])) for row in rows)
@@ -1297,6 +1298,7 @@ def _build_ingest_instructions(
     file_hash: str,
     canonical_name: str,
     index_context: str | None = None,
+    *, purpose_context: str | None = None, source_read_path: str | None = None,
 ) -> str:
     schema_content = ""
     try:
@@ -1311,10 +1313,11 @@ def _build_ingest_instructions(
     return render_template(
         "prompts/ingest/main.md", root=root, runtime_schema=render_schema_contract(runtime, root=root),
         max_tags=runtime["max_tags"],
-        filepath=str(filepath), file_hash=file_hash, canonical_name=canonical_name,
-        skeleton_block=parse_static_skeleton(filepath), schema_content=schema_content,
+        filepath=str(source_read_path or filepath), file_hash=file_hash, canonical_name=canonical_name,
+        skeleton_block=parse_static_skeleton(source_read_path or filepath), schema_content=schema_content,
         index_summary=_read_relevant_index_context(filepath) if index_context is None else index_context,
-        purpose_content=_read_purpose(), valid_predicates=", ".join(runtime["page_predicates"]),
+        purpose_content=_read_purpose() if purpose_context is None else purpose_context,
+        valid_predicates=", ".join(runtime["page_predicates"]),
         integration_predicates=", ".join(runtime["integration_predicates"]),
         event_tags=", ".join(runtime["event_tags"]),
         timeline_tags=", ".join(f"[{tag}]" for tag in runtime["event_tags"]),
@@ -1954,6 +1957,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         lease_token = str(processed_data.get("lease_token") or "")
         lease_generation = int(processed_data.get("lease_generation"))
         files, integration_disposition = _apply_integration_disposition(files, processed_data)
+        recompile = (job_row.get("parsed_payload") or {}).get("controlled_recompile")
         contract = load_purpose_contract()
         node_records = validate_ingest_payload(files, contract)
                 
@@ -2019,32 +2023,47 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             from vector_lake.mutation_coordinator import execute_mutation_batch
 
             def mark_ingest_processed():
+                if recompile:
+                    # Own Source mutation has now changed its version; the precondition
+                    # checked the old version under this same write transaction.
+                    validate_ingest_job_finalization(str(job_id), processed_data, check_source_version=False)
                 mark_file_processed(filepath, file_hash, **snapshot)
                 finalize_ingest_job(
                     str(job_id),
                     lease_owner,
                     lease_token,
                     lease_generation,
-                    result_data={"integration": processed_data.get("integration")},
+                    result_data={"integration": processed_data.get("integration"),
+                                 **({"controlled_recompile": recompile} if recompile else {})},
                 )
 
             execute_mutation_batch(
                 mutations,
                 canonical_callback=mark_ingest_processed,
+                **({"canonical_precondition": lambda: validate_ingest_job_finalization(str(job_id), processed_data)} if recompile else {}),
             )
         else:
             from vector_lake.db_store import transaction
 
             with transaction():
+                if recompile:
+                    validate_ingest_job_finalization(str(job_id), processed_data)
                 mark_file_processed(filepath, file_hash, **snapshot)
                 finalize_ingest_job(
                     str(job_id),
                     lease_owner,
                     lease_token,
                     lease_generation,
-                    result_data={"integration": processed_data.get("integration")},
+                    result_data={"integration": processed_data.get("integration"),
+                                 **({"controlled_recompile": recompile} if recompile else {})},
                 )
 
+        if recompile:
+            from vector_lake.controlled_recompile import remove_source_snapshot
+            try:
+                remove_source_snapshot(job_row["parsed_payload"]["source_read_path"])
+            except (OSError, ValueError) as exc:
+                log.warning("Ingest finalized, but source snapshot cleanup failed: %s", type(exc).__name__)
         task_packet_path = job_row.get("task_packet_path") if job_row else None
         if task_packet_path:
             try:

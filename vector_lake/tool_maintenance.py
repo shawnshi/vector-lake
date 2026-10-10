@@ -86,8 +86,11 @@ def backup_retention_report(keep: int = 0, max_bytes: int = 0, dry_run: bool = T
             "  unrecognised, never pruned: " + ", ".join(result["unrecognized"])
         )
 
+    for entry in result["protected"]:
+        lines.append(f"  PROTECTED  {entry['name']}: {entry['reason']}")
+
     if not result["remove"]:
-        lines.append("Nothing to remove: the backup tree is inside the bound.")
+        lines.append("Nothing to remove: no verified backup exceeds the bound.")
     elif result["dry_run"]:
         lines.append(
             f"[DRY RUN] {len(result['remove'])} entr(ies) would be removed, freeing "
@@ -96,7 +99,7 @@ def backup_retention_report(keep: int = 0, max_bytes: int = 0, dry_run: bool = T
     else:
         lines.append(
             f"[APPLIED] Removed {len(result['deleted'])} entr(ies), freeing "
-            f"{_gib(result['removable_bytes'])}. The newest copy is always kept."
+            f"{_gib(result['deleted_bytes'])} in completed units. The newest verified copy is always kept."
         )
         for name in result["deleted"]:
             lines.append(f"  deleted: {name}")

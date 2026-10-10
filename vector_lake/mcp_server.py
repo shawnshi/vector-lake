@@ -467,6 +467,17 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     return tools.delete_source(raw_path, dry_run=dry_run)
 
 @mcp.tool()
+def runtime_identity() -> str:
+    """Observe this server process: selected loaded code, current source, checkout and core origin.
+
+    Read-only: no DB access, module reload, service restart or production-acceptance approval.
+    """
+    import json
+    from vector_lake.runtime_identity import runtime_identity as observe
+    return json.dumps(observe(), ensure_ascii=False)
+
+
+@mcp.tool()
 def doctor_vector_lake() -> str:
     """Validate runtime dependencies and filesystem layout health."""
     return tools.doctor_vector_lake()

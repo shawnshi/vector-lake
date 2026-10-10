@@ -6,6 +6,7 @@ import random
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -158,10 +159,20 @@ def _record_lock_contention(attempts: int, budget_seconds: float, waited_seconds
         except (OSError, json.JSONDecodeError):
             payload = {}
         caller = "unknown"
-        for frame in inspect.stack()[2:]:
-            if frame.function not in {"_record_lock_contention", "_acquire_write_lock", "transaction"}:
-                caller = frame.function
-                break
+        # Walking live frames does not load source files/linecache like inspect.stack().
+        frame = inspect.currentframe()
+        try:
+            while frame is not None:
+                name = frame.f_code.co_name
+                if name not in {
+                    "_record_lock_contention", "_acquire_write_lock", "transaction",
+                    "__enter__", "__exit__",
+                }:
+                    caller = name
+                    break
+                frame = frame.f_back
+        finally:
+            del frame  # Do not retain a reference cycle through the current frame.
         entry = {
             "at": datetime.now(timezone.utc).isoformat(),
             "outcome": outcome,
@@ -179,39 +190,42 @@ def _record_lock_contention(attempts: int, budget_seconds: float, waited_seconds
         log.warning("Could not record write-lock contention: %s", exc)
 
 
-def _acquire_write_lock(conn: sqlite3.Connection) -> None:
+def _acquire_write_lock(conn: sqlite3.Connection) -> tuple[int, float, float, str] | None:
     """Take the write lock, or raise :class:`DatabaseLockTimeout` inside the budget."""
     started = time.monotonic()
     deadline = started + BEGIN_LOCK_BUDGET_SECONDS
     last_error: sqlite3.OperationalError | None = None
     attempts = 0
     acquired = False
-    while attempts < BEGIN_LOCK_MAX_ATTEMPTS:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        attempts += 1
-        _arm_busy_timeout(conn, remaining)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            acquired = True
-            break
-        except sqlite3.OperationalError as exc:
-            if not _is_lock_error(exc):
-                raise
-            last_error = exc
+    try:
+        while attempts < BEGIN_LOCK_MAX_ATTEMPTS:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            # Jittered exponential backoff, never past the remaining budget.
-            time.sleep(min(remaining, 0.1 * (2 ** (attempts - 1)) * (0.5 + random.random())))
-    # Whatever happened, hand the connection back its default patience.
-    _arm_busy_timeout(conn, DB_BUSY_TIMEOUT_MS / 1000.0)
+            attempts += 1
+            _arm_busy_timeout(conn, remaining)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                acquired = True
+                break
+            except sqlite3.OperationalError as exc:
+                if not _is_lock_error(exc):
+                    raise
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Jittered exponential backoff, never past the remaining budget.
+                time.sleep(min(remaining, 0.1 * (2 ** (attempts - 1)) * (0.5 + random.random())))
+    finally:
+        # Restore default patience even on a non-contention error or cancellation.
+        _arm_busy_timeout(conn, DB_BUSY_TIMEOUT_MS / 1000.0)
     waited = time.monotonic() - started
     if acquired:
         if attempts > 1:
-            _record_lock_contention(attempts, BEGIN_LOCK_BUDGET_SECONDS, waited, "acquired-after-retry")
-        return
+            # The transaction owner emits telemetry only after commit/rollback.
+            return (attempts, BEGIN_LOCK_BUDGET_SECONDS, waited, "acquired-after-retry")
+        return None
     _record_lock_contention(attempts, BEGIN_LOCK_BUDGET_SECONDS, waited, "timed-out")
     log.error(
         "Could not acquire the Vector Lake write lock within %.0fs (%d attempt(s)); "
@@ -227,13 +241,35 @@ def _acquire_write_lock(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
+def read_snapshot():
+    """Use one WAL read generation without acquiring the database writer lock.
+
+    The snapshot must settle before any later write transaction. Refuse nesting
+    rather than committing a caller's transaction, and reject accidental writes.
+    """
+    conn = get_connection()
+    if in_write_transaction():
+        raise RuntimeError("Read snapshot must start outside a SQLite transaction")
+    query_only = conn.execute("PRAGMA query_only").fetchone()[0]
+    conn.execute("PRAGMA query_only = ON")
+    try:
+        conn.execute("BEGIN DEFERRED")
+        yield conn
+    finally:
+        try:
+            conn.rollback()
+        finally:
+            conn.execute("PRAGMA query_only = ON" if query_only else "PRAGMA query_only = OFF")
+
+
+@contextmanager
 def transaction():
     conn = get_connection()
     if getattr(_LOCAL, "in_transaction", False):
         yield conn
         return
 
-    _acquire_write_lock(conn)
+    contention = _acquire_write_lock(conn)
     _LOCAL.in_transaction = True
     try:
         yield conn
@@ -250,6 +286,8 @@ def transaction():
         raise
     finally:
         _LOCAL.in_transaction = False
+        if contention is not None and not conn.in_transaction:
+            _record_lock_contention(*contention)
 
 # --- operational memory search projection -----------------------------------
 #
@@ -1781,6 +1819,7 @@ def _init_db_once(db_key: str):
             "CREATE INDEX IF NOT EXISTS idx_mutation_outbox_ready "
             "ON mutation_outbox(status, available_at, lease_until, id)"
         )
+        _migrate_outbox_fencing(conn)
         # The unique idempotency index is defence-in-depth on top of the SELECT
         # performed by enqueue_mutation().  A database written by an earlier
         # release can already hold duplicate keys, and failing here would make
@@ -2478,131 +2517,206 @@ def enqueue_mutations_batch(items: list[dict]) -> list[int]:
     ]
 
 
-def enqueue_mutation(
-    filename: str,
-    mutation_type: str,
-    payload_text: str | None = None,
-    idempotency_key: str | None = None,
-    validation_mode: str = "full",
-) -> int:
+def in_write_transaction() -> bool:
+    conn = getattr(_LOCAL, "conn", None)
+    return bool(getattr(_LOCAL, "in_transaction", False) or (conn is not None and conn.in_transaction))
+
+
+_OUTBOX_FENCING_COLUMNS = {
+    "lease_owner": "TEXT", "lease_token": "TEXT", "lease_generation": "INTEGER DEFAULT 0",
+    "projection_generation": "INTEGER DEFAULT 0", "base_version": "TEXT", "superseded_by": "INTEGER",
+}
+_OUTBOX_REVISION_INDEX = "idx_mutation_outbox_filename_generation"
+
+
+class MutationClaimLost(RuntimeError):
+    """The supplied outbox capability no longer owns a live processing lease."""
+
+
+class MutationSuperseded(MutationClaimLost):
+    """A newer per-page revision has replaced this intent."""
+
+
+def _migrate_outbox_fencing(conn):
+    columns = _table_columns(conn, "mutation_outbox")
+    for name, declaration in _OUTBOX_FENCING_COLUMNS.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE mutation_outbox ADD COLUMN {name} {declaration}")
+    conn.execute("UPDATE mutation_outbox SET projection_generation=id WHERE COALESCE(projection_generation,0)=0")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS {_OUTBOX_REVISION_INDEX} ON mutation_outbox(filename, projection_generation DESC, id DESC)")
+    conn.execute("UPDATE mutation_outbox SET status='pending', lease_until=NULL, lease_owner=NULL, lease_token=NULL "
+                 "WHERE status='processing' AND (lease_owner IS NULL OR lease_token IS NULL OR COALESCE(lease_generation,0)<=0)")
+    conn.execute("UPDATE mutation_outbox AS old SET status='superseded', lease_until=NULL, lease_owner=NULL, lease_token=NULL, "
+                 "superseded_by=(SELECT newer.id FROM mutation_outbox newer WHERE newer.filename IS old.filename "
+                 "ORDER BY newer.projection_generation DESC, newer.id DESC LIMIT 1) "
+                 "WHERE old.status IN ('pending','processing','failed') AND EXISTS "
+                 "(SELECT 1 FROM mutation_outbox newer WHERE newer.filename IS old.filename AND "
+                 "(newer.projection_generation>old.projection_generation OR "
+                 "(newer.projection_generation=old.projection_generation AND newer.id>old.id)))")
+
+
+def ensure_mutation_outbox_fencing():
+    """Upgrade writers only; a read-only snapshot never needs this protocol."""
+    init_db()
+    conn = get_connection()
+    if set(_OUTBOX_FENCING_COLUMNS) <= _table_columns(conn, "mutation_outbox") and _OUTBOX_REVISION_INDEX in _index_names(conn):
+        return
+    with transaction():
+        _migrate_outbox_fencing(conn)
+
+
+def mutation_outbox_revision_order() -> str:
+    """Read-only compatibility for archived databases predating the writer protocol."""
+    return "projection_generation DESC, id DESC" if "projection_generation" in _table_columns(get_connection(), "mutation_outbox") else "id DESC"
+
+
+def current_mutation_intent(outbox_id: int) -> dict:
+    row = get_connection().execute("SELECT * FROM mutation_outbox WHERE id=?", (outbox_id,)).fetchone()
+    if row is None:
+        raise MutationClaimLost("Outbox intent no longer exists")
+    latest = get_connection().execute("SELECT id,projection_generation FROM mutation_outbox WHERE filename IS ? "
+                                     "ORDER BY projection_generation DESC,id DESC LIMIT 1", (row["filename"],)).fetchone()
+    if row["status"] == "superseded" or latest["id"] != row["id"] or latest["projection_generation"] != row["projection_generation"]:
+        raise MutationSuperseded("Outbox intent has a newer per-page revision")
+    return dict(row)
+
+
+def validate_mutation_claim(claim: dict) -> dict:
+    try:
+        if any(isinstance(claim[name], (bool, float)) for name in ("id", "lease_generation", "projection_generation")):
+            raise ValueError("outbox identity fields must be integral")
+        outbox_id = int(claim["id"])
+        lease_generation = int(claim["lease_generation"])
+        revision = int(claim["projection_generation"])
+        owner, token = claim["lease_owner"], claim["lease_token"]
+        if min(outbox_id, lease_generation, revision) <= 0 or not isinstance(owner, str) or not owner or not isinstance(token, str) or not token:
+            raise ValueError("invalid capability")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MutationClaimLost("Incomplete outbox lease capability") from exc
+    row = current_mutation_intent(outbox_id)
+    if row["status"] != "processing" or row["lease_owner"] != owner or row["lease_token"] != token or row["lease_generation"] != lease_generation or row["projection_generation"] != revision:
+        raise MutationClaimLost("Outbox processing lease changed")
+    try:
+        deadline = datetime.fromisoformat(row["lease_until"])
+        if deadline <= datetime.now(timezone.utc):
+            raise MutationClaimLost("Outbox processing lease expired")
+    except (ValueError, TypeError) as exc:
+        raise MutationClaimLost("Outbox processing lease has an invalid deadline") from exc
+    return row
+
+
+def enqueue_mutation(filename: str, mutation_type: str, payload_text: str | None = None,
+                     idempotency_key: str | None = None, validation_mode: str = "full") -> int:
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("Outbox filename must be a nonempty string")
     if mutation_type not in {"update", "delete"}:
         raise ValueError(f"Unsupported mutation_type: {mutation_type}")
     if validation_mode not in {"full", "schema"}:
         raise ValueError(f"Unsupported validation_mode: {validation_mode}")
-    init_db()
+    ensure_mutation_outbox_fencing()
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     with transaction():
-        if idempotency_key:
-            existing = conn.execute(
-                "SELECT id, status FROM mutation_outbox WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if existing:
-                if existing["status"] in {"failed", "completed"}:
-                    conn.execute(
-                        "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
-                        "last_error = NULL, available_at = ?, lease_until = NULL, payload_text = ? WHERE id = ?",
-                        (now, payload_text, existing["id"]),
-                    )
-                return int(existing["id"])
-        cursor = conn.execute(
-            "INSERT INTO mutation_outbox "
-            "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
-            "idempotency_key, validation_mode) "
-            "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?)",
-            (filename, mutation_type, payload_text, now, now, idempotency_key, validation_mode),
-        )
-        return int(cursor.lastrowid)
+        existing = conn.execute("SELECT * FROM mutation_outbox WHERE idempotency_key=?", (idempotency_key,)).fetchone() if idempotency_key else None
+        if existing and (existing["filename"] != filename or existing["mutation_type"] != mutation_type):
+            raise ValueError("Idempotency key belongs to a different page or mutation type")
+        latest = conn.execute("SELECT id,projection_generation FROM mutation_outbox WHERE filename=? ORDER BY projection_generation DESC,id DESC LIMIT 1", (filename,)).fetchone()
+        if existing and existing["status"] in {"pending", "processing"} and latest["id"] == existing["id"]:
+            if existing["payload_text"] != payload_text or existing["validation_mode"] != validation_mode:
+                raise ValueError("Idempotency key has a different active payload or validation mode")
+            return int(existing["id"])
+        revision = conn.execute("SELECT COALESCE(MAX(projection_generation),0)+1 FROM mutation_outbox WHERE filename=?", (filename,)).fetchone()[0]
+        if existing:
+            outbox_id = int(existing["id"])
+            conn.execute("UPDATE mutation_outbox SET status='pending', attempt_count=0, last_error=NULL, available_at=?, "
+                         "started_at=NULL,completed_at=NULL,lease_until=NULL,lease_owner=NULL,lease_token=NULL, "
+                         "payload_text=?,validation_mode=?,projection_generation=?,base_version=NULL,superseded_by=NULL WHERE id=?",
+                         (now, payload_text, validation_mode, revision, outbox_id))
+        else:
+            cursor = conn.execute("INSERT INTO mutation_outbox (filename,mutation_type,payload_text,status,attempt_count,created_at,available_at,idempotency_key,validation_mode,projection_generation) "
+                                  "VALUES (?,?,?,'pending',0,?,?,?,?,?)", (filename, mutation_type, payload_text, now, now, idempotency_key, validation_mode, revision))
+            outbox_id = int(cursor.lastrowid)
+        conn.execute("UPDATE mutation_outbox SET status='superseded',superseded_by=?,lease_until=NULL,lease_owner=NULL,lease_token=NULL "
+                     "WHERE filename=? AND id<>? AND status IN ('pending','processing','failed') AND projection_generation<?",
+                     (outbox_id, filename, outbox_id, revision))
+        return outbox_id
 
 
-def is_managed_projection_state(
-    filename: str,
-    mutation_type: str,
-    payload_text: str | None = None,
-) -> bool:
-    """Return whether a filesystem event matches the latest durable projection intent."""
+def bind_mutation_versions(outbox_ids: list[int], versions: dict[str, str]):
+    """Bind inside the canonical transaction, after its callback has settled."""
+    conn = get_connection()
+    for outbox_id in outbox_ids:
+        row = conn.execute("SELECT filename,mutation_type FROM mutation_outbox WHERE id=?", (outbox_id,)).fetchone()
+        page_key = Path(row["filename"]).stem
+        version = versions.get(page_key, "")
+        if row["mutation_type"] == "delete" and version:
+            raise ValueError("Delete intent still has canonical page state")
+        conn.execute("UPDATE mutation_outbox SET base_version=?, lease_generation=COALESCE(lease_generation,0)+CASE WHEN status='processing' THEN 1 ELSE 0 END, "
+                     "status='pending',attempt_count=0,lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE id=?", (version, outbox_id))
+
+
+def is_managed_projection_state(filename: str, mutation_type: str, payload_text: str | None = None) -> bool:
     init_db()
-    row = get_connection().execute(
-        "SELECT mutation_type, payload_text FROM mutation_outbox "
-        "WHERE filename = ? ORDER BY id DESC LIMIT 1",
-        (str(filename),),
-    ).fetchone()
-    if row is None or str(row["mutation_type"]) != str(mutation_type):
-        return False
-    if mutation_type == "delete":
-        return True
-    return row["payload_text"] == payload_text
+    row = get_connection().execute("SELECT mutation_type,payload_text FROM mutation_outbox WHERE filename=? ORDER BY "
+                                  + mutation_outbox_revision_order() + " LIMIT 1", (str(filename),)).fetchone()
+    return row is not None and row["mutation_type"] == mutation_type and (mutation_type == "delete" or row["payload_text"] == payload_text)
 
 
-def claim_mutation_outbox(limit: int = 50, lease_seconds: int = 120) -> list[dict]:
-    """Atomically claim ready rows, including abandoned processing leases."""
-    init_db()
+def claim_mutation_outbox(limit: int = 50, lease_seconds: int = 120, *, lease_owner: str | None = None) -> list[dict]:
+    ensure_mutation_outbox_fencing()
     conn = get_connection()
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     lease_until = (now_dt + timedelta(seconds=max(1, lease_seconds))).isoformat()
+    owner = lease_owner or f"{os.getpid()}:{uuid.uuid4().hex}"
     with transaction():
-        rows = conn.execute(
-            "SELECT id FROM mutation_outbox WHERE "
-            "(status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) OR "
-            "(status = 'processing' AND COALESCE(lease_until, '') <= ?) "
-            "ORDER BY id ASC LIMIT ?",
-            (now, now, max(1, int(limit))),
-        ).fetchall()
-        ids = [int(row["id"]) for row in rows]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE mutation_outbox SET status = 'processing', "
-            f"attempt_count = COALESCE(attempt_count, 0) + 1, started_at = ?, "
-            f"lease_until = ? WHERE id IN ({placeholders})",
-            [now, lease_until, *ids],
-        )
-        claimed = conn.execute(
-            f"SELECT * FROM mutation_outbox WHERE id IN ({placeholders}) ORDER BY id ASC",
-            ids,
-        ).fetchall()
-        return [dict(row) for row in claimed]
+        rows = conn.execute("SELECT old.id FROM mutation_outbox old WHERE ((status='pending' AND COALESCE(available_at,created_at,'')<=?) "
+                            "OR (status='processing' AND (julianday(lease_until) IS NULL OR julianday(lease_until)<=julianday(?)))) "
+                            "AND NOT EXISTS (SELECT 1 FROM mutation_outbox newer WHERE newer.filename IS old.filename AND "
+                            "(newer.projection_generation>old.projection_generation OR (newer.projection_generation=old.projection_generation AND newer.id>old.id))) "
+                            "ORDER BY old.id LIMIT ?", (now, now, max(1, int(limit)))).fetchall()
+        claimed = []
+        for row in rows:
+            conn.execute("UPDATE mutation_outbox SET status='processing',attempt_count=COALESCE(attempt_count,0)+1,started_at=?,lease_until=?, "
+                         "lease_owner=?,lease_token=?,lease_generation=COALESCE(lease_generation,0)+1 WHERE id=?",
+                         (now, lease_until, owner, uuid.uuid4().hex, row["id"]))
+            claimed.append(dict(conn.execute("SELECT * FROM mutation_outbox WHERE id=?", (row["id"],)).fetchone()))
+        return claimed
 
 
-def complete_mutation_outbox(outbox_id: int):
+def complete_mutation_outbox(outbox_id: int, *, claim: dict):
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
     with transaction():
-        conn.execute(
-            "UPDATE mutation_outbox SET status = 'completed', completed_at = ?, "
-            "lease_until = NULL, last_error = NULL WHERE id = ?",
-            (now, outbox_id),
-        )
+        row = validate_mutation_claim(claim)
+        if row["id"] != outbox_id:
+            raise MutationClaimLost("Claim addresses a different outbox intent")
+        now = datetime.now(timezone.utc).isoformat()
+        changed = conn.execute("UPDATE mutation_outbox SET status='completed',completed_at=?,lease_until=NULL,last_error=NULL "
+                               "WHERE id=? AND status='processing' AND lease_owner=? AND lease_token=? AND lease_generation=? "
+                               "AND projection_generation=? AND lease_until>?",
+                               (now, outbox_id, row["lease_owner"], row["lease_token"], row["lease_generation"], row["projection_generation"], now)).rowcount
+        if changed != 1:
+            raise MutationClaimLost("Outbox completion lost its processing lease")
 
 
-def fail_mutation_outbox(
-    outbox_id: int,
-    error: str,
-    max_attempts: int = 3,
-    backoff_base: float = 2.0,
-) -> str:
+def fail_mutation_outbox(outbox_id: int, error: str, max_attempts: int = 3, backoff_base: float = 2.0, *, claim: dict) -> str:
     conn = get_connection()
-    row = conn.execute(
-        "SELECT attempt_count FROM mutation_outbox WHERE id = ?",
-        (outbox_id,),
-    ).fetchone()
-    if row is None:
-        raise KeyError(f"Unknown mutation_outbox id: {outbox_id}")
-    attempts = int(row["attempt_count"] or 0)
-    now_dt = datetime.now(timezone.utc)
-    terminal = attempts >= max(1, int(max_attempts))
-    status = "failed" if terminal else "pending"
-    delay_seconds = 0.0 if terminal else max(0.0, float(backoff_base)) * (2 ** max(0, attempts - 1))
-    available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
     with transaction():
-        conn.execute(
-            "UPDATE mutation_outbox SET status = ?, last_error = ?, available_at = ?, "
-            "lease_until = NULL WHERE id = ?",
-            (status, str(error)[:4000], available_at, outbox_id),
-        )
+        row = validate_mutation_claim(claim)
+        if row["id"] != outbox_id:
+            raise MutationClaimLost("Claim addresses a different outbox intent")
+        attempts = int(row["attempt_count"] or 0)
+        now_dt = datetime.now(timezone.utc)
+        terminal = attempts >= max(1, int(max_attempts))
+        status = "failed" if terminal else "pending"
+        delay = 0.0 if terminal else max(0.0, float(backoff_base)) * (2 ** max(0, attempts - 1))
+        available_at = (now_dt + timedelta(seconds=delay)).isoformat()
+        changed = conn.execute("UPDATE mutation_outbox SET status=?,last_error=?,available_at=?,lease_until=NULL,lease_owner=NULL,lease_token=NULL "
+                               "WHERE id=? AND status='processing' AND lease_owner=? AND lease_token=? AND lease_generation=? "
+                               "AND projection_generation=? AND lease_until>?",
+                               (status, str(error)[:4000], available_at, outbox_id, row["lease_owner"], row["lease_token"], row["lease_generation"], row["projection_generation"], now_dt.isoformat())).rowcount
+        if changed != 1:
+            raise MutationClaimLost("Outbox failure report lost its processing lease")
     return status
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
@@ -2909,7 +3023,7 @@ def claim_pending_jobs(limit: int = 10, lease_seconds: int = 300) -> list[dict]:
     lease_until = (now_dt + timedelta(seconds=max(1, lease_seconds))).isoformat()
     with transaction():
         rows = conn.execute(
-            "SELECT job_id FROM jobs WHERE "
+            "SELECT job_id FROM jobs WHERE task_type != 'ingest_recompile' AND "
             "((status IN ('queued', 'failed') AND retries < ? AND COALESCE(available_at, created_at, '') <= ?) "
             "OR (status = 'dispatched' AND COALESCE(lease_until, '') <= ?)) "
             "ORDER BY created_at ASC LIMIT ?",
@@ -3022,7 +3136,7 @@ def claim_subagent_jobs(
     )
     with transaction():
         rows = conn.execute(
-            "SELECT job_id FROM jobs WHERE task_type = 'ingest' AND "
+            "SELECT job_id FROM jobs WHERE task_type IN ('ingest', 'ingest_recompile') AND "
             "(status = 'awaiting_subagent' OR "
             "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?)) "
             "ORDER BY created_at ASC LIMIT ?",
@@ -3054,13 +3168,13 @@ def ingest_tasks_ready() -> bool:
     """Cheap read-only availability probe; never claim, refresh or bypass a lease."""
     now = datetime.now(timezone.utc).isoformat()
     return get_connection().execute(
-        "SELECT 1 FROM jobs WHERE task_type = 'ingest' AND "
+        "SELECT 1 FROM jobs WHERE task_type IN ('ingest', 'ingest_recompile') AND "
         "(status = 'awaiting_subagent' OR (status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?)) LIMIT 1",
         (now,),
     ).fetchone() is not None
 
 
-def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
+def validate_ingest_job_finalization(job_id: str, processed_data: dict, *, check_source_version: bool = True) -> dict:
     """Bind finalization to the exact leased job payload."""
     init_db()
     row = get_connection().execute(
@@ -3069,7 +3183,7 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     ).fetchone()
     if row is None:
         raise ValueError(f"Unknown ingest job: {job_id}")
-    if row["task_type"] != "ingest":
+    if row["task_type"] not in {"ingest", "ingest_recompile"}:
         raise ValueError(f"Job {job_id} is not an ingest job")
     if row["status"] != "subagent_processing":
         raise ValueError(f"Job {job_id} cannot be finalized from status {row['status']}")
@@ -3096,6 +3210,14 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
         payload = json.loads(row["payload"] or "{}")
     except json.JSONDecodeError as exc:
         raise ValueError(f"Job {job_id} has an invalid payload") from exc
+    from vector_lake.controlled_recompile import validate_marker
+    validate_marker(payload, task_type=row["task_type"], check_source_version=check_source_version)
+    if processed_data.get("controlled_recompile") != payload.get("controlled_recompile"):
+        raise ValueError(f"Job {job_id} recompile marker does not match its queued payload")
+    if row["task_type"] == "ingest_recompile":
+        for key in ("integration_candidates", "source_projection_hash", "ingest_contract_version", "source_read_path"):
+            if processed_data.get(key) != payload.get(key):
+                raise ValueError(f"Job {job_id} {key} differs from its controlled dispatch")
     for key in ("filepath", "hash"):
         if str(processed_data.get(key) or "") != str(payload.get(key) or ""):
             raise ValueError(f"Job {job_id} {key} does not match its queued payload")
@@ -3266,6 +3388,20 @@ def close_terminal_failed_jobs(source_ingested_only: bool = True) -> dict:
     with transaction():
         for job in list_terminal_failed_jobs():
             filepath = job["filepath"]
+            if job["task_type"] == "ingest_recompile":
+                from vector_lake.controlled_recompile import current_version_proven, fingerprint
+                payload_row = conn.execute("SELECT payload FROM jobs WHERE job_id = ?", (job["job_id"],)).fetchone()
+                try:
+                    payload = json.loads(payload_row["payload"])
+                    marker = payload.get("controlled_recompile") or {}
+                    current = fingerprint(filepath)
+                    proven = (current["sha256"] == marker.get("sha256")
+                              and current_version_proven(filepath, current["sha256"], current["md5"]))
+                except (OSError, TypeError, ValueError):
+                    proven = False  # Explicitly keep the failed job, not a no-data conclusion.
+                if not proven:
+                    kept.append(job["job_id"])
+                    continue
             if source_ingested_only and (not filepath or filepath not in ledger):
                 kept.append(job["job_id"])
                 continue
@@ -3294,7 +3430,7 @@ def clear_abandoned_sources(filepath: str | None = None) -> int:
 
 def _ingest_failure_claim_current(row: dict, claim: dict | None, now: str) -> bool:
     """Failure/release must hold the same ownership fence as successful finalization."""
-    if row["task_type"] != "ingest":
+    if row["task_type"] not in {"ingest", "ingest_recompile"}:
         return False
     try:
         retries = int(row["retries"] or 0)
@@ -3397,24 +3533,31 @@ def update_job_status(job_id: str, status: str, error_msg: str = "", *, claim: d
 
 
 def backup_database(destination_path: str | Path | None = None):
-    """Create a transactionally consistent SQLite backup of the active database."""
-    import time
+    """Atomically publish an integrity-checked SQLite snapshot and content receipt."""
+    from vector_lake.backup_retention import backup_lock, seal_backup
 
     if not get_db_path().exists():
         init_db()
     if destination_path is None:
         backup_dir = get_meta_dir() / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_path = backup_dir / f"vector_lake_{int(time.time())}.db.bak"
+        backup_path = backup_dir / f"vector_lake_{time.time_ns()}_{uuid.uuid4().hex[:8]}.db.bak"
     else:
         backup_path = Path(destination_path)
         backup_path.parent.mkdir(parents=True, exist_ok=True)
-    destination = sqlite3.connect(str(backup_path))
-    try:
-        get_connection().backup(destination)
-        integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise RuntimeError(f"SQLite backup integrity check failed: {integrity}")
-    finally:
-        destination.close()
+    temporary = backup_path.with_name(f".{backup_path.name}.{uuid.uuid4().hex}.partial")
+    with backup_lock(backup_path.parent):
+        try:
+            destination = sqlite3.connect(str(temporary))
+            try:
+                get_connection().backup(destination)
+                integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError(f"SQLite backup integrity check failed: {integrity}")
+            finally:
+                destination.close()
+            temporary.replace(backup_path)
+            seal_backup(backup_path, [backup_path], sqlite_integrity=integrity, database_member=backup_path.name)
+        finally:
+            temporary.unlink(missing_ok=True)
     return str(backup_path)

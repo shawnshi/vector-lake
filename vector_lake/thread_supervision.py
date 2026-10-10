@@ -129,6 +129,15 @@ def supervise_once() -> dict[str, str]:
     return outcome
 
 
+def join(name: str, timeout: float | None = None) -> None:
+    """Join the current registered thread, including a replacement after restart."""
+    with _lock:
+        entry = _loops.get(name)
+        thread = entry["thread"] if entry else None
+    if thread is not None:
+        thread.join(timeout=timeout)
+
+
 def snapshot() -> dict[str, dict]:
     """Per-loop state for a status surface."""
     with _lock:

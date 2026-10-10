@@ -285,13 +285,12 @@ def test_the_trace_survives_a_prefix_change(lake_with_author_page, monkeypatch):
 
 
 def test_the_boost_lifts_a_compiled_page_by_the_relative_amount(lake_with_author_page, monkeypatch):
-    """The behavioural half, pinned to the measured rule: lift = BOOST x pool top, capped there.
+    """Pin the additive lift: min(1, BOOST) x pool top, added to the original score.
 
-    Measured on this two-page pool: the traced page sits at 0.0 and the third-party page at 0.6, so
-    boost=0.25 puts it at 0.15, 0.6 at 0.36, and 1.0 at exactly 0.60 -- a lifted page reaches the
-    pool top but never passes it.  A *flip* therefore cannot be asserted here (the minimum can only
-    tie at boost=1.0); the ordering benefit in a real pool is evidenced by the live A/B, where the
-    boost moved the top ten from one author page to ten.
+    The native two-page pool has an author minimum0 and pool top0.6. The core fallback
+    preserves positive upstream scores (19.9 and20 here), so the same rule need not end
+    at the pool top. The bounded quantity is the added bonus, not the total score;
+    this oracle must not assume the native reranker's min-max normalization.
     """
     _add_sourced_nodes(
         **dict([_compiled("Concept_内部编译", "内部编译", "raw/article/团队内参.md")]),
@@ -330,8 +329,10 @@ def test_the_boost_lifts_a_compiled_page_by_the_relative_amount(lake_with_author
 
     monkeypatch.setenv("VECTOR_LAKE_AUTHOR_BOOST", "1.0")
     capped = scores()
-    assert capped["Concept_内部编译"] == pytest.approx(pool_top), "the cap is the pool top"
-    assert capped["Concept_内部编译"] <= capped["Concept_第三方编译"] + 1e-9
+    assert capped["Concept_内部编译"] == pytest.approx(off["Concept_内部编译"] + pool_top)
+    assert capped["Concept_内部编译"] - off["Concept_内部编译"] <= pool_top + 1e-9
+    monkeypatch.setenv("VECTOR_LAKE_AUTHOR_BOOST", "10.0")
+    assert scores() == pytest.approx(capped), "the lift fraction, not total score, is capped at1.0"
 
     monkeypatch.setenv("VECTOR_LAKE_AUTHOR_FACET", "filter")
     assert set(scores()) == {"Concept_内部编译"}, "filter must narrow to the traced page only"

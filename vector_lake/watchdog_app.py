@@ -53,7 +53,7 @@ class FileSystemEventHandler:
     """Local base class: the handlers only need their own ``on_*`` methods to exist."""
 
 
-class _WatchLoop(threading.Thread):
+class _WatchLoop:
     """One ``watchfiles`` watcher for one directory, dispatching into one handler.
 
     Replaces ``watchdog.observers.Observer``.  The two monitored trees want different
@@ -62,14 +62,25 @@ class _WatchLoop(threading.Thread):
     """
 
     def __init__(self, handler, path, recursive: bool, label: str):
-        super().__init__(name=f"watch-{label}", daemon=True)
+        self.name = f"watch-{label}"
         self.handler = handler
         self.path = path
         self.recursive = recursive
         self.label = label
         self._stop_event = threading.Event()
 
+    def start(self):
+        from vector_lake import thread_supervision
+
+        thread_supervision.start(self.name, self.run)
+
     def run(self):
+        from vector_lake import thread_supervision
+
+        if self._stop_event.is_set():
+            thread_supervision.finish(self.name, "watcher stopped")
+            return
+        write_status("idle", 0, index_queue.qsize(), f"Watcher {self.label} running", "", component=self.name)
         dispatch = {
             _FileChange.added: getattr(self.handler, "on_created", None),
             _FileChange.modified: getattr(self.handler, "on_modified", None),
@@ -94,14 +105,20 @@ class _WatchLoop(threading.Thread):
             log.exception("Watcher %s stopped: %s", self.label, exc)
             write_status(
                 "error", 0, index_queue.qsize(),
-                f"Watcher {self.label} stopped: {type(exc).__name__}", str(exc), component="watchdog",
+                f"Watcher {self.label} stopped: {type(exc).__name__}", str(exc), component=self.name,
             )
+            raise
+        finally:
+            if self._stop_event.is_set():
+                thread_supervision.finish(self.name, "watcher stopped")
 
     def stop(self):
         self._stop_event.set()
 
     def join(self, timeout=None):
-        super().join(timeout)
+        from vector_lake import thread_supervision
+
+        thread_supervision.join(self.name, timeout=timeout)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -251,81 +268,84 @@ class RawWatchdogHandler(FileSystemEventHandler):
                     log.warning("RawWatchdogHandler executor shutdown error: %s", exc)
 
 
-def process_mutation_outbox_batch(
-    limit: int = 50,
-    max_attempts: int = 3,
-    backoff_base: float = 2.0,
-) -> dict:
-    """Process one durable outbox batch; per-row failures never abort peers."""
-    from vector_lake import db_store, indexer
-    from vector_lake.mutation_coordinator import materialize_markdown_projection
-    from vector_lake.wiki_utils import get_wiki_dir
+def process_mutation_outbox_batch(limit: int = 50, max_attempts: int = 3, backoff_base: float = 2.0):
+    """Materialize and index only current, version-bound leased intents."""
+    from vector_lake import db_store
+    from vector_lake.indexer import update_index_items
+    from vector_lake.mutation_coordinator import (
+        ProjectionVersionConflict, materialize_markdown_projection, projection_locks,
+        require_projection_intent, resolve_wiki_mutation_path,
+    )
 
     rows = db_store.claim_mutation_outbox(limit=limit)
-    stats = {"claimed": len(rows), "completed": 0, "retrying": 0, "failed": 0}
-    ready_for_index = []
+    stats = {"claimed": len(rows), "completed": 0, "retrying": 0, "failed": 0, "superseded": 0, "lease_lost": 0}
+    ready = []
+    settled = set()
+
+    def lost(row, exc):
+        settled.add(row["id"])
+        stats["superseded" if isinstance(exc, db_store.MutationSuperseded) else "lease_lost"] += 1
+
+    def failed(row, exc):
+        try:
+            state = db_store.fail_mutation_outbox(
+                row["id"], str(exc), max_attempts=1 if isinstance(exc, ProjectionVersionConflict) else max_attempts,
+                backoff_base=backoff_base, claim=row,
+            )
+        except db_store.MutationClaimLost as stale:
+            lost(row, stale)
+            return
+        settled.add(row["id"])
+        stats["failed" if state == "failed" else "retrying"] += 1
+        log.error("Outbox %s could not publish %s; status=%s: %s", row["id"], row["filename"], state, exc)
+
     for row in rows:
-        outbox_id = int(row["id"])
-        filename = row["filename"]
         try:
-            target = get_wiki_dir() / filename
-            already_materialized = (
-                not target.exists()
-                if row["mutation_type"] == "delete"
-                else (
-                    row.get("payload_text") is not None
-                    and target.exists()
-                    and target.read_text(encoding="utf-8") == row.get("payload_text")
-                )
-            )
-            if not already_materialized:
-                # Debounce: if the row was just created by foreground coordinator, give it a tiny grace
-                # window to finish os.replace before background launches a concurrent duplicate write.
-                time.sleep(0.05)
-                already_materialized = (
-                    not target.exists()
-                    if row["mutation_type"] == "delete"
-                    else (
-                        row.get("payload_text") is not None
-                        and target.exists()
-                        and target.read_text(encoding="utf-8") == row.get("payload_text")
-                    )
-                )
-            if not already_materialized:
-                materialize_markdown_projection(
-                    filename,
-                    row["mutation_type"],
-                    row.get("payload_text"),
-                    validation_mode=row.get("validation_mode") or "full",
-                )
-            ready_for_index.append((outbox_id, filename))
+            mode = str(row.get("validation_mode") or "full")
+            with projection_locks([row["filename"]]):
+                require_projection_intent(row["id"], row["filename"], row["mutation_type"], row["payload_text"], claim=row, validation_mode=mode)
+                filepath = resolve_wiki_mutation_path(row["filename"], allow_existing_legacy_name=mode == "schema" or row["mutation_type"] == "delete", validate_new_name=row["mutation_type"] != "delete")
+                matched = row["mutation_type"] == "delete" and not filepath.exists()
+                if row["mutation_type"] == "update" and row["payload_text"] is not None and filepath.exists():
+                    matched = filepath.read_text(encoding="utf-8") == row["payload_text"]
+                if not matched:
+                    materialize_markdown_projection(row["filename"], row["mutation_type"], row["payload_text"], validation_mode=mode, outbox_id=row["id"], claim=row)
+                ready.append(row)
+        except db_store.MutationClaimLost as exc:
+            lost(row, exc)
         except Exception as exc:
-            status = db_store.fail_mutation_outbox(
-                outbox_id,
-                str(exc),
-                max_attempts=max_attempts,
-                backoff_base=backoff_base,
-            )
-            stats["failed" if status == "failed" else "retrying"] += 1
-            log.error(f"Outbox item {outbox_id} failed for {filename}; status={status}: {exc}")
-    if ready_for_index:
-        filenames = list(dict.fromkeys(filename for _, filename in ready_for_index))
+            failed(row, exc)
+
+    if ready:
         try:
-            indexer.update_index_items(filenames)
+            with projection_locks([row["filename"] for row in ready]):
+                current = []
+                for row in ready:
+                    try:
+                        require_projection_intent(row["id"], row["filename"], row["mutation_type"], row["payload_text"], claim=row, validation_mode=str(row.get("validation_mode") or "full"))
+                        current.append(row)
+                    except db_store.MutationClaimLost as exc:
+                        lost(row, exc)
+                    except Exception as exc:
+                        failed(row, exc)
+                if current:
+                    try:
+                        update_index_items(list(dict.fromkeys(row["filename"] for row in current)))
+                    except Exception as exc:
+                        for row in current:
+                            failed(row, exc)
+                    else:
+                        for row in current:
+                            try:
+                                db_store.complete_mutation_outbox(row["id"], claim=row)
+                                stats["completed"] += 1
+                                settled.add(row["id"])
+                            except db_store.MutationClaimLost as exc:
+                                lost(row, exc)
         except Exception as exc:
-            for outbox_id, filename in ready_for_index:
-                status = db_store.fail_mutation_outbox(
-                    outbox_id,
-                    str(exc),
-                    max_attempts=max_attempts,
-                    backoff_base=backoff_base,
-                )
-                stats["failed" if status == "failed" else "retrying"] += 1
-                log.error(f"Outbox index batch failed for {filename}; status={status}: {exc}")
-        else:
-            for outbox_id, _ in ready_for_index:
-                db_store.complete_mutation_outbox(outbox_id)
-                stats["completed"] += 1
+            for row in ready:
+                if row["id"] not in settled:
+                    failed(row, exc)
     return stats
 
 def canonicalise_manual_edits(filenames) -> tuple[int, list[tuple[str, str]]]:
@@ -336,7 +356,7 @@ def canonicalise_manual_edits(filenames) -> tuple[int, list[tuple[str, str]]]:
     caller instead of being silently dropped.
     """
     from vector_lake import db_store
-    from vector_lake.mutation_coordinator import execute_mutation_plan
+    from vector_lake.mutation_coordinator import execute_mutation_plan, projection_locks
     from vector_lake.wiki_utils import get_wiki_dir
 
     wiki_dir = get_wiki_dir()
@@ -345,15 +365,16 @@ def canonicalise_manual_edits(filenames) -> tuple[int, list[tuple[str, str]]]:
     for fname in filenames:
         fpath = wiki_dir / fname
         try:
-            if fpath.exists():
-                manual_text = fpath.read_text(encoding="utf-8")
-                if db_store.is_managed_projection_state(fname, "update", manual_text):
-                    continue
-                execute_mutation_plan(fname, manual_text)
-            else:
-                if db_store.is_managed_projection_state(fname, "delete"):
-                    continue
-                execute_mutation_plan(fname, is_delete=True)
+            with projection_locks([fname]):
+                if fpath.exists():
+                    manual_text = fpath.read_text(encoding="utf-8")
+                    if db_store.is_managed_projection_state(fname, "update", manual_text):
+                        continue
+                    execute_mutation_plan(fname, manual_text)
+                else:
+                    if db_store.is_managed_projection_state(fname, "delete"):
+                        continue
+                    execute_mutation_plan(fname, is_delete=True)
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
             failures.append((fname, reason))
@@ -765,7 +786,7 @@ def scheduled_lint_loop():
                         log.info(
                             "Backup retention removed %s entr(ies), %s bytes; %s kept.",
                             len(retention["deleted"]),
-                            retention["removable_bytes"],
+                            retention["deleted_bytes"],
                             len(retention["keep"]),
                         )
                     for failure in retention["failures"]:

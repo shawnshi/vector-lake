@@ -77,6 +77,11 @@ def _repair_block(repair: dict) -> str:
 
 def _brief(packet: dict) -> str:
     metadata = (packet.get("metadata") or {}).get("processed_data") or {}
+    if metadata.get("controlled_recompile") is not None or metadata.get("source_read_path") is not None:
+        from vector_lake.ingest_model_contract import build_cli_prompt
+        # The delegated compiler receives actual SHA-checked inline snapshot bytes.
+        # Original filepath remains provenance only; never reuse relay_brief's raw-read instruction.
+        return _runtime_schema_contract() + "\n\n" + build_cli_prompt(packet)
     # The prompt contains source/context text, not the authoritative dispatch manifest.
     # Copy the producer's actual snapshot verbatim; never reconstruct target/version tokens.
     fields = ("filepath", "hash", "canonical_name", "source_hash", "source_projection_hash",

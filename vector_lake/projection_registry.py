@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 log = logging.getLogger("vector-lake-projections")
@@ -120,7 +121,26 @@ def _vector_repair() -> str:
     )
 
 
+_COUNT_SCOPE: ContextVar[dict | None] = ContextVar("projection_count_scope", default=None)
+
+
 def _counts(conn) -> dict:
+    """Share successful count reads only within one synchronous status call.
+
+    Retain the connection in the entry to prevent id reuse; return a copy so
+    one health callback cannot mutate another's report. Failed reads propagate
+    unchanged and are never converted to an empty or healthy result.
+    """
+    scope = _COUNT_SCOPE.get()
+    if scope is None:
+        return _read_counts(conn)
+    key = id(conn)
+    if key not in scope:
+        scope[key] = (conn, _read_counts(conn))
+    return dict(scope[key][1])
+
+
+def _read_counts(conn) -> dict:
     """Every signal the count-based pilots need, each one measured cheap (total ~60 ms).
 
     **What is deliberately not here:** comparing ``wiki_search_index``'s row keys against
@@ -309,7 +329,19 @@ def registry() -> tuple[Projection, ...]:
 
 
 def status() -> dict[str, dict]:
-    """Every registered projection's state and detail.  Read-only."""
+    """Every projection's state and detail; read-only, with call-local counts.
+
+    No process-lifetime cache: another status or a repair must read again.
+    Nested status calls restore the parent's scope even on failure.
+    """
+    token = _COUNT_SCOPE.set({})
+    try:
+        return _status_report()
+    finally:
+        _COUNT_SCOPE.reset(token)
+
+
+def _status_report() -> dict[str, dict]:
     report: dict[str, dict] = {}
     for projection in registry():
         try:

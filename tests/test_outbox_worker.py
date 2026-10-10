@@ -15,7 +15,7 @@ def test_worker_recovers_projection_without_signal(isolated_memory):
 
     stats = process_mutation_outbox_batch(limit=10)
 
-    assert stats == {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
+    assert stats == {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0, "superseded": 0, "lease_lost": 0}
     assert target.read_text(encoding="utf-8") == _source_content()
     row = db_store.get_connection().execute("SELECT status FROM mutation_outbox").fetchone()
     assert row["status"] == "completed"
@@ -30,7 +30,7 @@ def test_worker_continues_after_one_row_fails(isolated_memory):
 
     stats = process_mutation_outbox_batch(limit=10, max_attempts=3, backoff_base=0)
 
-    assert stats == {"claimed": 2, "completed": 1, "retrying": 1, "failed": 0}
+    assert stats == {"claimed": 2, "completed": 1, "retrying": 1, "failed": 0, "superseded": 0, "lease_lost": 0}
     rows = {
         row["id"]: row["status"]
         for row in db_store.get_connection().execute("SELECT id, status FROM mutation_outbox")
@@ -48,7 +48,7 @@ def test_worker_batches_index_update_once_for_all_ready_rows(isolated_memory, mo
 
     stats = process_mutation_outbox_batch(limit=10)
 
-    assert stats == {"claimed": 2, "completed": 2, "retrying": 0, "failed": 0}
+    assert stats == {"claimed": 2, "completed": 2, "retrying": 0, "failed": 0, "superseded": 0, "lease_lost": 0}
     assert calls == [["Concept_First.md", "Concept_Second.md"]]
 
 

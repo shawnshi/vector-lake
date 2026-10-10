@@ -236,7 +236,10 @@ def _node_insert() -> str:
     return (
         "INSERT OR REPLACE INTO page_index_nodes "
         "(node_key, node_id, title, type, status, domain, topic_cluster, node_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS ("
+        "SELECT 1 FROM page_index_nodes WHERE node_key IS ? AND node_id IS ? "
+        "AND title IS ? AND type IS ? AND status IS ? AND domain IS ? "
+        "AND topic_cluster IS ? AND node_json IS ?)"
     )
 
 
@@ -312,11 +315,6 @@ def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
 
     if partial_keys is None:
         rows = [_node_columns(str(key), node) for key, node in nodes.items()]
-        with transaction():
-            conn.execute("DELETE FROM page_index_nodes")
-            if rows:
-                conn.executemany(_node_insert(), rows)
-        written = len(rows)
     else:
         rows = []
         for key in partial_keys:
@@ -324,15 +322,22 @@ def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
             if node is None:
                 continue
             rows.append(_node_columns(str(key), node))
-        with transaction():
-            if rows:
-                conn.executemany(_node_insert(), rows)
-            conn.execute(
-                "DELETE FROM page_index_nodes "
-                "WHERE node_key NOT IN (SELECT value FROM json_each(?))",
-                (json.dumps(sorted(str(key) for key in nodes)),),
-            )
-        written = len(rows)
+    # Keep serialization outside the write transaction. Full refresh still
+    # reconciles every authoritative column; only identical rows skip REPLACE.
+    # Changed rows retain the existing REPLACE/rowid semantics and invalidate
+    # the same readers as before, rather than adopting an in-place UPSERT.
+    authoritative_keys = json.dumps(sorted(str(key) for key in nodes))
+    with transaction():
+        if rows:
+            conn.executemany(_node_insert(), (row + row for row in rows))
+        conn.execute(
+            "DELETE FROM page_index_nodes "
+            "WHERE node_key IS NULL OR node_key NOT IN (SELECT value FROM json_each(?))",
+            (authoritative_keys,),
+        )
+    # Retain the historical count of prepared/processed rows, not SQLite's
+    # affected-row count, so callers need no result-schema change.
+    written = len(rows)
 
     stamp = index_file_stamp()
     edge_changed = True

@@ -1,4 +1,5 @@
 import argparse
+import json
 import io
 import sys
 
@@ -44,6 +45,16 @@ Usage Examples:
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available wiki operations")
 
     subparsers.add_parser("sync", help="[INGEST] Generates MCP ingestion instructions for Native Subagents.")
+    recompile_parser = subparsers.add_parser("recompile-ingest", help="[INGEST] Validate/hand off an explicitly approved 60-source current-version recompile.")
+    recompile_parser.add_argument("--plan", required=True)
+    recompile_parser.add_argument("--plan-sha256", required=True)
+    recompile_parser.add_argument("--approval", required=True)
+    recompile_parser.add_argument("--approval-sha256", required=True)
+    recompile_parser.add_argument("--apply", action="store_true", help="Hand off native tasks; default is validation only.")
+    recompile_parser.add_argument("--batch-size", type=int, default=1)
+    recompile_parser.add_argument("--defer-filepath", help="Explicitly retain one unowned Source without recompiling its raw.")
+    recompile_parser.add_argument("--defer-sha256", help="Approved current raw SHA-256 paired with --defer-filepath.")
+
     ingest_tasks_parser = subparsers.add_parser("ingest-tasks", help="[INGEST] List or expire subagent ingest tasks.")
     ingest_tasks_parser.add_argument("--limit", type=int, default=20, help="Maximum number of jobs to list.")
     ingest_tasks_parser.add_argument("--awaiting-only", action="store_true", help="Hide queued jobs and show only awaiting-subagent jobs.")
@@ -227,6 +238,12 @@ def main() -> int:
     try:
         if args.command == "sync":
             print(tools.sync_vector_lake())
+        elif args.command == "recompile-ingest":
+            from vector_lake.controlled_recompile import controlled_recompile
+            result = controlled_recompile(args.plan, args.plan_sha256, args.approval, args.approval_sha256,
+                                          apply=args.apply, batch_size=args.batch_size,
+                                          defer_filepath=args.defer_filepath, defer_sha256=args.defer_sha256)
+            print(json.dumps(result, ensure_ascii=False))
         elif args.command == "ingest-tasks":
             if getattr(args, "close_terminal_failed", False):
                 print(tools.close_terminal_failed_ingest_jobs())

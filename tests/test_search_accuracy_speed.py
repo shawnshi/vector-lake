@@ -94,6 +94,8 @@ def test_graph_filters_before_quota_and_backfills(isolated_memory, monkeypatch, 
 
 
 def test_token_cache_reuses_and_invalidates_content_and_backend(monkeypatch):
+    if not ts.HAVE_CORE:
+        pytest.skip('native BM25 token-cache path; core fallback keeps upstream scores unchanged')
     original = tokenizer.tokenize_joined
     calls = []
 

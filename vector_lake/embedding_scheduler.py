@@ -402,8 +402,8 @@ class EmbeddingResponseError(RuntimeError):
 class EmbeddingBudgetExceeded(RuntimeError):
     """The caller's deadline left no room for the wait this request needs.
 
-    Distinct from a provider error: nothing was sent, or the retry the provider
-    asked for was refused.  Callers that hold a deadline of their own (the query
+    Distinct from a provider error: work could not start in time, a transport
+    exceeded the budget, a late result was rejected, or a retry was refused.  Callers that hold a deadline of their own (the query
     path runs inside an MCP tool call) degrade on this instead of parking.
     """
 
@@ -425,7 +425,33 @@ def embedding_transport() -> str:
     return value if value in {"rest", "sdk"} else "rest"
 
 
-def _rest_embed_contents(contents: list[str], config) -> list[list[float]]:
+def _embedding_deadline(budget_seconds: float | None) -> float | None:
+    if budget_seconds is None:
+        return None
+    budget = float(budget_seconds)
+    if not math.isfinite(budget):
+        raise ValueError("Embedding budget must be finite")
+    deadline = time.monotonic() + budget
+    _remaining_budget(deadline)
+    return deadline
+
+
+def _remaining_budget(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise EmbeddingBudgetExceeded("Embedding caller deadline exhausted")
+    return remaining
+
+
+def _transport_timeout(deadline: float | None) -> float:
+    configured = _env_int("VECTOR_LAKE_EMBEDDING_TIMEOUT_MS", 30_000) / 1000.0
+    remaining = _remaining_budget(deadline)
+    return configured if remaining is None else min(configured, remaining)
+
+
+def _rest_embed_contents(contents: list[str], config, *, deadline: float | None = None) -> list[list[float]]:
     """One ``batchEmbedContents`` POST, with the SDK's error semantics.
 
     Raises on any non-200 so the caller's retry/budget loop behaves exactly as it did with the
@@ -438,7 +464,6 @@ def _rest_embed_contents(contents: list[str], config) -> list[list[float]]:
     api_key = str(os.environ.get("GEMINI_API_KEY") or "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    timeout_ms = _env_int("VECTOR_LAKE_EMBEDDING_TIMEOUT_MS", 30_000)
     payload = _json.dumps(
         {
             "requests": [
@@ -454,8 +479,9 @@ def _rest_embed_contents(contents: list[str], config) -> list[list[float]]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(1.0, timeout_ms / 1000.0)) as response:
+        with urllib.request.urlopen(request, timeout=_transport_timeout(deadline)) as response:
             body = response.read()
+        _remaining_budget(deadline)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -476,6 +502,7 @@ def _rest_embed_contents(contents: list[str], config) -> list[list[float]]:
                 f"Embedding dimension mismatch at position {index}: "
                 f"expected {config.dimension}, got {len(values)}"
             )
+    _remaining_budget(deadline)
     return values_list
 
 
@@ -493,7 +520,9 @@ def _create_client():
     from google.genai import types
 
     timeout_ms = _env_int("VECTOR_LAKE_EMBEDDING_TIMEOUT_MS", 30_000)
-    return genai.Client(http_options=types.HttpOptions(timeout=timeout_ms))
+    return genai.Client(http_options=types.HttpOptions(
+        timeout=timeout_ms, retry_options=types.HttpRetryOptions(attempts=1),
+    ))
 
 
 # ``_create_client()`` measured 1.7-6.9 s per call on the operator machine (the
@@ -607,6 +636,8 @@ def _request_embeddings(
     limiter: MinuteRateLimiter,
     budget_seconds: float | None = None,
     durable_reservation: bool = True,
+    *,
+    deadline: float | None = None,
 ) -> list[list[float]]:
     """Embed ``contents``, optionally inside a caller-supplied time budget.
 
@@ -618,21 +649,39 @@ def _request_embeddings(
     and the search degrades with ``vector_notes`` explaining why.
     """
     last_error: Exception | None = None
-    deadline = None if budget_seconds is None else time.monotonic() + float(budget_seconds)
+    deadline = _embedding_deadline(budget_seconds) if deadline is None else deadline
+    _remaining_budget(deadline)
     transport = embedding_transport()
     # Built lazily: this import is the 3.5 s the REST transport exists to avoid.
     provider_contents = _provider_contents(contents) if transport == "sdk" else []
     for attempt in range(config.max_retries + 1):
         try:
+            _remaining_budget(deadline)
             limiter.reserve(request_tokens, deadline=deadline, durable=durable_reservation)
+            _remaining_budget(deadline)
             if transport == "rest":
-                return _rest_embed_contents(contents, config)
-            response = client.models.embed_content(model=config.model, contents=provider_contents)
-            return _validated_response_values(response, len(contents), config.dimension)
+                values = _rest_embed_contents(contents, config, deadline=deadline)
+            else:
+                timeout_ms = int(_transport_timeout(deadline) * 1000)
+                if timeout_ms < 1:
+                    raise EmbeddingBudgetExceeded("Less than one millisecond remains for SDK transport")
+                response = client.models.embed_content(
+                    model=config.model, contents=provider_contents,
+                    config={"http_options": {
+                        "timeout": timeout_ms, "retry_options": {"attempts": 1},
+                    }},
+                )
+                values = _validated_response_values(response, len(contents), config.dimension)
+            _remaining_budget(deadline)
+            return values
         except EmbeddingBudgetExceeded:
             raise
         except Exception as exc:
             last_error = exc
+            try:
+                _remaining_budget(deadline)
+            except EmbeddingBudgetExceeded as expired:
+                raise expired from exc
             if attempt >= config.max_retries:
                 break
             message = str(exc)
@@ -657,17 +706,22 @@ def embed_texts(
 ) -> list[list[float]]:
     """Shared validated embedding entrypoint for small runtime requests.
 
-    ``budget_seconds`` bounds the total wait (rate-limit window plus retries).
-    Omit it for batch work such as backfill, where waiting is the correct answer.
+    ``budget_seconds`` is one cooperative deadline starting before preparation:
+    transport timeouts use its remainder, and expired results are rejected.
+    Synchronous SDK initialization/DNS and inactivity-based socket timeouts are
+    not a hard wall-clock cancellation boundary. Omit the caller budget for
+    batch work where waiting is acceptable; per-attempt HTTP timeout still applies.
 
     ``durable_reservation=False`` keeps the request off the write lock, for
     callers on a read path; see :meth:`MinuteRateLimiter.reserve`.
     """
     if not texts or not os.environ.get("GEMINI_API_KEY"):
         return []
+    deadline = _embedding_deadline(budget_seconds)
     config = load_embedding_rate_config()
     normalized = [str(text)[:config.max_chars_per_item] for text in texts]
     tokens = sum(estimate_embedding_tokens(text) for text in normalized)
+    _remaining_budget(deadline)
     return _request_embeddings(
         _shared_client() if embedding_transport() == "sdk" else None,
         normalized,
@@ -676,6 +730,7 @@ def embed_texts(
         MinuteRateLimiter(config),
         budget_seconds=budget_seconds,
         durable_reservation=durable_reservation,
+        deadline=deadline,
     )
 
 

@@ -17,7 +17,7 @@ def test_outbox_claims_pending_rows_without_signal(isolated_memory):
     assert [row["id"] for row in rows] == [outbox_id]
     assert rows[0]["status"] == "processing"
     assert rows[0]["attempt_count"] == 1
-    db_store.complete_mutation_outbox(outbox_id)
+    db_store.complete_mutation_outbox(outbox_id, claim=rows[0])
     row = db_store.get_connection().execute(
         "SELECT status, completed_at FROM mutation_outbox WHERE id = ?", (outbox_id,)
     ).fetchone()
@@ -28,9 +28,9 @@ def test_outbox_claims_pending_rows_without_signal(isolated_memory):
 def test_outbox_retries_then_dead_letters(isolated_memory):
     db_store.init_db()
     outbox_id = db_store.enqueue_mutation("Concept_Test.md", "update", payload_text="payload")
-    db_store.claim_mutation_outbox(limit=1)
+    rows = db_store.claim_mutation_outbox(limit=1)
 
-    retry_status = db_store.fail_mutation_outbox(outbox_id, "first failure", max_attempts=2, backoff_base=0)
+    retry_status = db_store.fail_mutation_outbox(outbox_id, "first failure", max_attempts=2, backoff_base=0, claim=rows[0])
     assert retry_status == "pending"
     first = db_store.get_connection().execute(
         "SELECT status, attempt_count, last_error FROM mutation_outbox WHERE id = ?", (outbox_id,)
@@ -39,7 +39,7 @@ def test_outbox_retries_then_dead_letters(isolated_memory):
 
     rows = db_store.claim_mutation_outbox(limit=1)
     assert len(rows) == 1
-    terminal_status = db_store.fail_mutation_outbox(outbox_id, "second failure", max_attempts=2, backoff_base=0)
+    terminal_status = db_store.fail_mutation_outbox(outbox_id, "second failure", max_attempts=2, backoff_base=0, claim=rows[0])
     assert terminal_status == "failed"
 
 

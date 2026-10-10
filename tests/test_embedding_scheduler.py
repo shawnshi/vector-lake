@@ -449,7 +449,7 @@ def test_the_backfill_stamps_which_model_produced_the_stored_vectors(isolated_me
         "_create_client",
         lambda: SimpleNamespace(
             models=SimpleNamespace(
-                embed_content=lambda model, contents: SimpleNamespace(
+                embed_content=lambda model, contents, config=None: SimpleNamespace(
                     embeddings=[SimpleNamespace(values=[1.0] * 3072) for _ in contents]
                 )
             )

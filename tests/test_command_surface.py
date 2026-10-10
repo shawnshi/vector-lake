@@ -126,11 +126,12 @@ def test_mcp_server_registers_its_tool_surface():
     """The server registers the inline preview alongside its proposal tools."""
     names = mcp_server.registered_tool_names(mcp_server.mcp)
 
-    assert len(names) == 19, f"expected exactly 19 core tools, got {len(names)}: {names}"
+    assert len(names) == 20, f"expected exactly 20 core tools, got {len(names)}: {names}"
     assert "preview_query_context" in names
     assert "search_vector_lake" in names
     assert "query_logic_lake" in names
     assert "doctor_vector_lake" in names
+    assert "runtime_identity" in names
 
 
 def test_readme_maintenance_examples_match_parser_and_bind_approval():

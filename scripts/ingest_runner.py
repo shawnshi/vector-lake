@@ -60,11 +60,7 @@ def _runtime_dir() -> Path:
     return get_meta_dir() / "runtime"
 
 
-REJECT_DUPLICATE = (
-    "该原始文件的 Source 页已发布（frontmatter sources 已声明此 raw 路径），"
-    "此任务为重复准备；由 ingest runner 自动关闭以免重复入库。"
-)
-REJECT_MISSING_SOURCE = "原始文件在 raw 目录下已不存在，任务无法完成；由 ingest runner 自动关闭。"
+from vector_lake.ingest_errors import REJECT_DUPLICATE, REJECT_MISSING_SOURCE  # noqa: E402
 
 RESULT_COUNTERS = (
     "duplicate", "missing-source", "needs-model", "finalized", "errors", "model-failed",
@@ -121,8 +117,32 @@ def write_status(**fields) -> None:
     os.replace(temporary, path)
 
 
+def _validate_controlled_claim(processed: dict, claim: dict | None = None) -> bool:
+    """Controlled admission is determined by the durable claim, not packet opt-out."""
+    from vector_lake.db_store import get_connection, init_db, validate_ingest_job_finalization
+    job_id = str((claim or processed).get("job_id") or "")
+    if job_id:
+        init_db()
+    row = get_connection().execute("SELECT task_type FROM jobs WHERE job_id = ?", (job_id,)).fetchone() if job_id else None
+    controlled = ((row is not None and row["task_type"] == "ingest_recompile")
+                  or (claim or {}).get("task_type") == "ingest_recompile"
+                  or processed.get("controlled_recompile") is not None)
+    if controlled:
+        if str(processed.get("job_id") or "") != job_id:
+            raise ValueError("Controlled packet identity differs from its actual claim")
+        checked = validate_ingest_job_finalization(job_id, processed)
+        if checked["task_type"] != "ingest_recompile":
+            raise ValueError("Recompile exception requires its dedicated native job")
+        if claim and any(processed.get(k) != claim.get(k) for k in ("lease_owner", "lease_token", "lease_generation")):
+            raise ValueError("Controlled packet ownership differs from its actual claim")
+        return True
+    return False
+
+
 def classify(processed: dict, index: dict) -> str:
-    """C1: decide from evidence before spending anything on the task."""
+    """C1: ordinary classification plus protected explicit recompile admission."""
+    if _validate_controlled_claim(processed):
+        return "needs-model"
     filepath = str(processed.get("filepath") or "")
     if not filepath or not Path(filepath).exists():
         return "missing-source"
@@ -222,6 +242,8 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
     def model_round(proposal):
         if execution and not execution.ready():
             return None, BackendFailure("backend paused; task retained", "paused")
+        current = ((proposal.get("metadata") or {}).get("processed_data") or {})
+        _validate_controlled_claim(current, task)  # Also fences each repair round.
         started = time.perf_counter()
         try:
             answer, error = run_model(proposal, model_cmd)
@@ -260,7 +282,18 @@ def _process_task(task: dict, shadow: bool, model_cmd: str, publication_index: d
             db_store.release_job_for_retry(job_id, "backend delivery failure; source budget untouched", claim=task,
                                            delay_seconds=execution.delay(120) if execution else 5)
 
-    verdict = classify(processed, publication_index)
+    try:
+        _validate_controlled_claim(processed, task)
+        verdict = classify(processed, publication_index)
+    except OSError as exc:
+        res["errors"] += 1
+        return res, f"dispatch resource unavailable: {type(exc).__name__}"
+    except ValueError as exc:
+        res["errors"] += 1
+        last_err = f"dispatch validation failed: {exc}"
+        if job_id:
+            record_ingest_failure(job_id, last_err, claim=task)
+        return res, last_err
     try:
         if verdict in {"duplicate", "missing-source"}:
             reason = REJECT_DUPLICATE if verdict == "duplicate" else REJECT_MISSING_SOURCE

@@ -769,6 +769,27 @@ def dedupe_and_prune_edges(
     return pruned
 
 
+def _zero_evidence_below_threshold(
+    max_affinity: float | None,
+    multiplier: float,
+    max_multiplier: float | None,
+    min_relevance: float = 1.5,
+) -> bool:
+    """Skip zero-only evidence only when even its rounded upper bound loses.
+
+    Nonfinite/negative inputs disable this optimization, never qualification.
+    Preserve the scorer's multiplication grouping and rounding at the boundary.
+    """
+    if max_affinity is None or max_multiplier is None:
+        return False
+    if not all(math.isfinite(value) and value >= 0 for value in (max_affinity, multiplier, max_multiplier)):
+        return False
+    if not math.isfinite(min_relevance):
+        return False
+    bound = max_affinity * (multiplier * max_multiplier)
+    return math.isfinite(bound) and round(bound, 3) < min_relevance
+
+
 def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -> list[dict]:
     nodes_dict = index_data["nodes"]
     node_keys = list(nodes_dict.keys())
@@ -891,8 +912,14 @@ def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -
         for node in nodes_dict.values():
             node.pop("_key", None)
         return vector_lake_core.fast_calculate_weighted_edges(
-            payload, type_affinity_precomputed, overlap_weight, 1.5, 50
+            payload, type_affinity_precomputed, overlap_weight, 1.5, MAX_EDGES_PER_NODE
         )
+
+    # Include the native API's missing-type fallback (0.5) conservatively.
+    affinity_values = [0.5] + [value for row in type_affinity_precomputed.values() for value in row.values()]
+    max_affinity = max(affinity_values) if all(math.isfinite(value) for value in affinity_values) else None
+    multiplier_values = list(node_multipliers.values())
+    max_multiplier = max(multiplier_values, default=0.0) if all(math.isfinite(value) and value >= 0 for value in multiplier_values) else None
 
     for key_a in node_keys:
         links_a = node_links[key_a]
@@ -905,16 +932,21 @@ def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -
 
         candidate_source_overlaps = {}
         candidate_neighbor_scores = {}
-        
-        for source in sources_a:
-            for key_b in source_to_nodes.get(source, []):
-                if key_a < key_b:
-                    candidate_source_overlaps[key_b] = candidate_source_overlaps.get(key_b, 0) + 1
-                    
+        skip_zero_postings = _zero_evidence_below_threshold(max_affinity, multiplier_a, max_multiplier)
+
+        if overlap_weight != 0.0 or not skip_zero_postings:
+            for source in sources_a:
+                for key_b in source_to_nodes.get(source, []):
+                    if key_a < key_b:
+                        candidate_source_overlaps[key_b] = candidate_source_overlaps.get(key_b, 0) + 1
+
         for neighbor in links_a:
+            degree_weight = node_degrees[neighbor]
+            if degree_weight == 0.0 and skip_zero_postings:
+                continue
             for key_b in reverse_links.get(neighbor, []):
                 if key_a < key_b:
-                    candidate_neighbor_scores[key_b] = candidate_neighbor_scores.get(key_b, 0.0) + node_degrees[neighbor]
+                    candidate_neighbor_scores[key_b] = candidate_neighbor_scores.get(key_b, 0.0) + degree_weight
 
         candidates = set(candidate_source_overlaps.keys())
         candidates.update(candidate_neighbor_scores.keys())
@@ -1018,6 +1050,8 @@ def generate_index(skip_embeddings: bool = True):
     updates: without it a long rebuild clobbered every write that landed while
     it was running, and those outbox rows were already marked complete.
     """
+    if db_store.in_write_transaction():
+        raise RuntimeError("Index publication must start outside a SQLite transaction")
     output_path = str(get_index_path())
     try:
         with FileLock(output_path + ".lock", timeout=INDEX_LOCK_TIMEOUT_SECONDS):
@@ -1136,6 +1170,8 @@ def update_index_items(filenames: list[str]):
         
     if not valid_filenames:
         return
+    if db_store.in_write_transaction():
+        raise RuntimeError("Index publication must start outside a SQLite transaction")
 
     # Pre-parse canonical nodes. Embedding refresh is handled by the explicit backfill scheduler.
     pre_parsed_data = {}
@@ -1180,233 +1216,243 @@ def update_index_items(filenames: list[str]):
     try:
         with FileLock(lock_path, timeout=15):
             from vector_lake.db_store import transaction
-            with transaction():
-                try:
-                    index_data = _load_index_unlocked(output_path)
-                except json.JSONDecodeError:
+            sql_actions = []
+            try:
+                index_data = _load_index_unlocked(output_path)
+            except json.JSONDecodeError:
+                needs_full_rebuild = True
+                index_data = None
+
+            if index_data is None:
+                needs_full_rebuild = True
+            else:
+                removed_system_keys = _strip_system_nodes(index_data)
+                for system_key in removed_system_keys:
+                    sql_actions.append((db_store.delete_search_index, (system_key,), {}))
+                removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+                if removed_legacy_keys:
+                    log.info(
+                        "Detected legacy embedded governance payloads in index.json "
+                        f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+                    )
                     needs_full_rebuild = True
                     index_data = None
-    
-                if index_data is None:
-                    needs_full_rebuild = True
-                else:
-                    removed_system_keys = _strip_system_nodes(index_data)
-                    for system_key in removed_system_keys:
-                        db_store.delete_search_index(system_key)
-                    removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
-                    if removed_legacy_keys:
-                        log.info(
-                            "Detected legacy embedded governance payloads in index.json "
-                            f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
-                        )
-                        needs_full_rebuild = True
-                        index_data = None
-    
-                if index_data is not None:
-                    if isinstance(index_data.get("categories"), list):
-                        index_data["categories"] = set(index_data["categories"])
-    
-                    # The maps the per-node derivation resolves against, built once for the batch
-                    # exactly as the full build builds them: ``_link_map_for_nodes`` uses the shared
-                    # declaration rule and ``core_name_maps`` the shared core rule, so the pairs and
-                    # the weights this touches cannot drift from the ones a rebuild would produce.
-                    #
-                    # ``pre_parsed_data`` is merged in first: it holds the pages this very batch is
-                    # about, so a link to a name the batch introduces (or whose title/alias it
-                    # changes) resolves now rather than one batch later.  Building the maps from the
-                    # post-batch set is what a rebuild would do, and this is that set for the pages
-                    # the batch touches.
-                    nodes_for_maps = {**(index_data.get("nodes") or {}), **pre_parsed_data}
-                    alias_map = _link_map_for_nodes(nodes_for_maps)
-                    _core_pages, unique_cores = core_name_maps(
-                        nodes_for_maps.keys(), _declared_names_for_nodes(nodes_for_maps)
-                    )
 
-                    # Every node's triples, with their targets resolved: ``calculate_relevance`` reads
-                    # the *other* node's predicate weight from this map, so leaving the targets raw
-                    # meant a typed link written by name (title, alias or core name) was scored as a
-                    # plain mention.  The difference is large enough that a pair with low decay or
-                    # alignment fell under the gate and vanished -- which the read-back used to hide.
-                    # ``pre_parsed_data`` holds the pages this batch is about, so a page introduced by
-                    # it is present before its own pass runs.
-                    all_nodes_triples = {}
-                    for k, v in nodes_for_maps.items():
-                        td = {}
-                        for t in ((v or {}).get("triples") or []):
-                            target = t.get("target")
-                            if target:
-                                td[resolve_link_target(target, alias_map, unique_cores) or target] = (
-                                    t.get("predicate", "mentions")
-                                )
-                        all_nodes_triples[k] = td
+            if index_data is not None:
+                if isinstance(index_data.get("categories"), list):
+                    index_data["categories"] = set(index_data["categories"])
 
-                    for filename in valid_filenames:
-                        node_key = filename[:-3]
-    
-                        if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
-                            index_data.setdefault("error_log", [])
-                            index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
-                            index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
-                            log.warning(f"Schema violation in {filename} during partial update.")
+                # The maps the per-node derivation resolves against, built once for the batch
+                # exactly as the full build builds them: ``_link_map_for_nodes`` uses the shared
+                # declaration rule and ``core_name_maps`` the shared core rule, so the pairs and
+                # the weights this touches cannot drift from the ones a rebuild would produce.
+                #
+                # ``pre_parsed_data`` is merged in first: it holds the pages this very batch is
+                # about, so a link to a name the batch introduces (or whose title/alias it
+                # changes) resolves now rather than one batch later.  Building the maps from the
+                # post-batch set is what a rebuild would do, and this is that set for the pages
+                # the batch touches.
+                nodes_for_maps = {**(index_data.get("nodes") or {}), **pre_parsed_data}
+                alias_map = _link_map_for_nodes(nodes_for_maps)
+                _core_pages, unique_cores = core_name_maps(
+                    nodes_for_maps.keys(), _declared_names_for_nodes(nodes_for_maps)
+                )
+
+                # Every node's triples, with their targets resolved: ``calculate_relevance`` reads
+                # the *other* node's predicate weight from this map, so leaving the targets raw
+                # meant a typed link written by name (title, alias or core name) was scored as a
+                # plain mention.  The difference is large enough that a pair with low decay or
+                # alignment fell under the gate and vanished -- which the read-back used to hide.
+                # ``pre_parsed_data`` holds the pages this batch is about, so a page introduced by
+                # it is present before its own pass runs.
+                all_nodes_triples = {}
+                for k, v in nodes_for_maps.items():
+                    td = {}
+                    for t in ((v or {}).get("triples") or []):
+                        target = t.get("target")
+                        if target:
+                            td[resolve_link_target(target, alias_map, unique_cores) or target] = (
+                                t.get("predicate", "mentions")
+                            )
+                    all_nodes_triples[k] = td
+
+                for filename in valid_filenames:
+                    node_key = filename[:-3]
+
+                    if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
+                        index_data.setdefault("error_log", [])
+                        index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
+                        index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
+                        log.warning(f"Schema violation in {filename} during partial update.")
+                        old_node = (index_data.get("nodes") or {}).pop(node_key, None)
+                        if old_node:
+                            sql_actions.append((db_store.delete_search_index, (node_key,), {}))
+                        index_data["weighted_edges"] = [
+                            edge for edge in (index_data.get("weighted_edges") or [])
+                            if edge["source"] != node_key and edge["target"] != node_key
+                        ]
+                    else:
+                        # The alias map is rebuilt from every node below, through the one
+                        # shared rule; the old code patched entries here and re-added them
+                        # (including the page's ``id``) with plain assignment, which is how the
+                        # incremental path came to reuse a different resolution rule than the
+                        # full build -- the difference the read-back used to paper over.
+                        index_data.setdefault("error_log", [])
+                        index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
+
+                        node_data = pre_parsed_data.get(node_key)
+                        if node_data is None:
                             old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                             if old_node:
-                                db_store.delete_search_index(node_key)
+                                sql_actions.append((db_store.delete_search_index, (node_key,), {}))
                             index_data["weighted_edges"] = [
                                 edge for edge in (index_data.get("weighted_edges") or [])
                                 if edge["source"] != node_key and edge["target"] != node_key
                             ]
                         else:
-                            # The alias map is rebuilt from every node below, through the one
-                            # shared rule; the old code patched entries here and re-added them
-                            # (including the page's ``id``) with plain assignment, which is how the
-                            # incremental path came to reuse a different resolution rule than the
-                            # full build -- the difference the read-back used to paper over.
-                            index_data.setdefault("error_log", [])
-                            index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
-    
-                            node_data = pre_parsed_data.get(node_key)
-                            if node_data is None:
-                                old_node = (index_data.get("nodes") or {}).pop(node_key, None)
-                                if old_node:
-                                    db_store.delete_search_index(node_key)
+                            if node_data is not None:
+                                index_data["nodes"][node_key] = node_data
+                                aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
+                                body_text = pre_parsed_bodies.get(node_key, "")
+                                text = f"{aliases_str} {body_text}"
+                                t_title = _tokenize_for_fts(node_data.get('title', ''))
+                                t_summary = _tokenize_for_fts(node_data.get('summary', ''))
+                                t_text = _tokenize_for_fts(text)
+                                sql_actions.append((
+                                    db_store.upsert_search_index,
+                                    (node_key, t_title, t_summary, t_text),
+                                    {"content_hash": _node_content_digest(node_data, body_text)},
+                                ))
+                                # The stale vector must not outlive the rewrite, and this path
+                                # must not call an embedding provider (pinned by
+                                # ``test_incremental_index_invalidates_stale_vector_without_api``),
+                                # so invalidation here is deliberate.  The counterpart that puts
+                                # the vector back is the periodic sweep
+                                # (``periodic_catch_up._embedding_catch_up``); the old comment
+                                # promised "explicit backfill", which only ever ran when an
+                                # operator remembered, and the projection shrank to 2 602 of
+                                # 7 175 nodes before that was noticed on 2026-09-21.
+                                sql_actions.append((db_store.delete_embedding, (node_key,), {}))
+                                
+
+                                if isinstance(node_data["categories"], list):
+                                    categories = set((index_data.get("categories") or []))
+                                    for category in node_data["categories"]:
+                                        categories.add(category)
+                                    index_data["categories"] = categories
+
                                 index_data["weighted_edges"] = [
                                     edge for edge in (index_data.get("weighted_edges") or [])
                                     if edge["source"] != node_key and edge["target"] != node_key
                                 ]
-                            else:
-                                if node_data is not None:
-                                    index_data["nodes"][node_key] = node_data
-                                    aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
-                                    body_text = pre_parsed_bodies.get(node_key, "")
-                                    text = f"{aliases_str} {body_text}"
-                                    t_title = _tokenize_for_fts(node_data.get('title', ''))
-                                    t_summary = _tokenize_for_fts(node_data.get('summary', ''))
-                                    t_text = _tokenize_for_fts(text)
-                                    db_store.upsert_search_index(
-                                        node_key,
-                                        t_title,
-                                        t_summary,
-                                        t_text,
-                                        content_hash=_node_content_digest(node_data, body_text),
-                                    )
-                                    # The stale vector must not outlive the rewrite, and this path
-                                    # must not call an embedding provider (pinned by
-                                    # ``test_incremental_index_invalidates_stale_vector_without_api``),
-                                    # so invalidation here is deliberate.  The counterpart that puts
-                                    # the vector back is the periodic sweep
-                                    # (``periodic_catch_up._embedding_catch_up``); the old comment
-                                    # promised "explicit backfill", which only ever ran when an
-                                    # operator remembered, and the projection shrank to 2 602 of
-                                    # 7 175 nodes before that was noticed on 2026-09-21.
-                                    db_store.delete_embedding(node_key)
-                                    
-    
-                                    if isinstance(node_data["categories"], list):
-                                        categories = set((index_data.get("categories") or []))
-                                        for category in node_data["categories"]:
-                                            categories.add(category)
-                                        index_data["categories"] = categories
-    
-                                    index_data["weighted_edges"] = [
-                                        edge for edge in (index_data.get("weighted_edges") or [])
-                                        if edge["source"] != node_key and edge["target"] != node_key
-                                    ]
-                                    node_data["_key"] = node_key
-                                    all_nodes = index_data["nodes"]
-    
-                                    # Resolution happens here, not only in the full build.  This loop
-                                    # used to compare *raw* link strings, so a link by core name or
-                                    # alias produced no pair at all -- the difference the read-back
-                                    # that used to follow it had been compensating for, which is why a
-                                    # link deleted from a page kept its edge (the projection was the
-                                    # source of that edge rather than the derivation).
-                                    def _resolved(names):
-                                        return {
-                                            resolve_link_target(name, alias_map, unique_cores) or name
-                                            for name in names
-                                        }
+                                node_data["_key"] = node_key
+                                all_nodes = index_data["nodes"]
 
-                                    td = {}
-                                    for t in (node_data.get("triples") or []):
-                                        if t.get("target"):
-                                            target = t["target"]
-                                            td[resolve_link_target(target, alias_map, unique_cores) or target] = (
-                                                t.get("predicate", "mentions")
-                                            )
-                                    all_nodes_triples[node_key] = td
-                                    triples_a = td
-                                    
-                                    node_links = _resolved(node_data.get("links") or [])
-                                    node_sources = set((node_data.get("sources") or []))
-                                    for other_key, other_node in all_nodes.items():
-                                        if other_key == node_key:
-                                            continue
-                                            
-                                        other_links = _resolved(other_node.get("links") or [])
-                                        other_sources = set((other_node.get("sources") or []))
-                                        triples_b = all_nodes_triples.get(other_key)
-                                        
-                                        has_direct = other_key in node_links or node_key in other_links
-                                        # Optimization: Replace bool(set1 & set2) with not isdisjoint() to prevent allocating a new set just to check for overlap
-                                        has_source_overlap = not node_sources.isdisjoint(other_sources)
-                                        has_common_neighbor = not node_links.isdisjoint(other_links)
-                                        
-                                        if not (has_direct or has_source_overlap or has_common_neighbor):
-                                            continue
-    
-                                        # The pair is scored in the orientation the full build uses:
-                                        # "a" is the lexicographically smaller key, because
-                                        # TYPE_AFFINITY is asymmetric and the full build only ever asks
-                                        # for key_a < key_b.  Scoring from the updated node instead gave
-                                        # the same pair a different weight.
-                                        if node_key < other_key:
-                                            first, second = node_data, other_node
-                                            first_key, second_key = node_key, other_key
-                                            first_links, second_links = node_links, other_links
-                                            first_sources, second_sources = node_sources, other_sources
-                                            first_triples, second_triples = triples_a, triples_b
-                                        else:
-                                            first, second = other_node, node_data
-                                            first_key, second_key = other_key, node_key
-                                            first_links, second_links = other_links, node_links
-                                            first_sources, second_sources = other_sources, node_sources
-                                            first_triples, second_triples = triples_b, triples_a
-                                        first["_key"] = first_key
-                                        second["_key"] = second_key
-                                        relevance = calculate_relevance(
-                                            first, second, all_nodes,
-                                            links_a=first_links, links_b=second_links,
-                                            sources_a=first_sources, sources_b=second_sources,
-                                            triples_a=first_triples, triples_b=second_triples
+                                # Resolution happens here, not only in the full build.  This loop
+                                # used to compare *raw* link strings, so a link by core name or
+                                # alias produced no pair at all -- the difference the read-back
+                                # that used to follow it had been compensating for, which is why a
+                                # link deleted from a page kept its edge (the projection was the
+                                # source of that edge rather than the derivation).
+                                def _resolved(names):
+                                    return {
+                                        resolve_link_target(name, alias_map, unique_cores) or name
+                                        for name in names
+                                    }
+
+                                td = {}
+                                for t in (node_data.get("triples") or []):
+                                    if t.get("target"):
+                                        target = t["target"]
+                                        td[resolve_link_target(target, alias_map, unique_cores) or target] = (
+                                            t.get("predicate", "mentions")
                                         )
-                                        if relevance >= 1.5:
-                                            index_data["weighted_edges"].append({
-                                                "source": first_key,
-                                                "target": second_key,
-                                                "weight": relevance,
-                                            })
-                                        other_node.pop("_key", None)
-                                    node_data.pop("_key", None)
-    
-                    # Once per batch, after every branch: rebuilding inside the loop cost
-                    # O(batch x corpus) under the index lock, and the deletion branch (which pops
-                    # the node) never rebuilt at all, leaving a removed page's names resolvable.
-                    index_data["aliases"] = _link_map_for_nodes(index_data["nodes"])
-                    _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
-                    # Re-apply the shared cap and pair-level dedup after the batch: the loop above
-                    # appends every qualifying edge for each touched node, so the published set has
-                    # to be normalised back to weighted_edges' documented contract (one row per
-                    # unordered pair, min/max orientation, degree cap).
-                    index_data["weighted_edges"] = dedupe_and_prune_edges(
-                        index_data.get("weighted_edges") or []
-                    )
-                    index_data["categories"] = list((index_data.get("categories") or []))
-                    # Do not recompute heavy debt metrics on partial update
-                    index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
-                    index_data["schema_version"] = "8.0"
-                    # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
-                    _write_index(output_path, index_data)
-                    _write_claim_graph(str(get_claim_graph_path()), governance_store.build_claim_graph_projection())
+                                all_nodes_triples[node_key] = td
+                                triples_a = td
+                                
+                                node_links = _resolved(node_data.get("links") or [])
+                                node_sources = set((node_data.get("sources") or []))
+                                for other_key, other_node in all_nodes.items():
+                                    if other_key == node_key:
+                                        continue
+                                        
+                                    other_links = _resolved(other_node.get("links") or [])
+                                    other_sources = set((other_node.get("sources") or []))
+                                    triples_b = all_nodes_triples.get(other_key)
+                                    
+                                    has_direct = other_key in node_links or node_key in other_links
+                                    # Optimization: Replace bool(set1 & set2) with not isdisjoint() to prevent allocating a new set just to check for overlap
+                                    has_source_overlap = not node_sources.isdisjoint(other_sources)
+                                    has_common_neighbor = not node_links.isdisjoint(other_links)
+                                    
+                                    if not (has_direct or has_source_overlap or has_common_neighbor):
+                                        continue
+
+                                    # The pair is scored in the orientation the full build uses:
+                                    # "a" is the lexicographically smaller key, because
+                                    # TYPE_AFFINITY is asymmetric and the full build only ever asks
+                                    # for key_a < key_b.  Scoring from the updated node instead gave
+                                    # the same pair a different weight.
+                                    if node_key < other_key:
+                                        first, second = node_data, other_node
+                                        first_key, second_key = node_key, other_key
+                                        first_links, second_links = node_links, other_links
+                                        first_sources, second_sources = node_sources, other_sources
+                                        first_triples, second_triples = triples_a, triples_b
+                                    else:
+                                        first, second = other_node, node_data
+                                        first_key, second_key = other_key, node_key
+                                        first_links, second_links = other_links, node_links
+                                        first_sources, second_sources = other_sources, node_sources
+                                        first_triples, second_triples = triples_b, triples_a
+                                    first["_key"] = first_key
+                                    second["_key"] = second_key
+                                    relevance = calculate_relevance(
+                                        first, second, all_nodes,
+                                        links_a=first_links, links_b=second_links,
+                                        sources_a=first_sources, sources_b=second_sources,
+                                        triples_a=first_triples, triples_b=second_triples
+                                    )
+                                    if relevance >= 1.5:
+                                        index_data["weighted_edges"].append({
+                                            "source": first_key,
+                                            "target": second_key,
+                                            "weight": relevance,
+                                        })
+                                    other_node.pop("_key", None)
+                                node_data.pop("_key", None)
+
+                # Once per batch, after every branch: rebuilding inside the loop cost
+                # O(batch x corpus) under the index lock, and the deletion branch (which pops
+                # the node) never rebuilt at all, leaving a removed page's names resolvable.
+                index_data["aliases"] = _link_map_for_nodes(index_data["nodes"])
+                _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
+                # Re-apply the shared cap and pair-level dedup after the batch: the loop above
+                # appends every qualifying edge for each touched node, so the published set has
+                # to be normalised back to weighted_edges' documented contract (one row per
+                # unordered pair, min/max orientation, degree cap).
+                index_data["weighted_edges"] = dedupe_and_prune_edges(
+                    index_data.get("weighted_edges") or []
+                )
+                index_data["categories"] = list((index_data.get("categories") or []))
+                # Do not recompute heavy debt metrics on partial update
+                index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
+                index_data["schema_version"] = "8.0"
+                # Independent canonical writers may commit while planning holds only
+                # the index lock. Read all graph collections from one WAL generation.
+                with db_store.read_snapshot():
+                    claim_graph = governance_store.build_claim_graph_projection()
+
+            # Only the batch's SQL changes share a write transaction. The index file
+            # lock still serializes planning/publication; slow graph and JSON work
+            # must not monopolize SQLite's database-wide writer lock.
+            if sql_actions:
+                with transaction():
+                    for operation, args, kwargs in sql_actions:
+                        operation(*args, **kwargs)
+            if index_data is not None:
+                _write_index(output_path, index_data)
+                _write_claim_graph(str(get_claim_graph_path()), claim_graph)
     except Timeout:
         raise TimeoutError(f"Timeout while acquiring lock for {output_path}")
 
@@ -1424,6 +1470,8 @@ def refresh_graph_topology_if_dirty() -> bool:
     A full rebuild must not run while this function still holds the index lock
     or an open transaction; it acquires both itself.
     """
+    if db_store.in_write_transaction():
+        raise RuntimeError("Index publication must start outside a SQLite transaction")
     output_path = str(get_index_path())
     if not os.path.exists(output_path):
         generate_index()
@@ -1457,31 +1505,32 @@ def refresh_graph_topology_if_dirty() -> bool:
         with FileLock(lock_path, timeout=INDEX_LOCK_TIMEOUT_SECONDS):
             from vector_lake.db_store import transaction
 
-            with transaction():
-                try:
-                    index_data = _load_index_unlocked(output_path)
-                except json.JSONDecodeError:
-                    index_data = None
+            try:
+                index_data = _load_index_unlocked(output_path)
+            except json.JSONDecodeError:
+                index_data = None
 
-                if index_data is None:
+            if index_data is None:
+                needs_full_rebuild = True
+            else:
+                removed_system_keys = _strip_system_nodes(index_data)
+                if removed_system_keys:
+                    with transaction():
+                        for system_key in removed_system_keys:
+                            db_store.delete_search_index(system_key)
+
+                removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+                if removed_legacy_keys:
+                    log.info(
+                        "Detected legacy embedded governance payloads during graph refresh "
+                        f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+                    )
                     needs_full_rebuild = True
-                else:
-                    removed_system_keys = _strip_system_nodes(index_data)
-                    for system_key in removed_system_keys:
-                        db_store.delete_search_index(system_key)
-
-                    removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
-                    if removed_legacy_keys:
-                        log.info(
-                            "Detected legacy embedded governance payloads during graph refresh "
-                            f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
-                        )
-                        needs_full_rebuild = True
-                    elif is_graph_dirty(index_data):
-                        _apply_graph_topology(index_data)
-                        _write_index(output_path, index_data)
-                        log.info("Graph topology partially refreshed and saved.")
-                        changed = True
+                elif is_graph_dirty(index_data):
+                    _apply_graph_topology(index_data)
+                    _write_index(output_path, index_data)
+                    log.info("Graph topology partially refreshed and saved.")
+                    changed = True
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
         return False

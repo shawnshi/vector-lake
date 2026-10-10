@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from vector_lake import cli_app, db_store, mcp_server, tools
-from vector_lake.backup_retention import prune_backups
+from vector_lake.backup_retention import prune_backups, seal_backup
 
 _OUTBOX_INDEX = "idx_mutation_outbox_idempotency"
 
@@ -49,8 +49,12 @@ def _seed_backups(memory_dir: Path, count: int = 4) -> Path:
     for index in range(count):
         path = root / f"vector_lake_{index}.db.bak"
         path.write_bytes(b"x" * 1024)
+        members = [path]
         for suffix in ("-wal", "-shm"):
-            path.with_name(path.name + suffix).write_bytes(b"")
+            sidecar = path.with_name(path.name + suffix)
+            sidecar.write_bytes(b"")
+            members.append(sidecar)
+        seal_backup(path, members, sqlite_integrity="ok", database_member=path.name)
     return root
 
 
@@ -131,7 +135,7 @@ def test_backup_retention_report_applies_only_past_the_bound(isolated_memory):
     report = tools.backup_retention_report(keep=2, dry_run=False)
 
     assert "[APPLIED]" in report
-    assert "The newest copy is always kept." in report
+    assert "The newest verified copy is always kept." in report
     assert len(list(root.glob("*.db.bak"))) == 2
 
 

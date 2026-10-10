@@ -126,7 +126,7 @@ def test_embed_texts_does_not_import_the_sdk_on_the_default_path(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(
         embedding_scheduler, "_rest_embed_contents",
-        lambda contents, cfg: [[0.1] * cfg.dimension for _ in contents],
+        lambda contents, cfg, **_kwargs: [[0.1] * cfg.dimension for _ in contents],
     )
     client_calls = []
     monkeypatch.setattr(embedding_scheduler, "_shared_client", lambda: client_calls.append(1))
@@ -144,7 +144,7 @@ def test_the_sdk_path_is_still_available(monkeypatch):
     config = _config()
 
     class _Models:
-        def embed_content(self, model=None, contents=None):
+        def embed_content(self, model=None, contents=None, **_kwargs):
             return type(
                 "R", (), {"embeddings": [type("E", (), {"values": [0.2] * config.dimension})()]}
             )()
@@ -191,7 +191,7 @@ def test_the_backfill_never_builds_an_sdk_client_on_the_rest_path(isolated_memor
     )
     monkeypatch.setattr(
         embedding_scheduler, "_rest_embed_contents",
-        lambda contents, cfg: [[0.4] * cfg.dimension for _ in contents],
+        lambda contents, cfg, **_kwargs: [[0.4] * cfg.dimension for _ in contents],
     )
 
     result = embedding_backfill(

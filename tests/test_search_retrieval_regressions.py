@@ -152,6 +152,8 @@ def test_partial_fts_failure_does_not_replace_good_hits_with_file_fallback(isola
 @pytest.mark.parametrize("fusion", ["sum", "rrf"])
 @pytest.mark.parametrize("engine", ["prepared", "legacy", "python"])
 def test_disconnected_zero_mass_pages_never_enter_pool(isolated_memory, monkeypatch, fusion, engine):
+    if engine != 'python' and not tool_search.HAVE_CORE:
+        pytest.skip('native-only PPR engine; Python engine remains mandatory in fallback lane')
     monkeypatch.setenv("VECTOR_LAKE_FUSION", fusion)
     monkeypatch.setenv("VECTOR_LAKE_EXPANSION_QUOTA", "5")
     if engine == "python":
@@ -169,6 +171,8 @@ def test_disconnected_zero_mass_pages_never_enter_pool(isolated_memory, monkeypa
 
 
 def test_changed_adjacency_rebuilds_cache_even_with_same_generation(monkeypatch):
+    if not tool_search.HAVE_CORE:
+        pytest.skip('native-only prepared PPR cache; native CI hard-requires this ABI')
     old = {"seed": [("old", 1.0)], "old": [("seed", 1.0)]}
     new = {"seed": [("new", 1.0)], "new": [("seed", 1.0)]}
     first = tool_search._ppr_index(old, 7)

@@ -19,6 +19,9 @@ def _database_backup(root: Path, name: str, size: int, mtime: float, sidecars=Tr
             sidecar = path.with_name(path.name + suffix)
             sidecar.write_bytes(b"")
             os.utime(sidecar, (mtime, mtime))
+    # Rule-layer fixtures bind synthetic bytes; SQLite validation is exercised by producer tests.
+    members = [path, *(path.with_name(path.name + suffix) for suffix in ("-wal", "-shm") if sidecars)]
+    backup_retention.seal_backup(path, members, sqlite_integrity="ok", database_member=path.name)
     return path
 
 
@@ -26,7 +29,7 @@ def _directory_backup(root: Path, name: str, size: int, mtime: float) -> Path:
     directory = root / name
     directory.mkdir()
     (directory / "vector_lake.db").write_bytes(b"x" * size)
-    (directory / "manifest.json").write_text("{}", encoding="utf-8")
+    backup_retention.seal_backup(directory, [directory / "vector_lake.db"], sqlite_integrity="ok", database_member="vector_lake.db")
     os.utime(directory, (mtime, mtime))
     return directory
 
@@ -89,7 +92,7 @@ def test_byte_cap_drops_the_entries_that_would_cross_it(backup_root):
         "vector_lake_2.db.bak",
         "vector_lake_1.db.bak",
     ]
-    assert plan["removable_bytes"] == 200
+    assert plan["removable_bytes"] > 200, "receipts are part of the removable footprint"
 
 
 def test_the_newest_entry_is_never_removable(backup_root):
@@ -111,6 +114,7 @@ def test_sidecars_travel_with_their_database_unit(backup_root):
         "vector_lake_1.db.bak",
         "vector_lake_1.db.bak-wal",
         "vector_lake_1.db.bak-shm",
+        "vector_lake_1.db.bak.verified.json",
     ]
 
 
@@ -154,10 +158,11 @@ def test_prune_removes_exactly_the_planned_entries(backup_root):
 
     assert result["deleted"] == ["vector_lake_1.db.bak", "vector_lake_0.db.bak"]
     assert result["failures"] == []
-    assert [path.name for path in sorted(backup_root.iterdir())] == [
+    assert [path.name for path in sorted(backup_root.iterdir()) if path.name != backup_retention.BACKUP_LOCK_NAME] == [
         "vector_lake_2.db.bak",
         "vector_lake_2.db.bak-shm",
         "vector_lake_2.db.bak-wal",
+        "vector_lake_2.db.bak.verified.json",
     ]
 
 

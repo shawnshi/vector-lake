@@ -76,26 +76,34 @@ def _diff_sets() -> dict[str, set[str]]:
 
 
 def create_maintenance_backup(label: str = "maintenance") -> str:
-    """Create a consistent SQLite backup and copy recoverable projections."""
-    backup_dir = get_meta_dir() / "backups" / f"{label}_{_utc_stamp()}"
-    # Same-second invocations must not collide; a failed mkdir used to abort the repair.
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
-    if get_db_path().exists():
-        target = backup_dir / get_db_path().name
-        backup_database(target)
-        copied.append(target.name)
-    for path in [get_index_path(), get_claim_graph_path()]:
-        if Path(path).exists():
-            target = backup_dir / Path(path).name
-            shutil.copy2(path, target)
+    """Publish a completed database snapshot and recoverable projection files."""
+    from vector_lake.backup_retention import BACKUP_LOCK_NAME, backup_lock, seal_backup
+
+    root = get_meta_dir() / "backups"
+    root.mkdir(parents=True, exist_ok=True)
+    backup_dir = root / f"{label}_{_utc_stamp()}"
+    staging = backup_dir.with_name(backup_dir.name + ".partial")
+    with backup_lock(root):
+        staging.mkdir()
+        copied: list[str] = []
+        database_checked = get_db_path().exists()
+        if database_checked:
+            target = staging / get_db_path().name
+            backup_database(target)
             copied.append(target.name)
-    manifest = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "label": label,
-        "copied": copied,
-    }
-    (backup_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        for path in [get_index_path(), get_claim_graph_path()]:
+            if Path(path).exists():
+                target = staging / Path(path).name
+                shutil.copy2(path, target)
+                copied.append(target.name)
+        manifest = {"created_at": datetime.now(timezone.utc).isoformat(), "label": label, "copied": copied}
+        if database_checked:
+            (staging / BACKUP_LOCK_NAME).unlink(missing_ok=True)
+            seal_backup(staging, list(staging.iterdir()), sqlite_integrity="ok", database_member=get_db_path().name, metadata=manifest)
+        else:
+            manifest["state"] = "unverified"
+            (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        staging.replace(backup_dir)
     return str(backup_dir)
 
 

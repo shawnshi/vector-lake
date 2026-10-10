@@ -584,9 +584,16 @@ def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]
     init_db()
     requested = set(page_keys) if page_keys is not None else None
     rows_by_page: dict[str, list[tuple[str, str]]] = {}
-    rows = get_connection().execute(
-        "SELECT entity_id, data_json FROM entities ORDER BY entity_id"
-    ).fetchall()
+    if requested is not None and not requested:
+        return {}
+    if requested is None:
+        rows = get_connection().execute("SELECT entity_id, data_json FROM entities ORDER BY entity_id").fetchall()
+    else:
+        placeholders = ",".join("?" for _ in requested)
+        rows = get_connection().execute(
+            f"SELECT entity_id, data_json FROM entities WHERE f_page_key IN ({placeholders}) ORDER BY entity_id",
+            tuple(sorted(requested)),
+        ).fetchall()
     for row in rows:
         raw = str(row["data_json"])
         try:

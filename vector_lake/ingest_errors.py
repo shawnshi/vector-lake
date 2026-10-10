@@ -4,6 +4,16 @@ from __future__ import annotations
 from enum import Enum
 
 
+# Host mechanical closures are not model/source rejection evidence.
+REJECT_DUPLICATE = (
+    "该原始文件的 Source 页已发布（frontmatter sources 已声明此 raw 路径），"
+    "此任务为重复准备；由 ingest runner 自动关闭以免重复入库。"
+)
+REJECT_MISSING_SOURCE = "原始文件在 raw 目录下已不存在，任务无法完成；由 ingest runner 自动关闭。"
+
+MECHANICAL_REJECTION_REASONS = frozenset({REJECT_DUPLICATE, REJECT_MISSING_SOURCE})
+
+
 class IngestFailureKind(str, Enum):
     VERSION_CONFLICT = "version_conflict"
     LEASE_LOST = "lease_lost"

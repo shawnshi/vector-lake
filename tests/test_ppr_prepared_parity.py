@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import pytest
 
-import vector_lake_core as core
+# Native-only parity tests: the explicit fallback lane has no core by design.
+# The native CI entrypoint separately requires this ABI before collection.
+core = pytest.importorskip('vector_lake_core', reason='native-only prepared PPR parity')
 from vector_lake import tool_search
 
 requires_prepared = pytest.mark.skipif(
