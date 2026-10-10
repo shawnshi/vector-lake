@@ -237,11 +237,12 @@ def test_the_metric_evidence_census_reports_coverage_and_gaps(isolated_memory):
         return f"{head}{line if metric else ''}\n{sep}{tail}"
 
     def page(name: str, tier: str, metric: bool) -> None:
+        evidence_line = f"evidence_tier: {tier}\n" if tier else ""
         (wiki / name).write_text(
             "---\n"
             f"id: {name[:-3].lower()}\ntitle: {name[:-3]}\ntype: concept\ndomain: Medical_IT\n"
             "status: Active\nepistemic-status: seed\ncategories: [System_Architecture]\n"
-            f"strategic_scope: core\n{f'evidence_tier: {tier}\n' if tier else ''}"
+            f"strategic_scope: core\n{evidence_line}"
             "updated: 2026-09-23T00:00:00Z\nsources: []\n---\n\n" + body(metric),
             encoding="utf-8",
         )
