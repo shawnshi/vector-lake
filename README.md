@@ -44,6 +44,7 @@ python -B scripts/business_acceptance.py --backend fallback --output /path/to/ne
 |全量重建成本取决于语料与后端|全量重建需要读取与分词正文；增量路径可跳过未变更节点，不使用旧语料耗时外推当前实例|仅在必要时全量重建；日常依赖增量更新，并记录当前工作负载下的耗时|
 |过滤态扩容有界|查询内复用候选池前缀与过滤判定；候选池最多 4096 条，宽泛过滤仍可能触顶或超过延迟预算|触顶时保留不完整告警，不把有界候选检索写成精确全量检索。性能需按当前语料和 provider 网络重新测量，历史结果见 [CHANGELOG](CHANGELOG.md)|
 |人工编辑会经过校验|未通过 schema / 目的契约校验的手改页面会被拒绝并保留原文件，日志给出原因|修复页面后重新保存，或查看守护进程状态文件的 `current_action`|
+|增量 wiki 监听只识别小写 `.md`|现有大写 `.MD` 页面的路径兼容不代表增量监听会接收其事件|新页面使用小写 `.md`；已有大写扩展名页面需核对全量重建结果，不以主进程心跳证明其增量索引已更新|
 
 ## Architecture
 
@@ -116,7 +117,7 @@ Runner 状态中的 `finalized` 保留为成功关闭作业总数；另有 `publ
 
 来源/页面校验失败仍使用原有来源预算。模型进程退出、超时、无效交付 JSON 和宿主运行故障则保留来源预算，通过带围栏的释放等待重试；它们不是内容拒绝。Runner 将后端状态写入 `.meta/runtime/runner_backend_state.json`：前两次连续执行故障分别退避 5、10 秒，第三次进入 `open`，不再认领或发起新模型调用，重启也不自动清零。已经运行的并发调用可以结束，迟到成功不能自动解除 `open`。在途请求可能多于三次，三次是暂停触发阈值，不是并发时的总请求数上限。
 
-状态损坏/不可读时停止启动，不伪造健康。修复后可由所有者显式使用 Runner 的 `--reset-backend` 清除暂停；此操作必须取得同一根的消费者锁，不能与 `--check` 合用，不验证认证，也不能重置已有来源失败次数。该标志随后会按正常 Runner 模式执行工作，故实际运行/服务重启须另有授权；本次代码修改不会自动激活生产服务或清除其状态。Health 单独报告 `runner_backend_paused`，默认告警/strict 降级规则保持不变。
+状态损坏/不可读时停止启动，不伪造健康。修复后可由所有者显式使用 Runner 的 `--reset-backend` 清除暂停；此操作必须取得同一根的消费者锁，不能与 `--check` 合用，不验证认证，也不能重置已有来源失败次数。该标志随后会按正常 Runner 模式执行工作，故实际运行/服务重启须另有授权；磁盘代码修改不会自动激活服务或清除暂停状态。Health 单独报告 `runner_backend_paused`，默认告警/strict 降级规则保持不变。
 
 `--interval` 现在是最大空闲等待：有可执行积压时让步 1 秒后续批；空队列按 5、10、20、40、80 秒退避到配置上限（至少 5 秒）。仅探测 `awaiting_subagent` 或租约已过期的模型任务，不跳过派发/重试的 `available_at`，不将仍有有效租约的任务视为积压。长期空闲后新任务仍可能等待一次最大空闲间隔；这里未引入跨进程事件推送。每个任务完成时由主线程刷新状态，避免长批次直到结束才更新进度。
 
@@ -174,10 +175,12 @@ Gemini/Codex 实际执行可复用安全能力探针；显式 `--check` 仍做�
 ### 1. 运行环境前置要求 (Prerequisites)
 
 * **Python**: `>= 3.10`（推荐 3.11 \~ 3.13）。
-* **操作系统**: Windows (需支持 UTF-8)、macOS、Linux。
+* **操作系统**: Windows（需支持 UTF-8）、Linux；macOS 当前未纳入 CI，需在目标环境验证。跨平台 CI 覆盖 Windows／Ubuntu × Python 3.10／3.13 × native／fallback。
 * **嵌入模型凭据（可选）**：Vector Lake 的 embedding 使用 `GEMINI_API_KEY`；未配置时检索使用 FTS5 与图拓扑，不能生成或补齐向量。文本编译另需所选 Pi / Gemini / Codex CLI 及其原生认证；`ingest.backend` 不改变 embedding 提供方，配置 Key 也不会让 `sync` 自行调用文本模型。
 
 ### 2. 依赖安装 (Dependencies)
+
+在项目专用 Python 虚拟环境中执行，避免改动宿主全局依赖。MCP 与 Watchdog 应分别显式指定部署环境的解释器；GUI 客户端的 `command` 建议填写该 Python 的绝对路径。
 
 ```powershell
 # 1. 克隆仓库并进入根目录
@@ -193,6 +196,8 @@ python scripts/build_core.py
 ```
 
 ### 3. 配置与环境变量 (Configuration & Environment)
+
+升级时保留已有配置与数据，不直接复制示例覆盖它们；示例初始化只用于新部署。
 
 ```powershell
 # 从示例创建配置文件
@@ -236,6 +241,7 @@ Watchdog 的 wiki/raw watcher 与后台循环统一接受线程监督，异常�
 |`PYTHONUTF8`|强制 Python 运行时使用 UTF-8 编码（Windows 强烈推荐）|`1`|
 |`GEMINI_API_KEY`|向量嵌入模型 API Key（Gemini Embedding）；代码从进程环境读取，不从 `config.json` 读取凭据|不在仓库填写|
 |`VECTOR_LAKE_MEMORY_DIR`|显式指定 MEMORY 根路径（优先级高于 `config.json`）|例如 `C:/path/to/MEMORY`|
+|`VECTOR_LAKE_PAYLOAD_ROOT`|额外允许的任务包 sandbox 根，不覆盖内置的仓库 `brain/` 与宿主根；独立代码部署时保留已有任务包原根，不放宽到整个仓库上级|例如 `C:/path/to/vector-lake/brain`|
 |`VECTOR_LAKE_RUNNER_MODEL_CMD`|覆盖 `ingest.backend` 的模型接缝命令；使用配置文件选择后端时应取消此覆盖|通常不设置|
 |`VECTOR_LAKE_RUNNER_SHADOW`|Watchdog 拉起 Runner 时，设为 `1` 跳过模型调用和写页，但仍认领任务、处理重复来源并写运行状态；直接 Runner 默认 shadow，需 `--no-shadow` 才写页|默认 `0`（Watchdog 路径）|
 |`VECTOR_LAKE_RUNNER_CONCURRENCY`|摄取 Runner 并发模型调用线程数，也可由 `ingest_runner.py --concurrency` 覆盖|默认 `1`；按宿主容量调整|
@@ -256,7 +262,7 @@ python cli.py doctor
 
 ### 5. 宿主 Agent 接入 (MCP Client Configuration)
 
-Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 19 个工具；准确注册面由 `mcp_server.py` 与 `tests/test_command_surface.py` 核验。
+Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Desktop、Cursor 等）暴露 20 个工具；准确注册面由 `mcp_server.py` 与 `tests/test_command_surface.py` 核验。
 
 **在客户端配置文件（如 `claude_desktop_config.json` 或 `.mcp.json`）中添加：**
 
@@ -271,14 +277,16 @@ Vector Lake 以标准 Model Context Protocol (MCP) 向宿主（Pi、Claude Deskt
       ],
       "env": {
         "PYTHONPATH": "C:/path/to/vector-lake",
-        "PYTHONUTF8": "1"
+        "PYTHONUTF8": "1",
+        "VECTOR_LAKE_MEMORY_DIR": "C:/path/to/MEMORY",
+        "VECTOR_LAKE_PAYLOAD_ROOT": "C:/path/to/vector-lake/brain"
       }
     }
   }
 }
 ```
 
-`PYTHONPATH` 使用仓库的绝对路径，避免依赖不同客户端的工作目录规则。需要向量嵌入时，由启动环境或客户端的私有配置提供 `GEMINI_API_KEY`，不要把真实密钥写入共享示例。
+`PYTHONPATH` 使用仓库的绝对路径，`VECTOR_LAKE_MEMORY_DIR` 与 `VECTOR_LAKE_PAYLOAD_ROOT` 分别绑定实际 MEMORY 和额外允许的任务包根目录；按部署位置修改示例路径，避免依赖客户端工作目录或宿主默认值。需要向量嵌入时，由启动环境或客户端的私有配置提供 `GEMINI_API_KEY`，不要把真实密钥写入共享示例。
 
 Pi 的文件配置位于 `~/.pi/agent/mcp.json`；其他客户端使用各自的配置入口。在具备 `tool_search` 的 Pi 会话中，可以在该 server 项增加：
 
@@ -291,7 +299,7 @@ Pi 的文件配置位于 `~/.pi/agent/mcp.json`；其他客户端使用各自的
 }
 ```
 
-这是 Pi 的工具暴露配置，不应直接复制到其他 MCP 客户端。更新服务代码后，常驻 Python 进程需要重连或重启；Pi 使用 `/mcp reconnect mentat-mind-mcp`。`doctor` 的新进程导入检查不等于现有连接已经加载新代码。
+这是 Pi 的工具暴露配置，不应直接复制到其他 MCP 客户端。修改 Pi 的 MCP 配置后，使用 `/reload` 重新加载配置；服务代码变更后，常驻 Python 进程仍需重连或重启，可用 `/mcp reconnect mentat-mind-mcp`。在实际连接上调用 `runtime_identity`，核对 PID、加载路径与选定函数身份；`doctor` 的新进程检查、配置文件修改或独立临时客户端都不能替代实际宿主连接验收。
 
 ### 6. 启动后台守护进程 (Starting Daemon)
 
@@ -309,7 +317,7 @@ python watchdog_sync.py
 
 * **双轨看门狗 (Two-Track Watchdog)**：除增量文件外还捕获 `on_deleted` / `on_moved`，因此重命名或删除页面不会在图谱里留下幽灵节点。
 * **写入健康门 (Write Health Gate)**：写入只在**硬故障**下被阻断（数据库不可用、存在 hard-failed 的 `mutation_outbox` 行）。outbox 积压超过 `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`、投影漂移、心跳过期、终态失败作业、时间线 parity 漂移都属于**可修复降级**，只记录告警并继续写入——阻断它们会同时阻断唯一的修复通道。需要严格模式的运维方可分别用 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING` / `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING` 把这些降级提升为阻断。
-* **I/O 批处理防抖 (I/O Debouncing)**：同批次修改合并为一次 `index.json` 写盘；`index.json` 不再保存完整正文（每个节点保留至多 320 字符的摘要，摘要与 `weighted_edges` 各占文件的一部分——具体比例取决于实例），投影写入使用短事务，全量重建不再冻结数据库。
+* **I/O 批处理防抖 (I/O Debouncing)**：同批次修改合并为一次 `index.json` 写盘；`index.json` 不再保存完整正文（每个节点保留至多 320 字符的摘要，摘要与 `weighted_edges` 各占文件的一部分——具体比例取决于实例），增量 FTS 与旧向量作废使用短事务；全量投影刷新仍可能持有写锁，不能保证重建期间没有锁竞争。
 * **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges`，把争议与矛盾结构化为冲突边，Query 时可直接展示领域盲区。
 * **跨类型本体拦截 (PIEA)**：入口级跨类型查重，避免同一名称多态共存；内置正则清洗违规嵌套前缀（如 `Concept_Synthesis_`），并由 schema gate 校验受控前缀与类型。
 * **持久化增量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台变更先写 durable outbox，Watchdog 合并批次后更新索引；`_calculate_weighted_edges` 使用稀疏遍历并限制每节点投影边数。
@@ -343,20 +351,11 @@ Windows 常驻入口为计划任务 **`VectorLake-Watchdog`**，执行 `scripts/
 
 ### 显式当前版本重评（限定60份）
 
-`recompile-ingest` 是本地操作者入口，**不是**普通 `sync` 的新扫描策略，也不是认证或 OS 隔离边界。它只接受冻结78项清单中的39份证据缺口与21份隔离资料；18份有效拒收不得纳入。两个输入文件均须提供 SHA-256，源文件的 SHA-256、MD5、大小与 mtime 必须仍匹配清单。
+`recompile-ingest` 面向固定冻结清单中的60份资料，不是通用重编或普通 `sync` 的替代入口。批准制品、公开性证明、租约、失败预算、延后与完成回执的完整约束见 [专用受控重编说明](docs/controlled-recompile.md)。仅校验、不登记或派发：
 
 ```bash
 python cli.py recompile-ingest --plan <frozen-plan.json> --plan-sha256 <digest> --approval <read-approval.json> --approval-sha256 <digest>
-# 上述只验证，不登记或派发；实际交接再显式增加 --apply --batch-size 1。
 ```
-
-读取批准文件的结构为 `{"version":1,"request_id":"<unique-id>","plan_sha256":"<digest>","read_scope":"public_only","entries":[...]}`。`entries` 必须恰好覆盖60份；每项含 `filepath`、当前 `sha256`、`classification:"public"` 和 `classification_evidence`（12–1000字符）。**不能由目录、domain、URL或程序默认值替操作者填充公开性证明**；未知/私人资料不被这个入口接收，SHA-256也只绑定批准制品，不证明其分类主张。当前入口不提供私人资料的隔离授权模式。
-
-交接复用原生任务包、单实例Runner、claim/lease及 `finalize_ingest`；使用独立 `ingest_recompile` 作业类型，旧Runner不会把它领取后按duplicate关闭。只有持久请求、白名单、当前字节与租约全部匹配，才允许本次任务不走C1重复关闭；普通作业的去重不变。Canonical Source命名冲突、其他活跃/待处理任务、新出现的当前版本完成回执、旧账本漂移或不明/共享Source归属均会阻断交接。模型只读取任务目录中的已校验只读源快照，不再打开可变化的原raw；只读属性/工作目录不构成OS安全沙箱。快照在真实finalization后清理，未完成任务的快照保留供恢复。模型不获得混合Wiki候选或私人purpose正文，只能按当前源独立编译或给出真实来源拒收；非Source页保持原生create-only规则。
-
-旧jobs/result_json保留；仅真实finalization才更新processed_files。请求登记的`completed`只是授权记录，**不是模型完成或出版回执**；输出`DISPATCHED_NOT_COMPLETE`也不是完成。新回执另记录request、批准制品及当前SHA-256绑定。失败作业只能通过同一显式入口重交接，保留失败次数与等待时间；更换request_id不会重置同内容的确定性失败预算。先交接1份并验证真实出版/拒收回执，才继续余下对象。新代码须按上文空闲窗口规范加载到常驻Runner；磁盘修改或派发成功不证明新服务已激活。
-
-经操作者明确决定，可用 `--defer-filepath <approved-raw> --defer-sha256 <digest>` 延后一份归属不明的对象，再沿原入口交接其他对象。这不覆盖、改绑或读取该旧Source，不移除60份冻结白名单中的成员，也不改写拒收与处理账本。延后要求当前指纹匹配、没有未完成原生作业，且确实命中归属未证明的门；同一请求仅允许一份，持久记录单列为 `ingest_recompile_deferral`。其 `completed` 只表示延后登记，**不是来源重评完成**；登记后按固定幂等标识校验完整绑定，撤销或损坏必须阻断，旧参数不得复活或换对象，本入口不提供解除延后。交接结果另返回 `deferred` 数量，该对象不能进入模型或finalizer。
 
 历史版本的逐项特性说明不再在本文件维护；版本变更请查 `CHANGELOG.md`，运行契约以本节与上方“已知限制”表为准。
 
@@ -417,8 +416,8 @@ Vector Lake uses a CQRS-like layout with canonical SQLite mutations and derived 
 * **SQLite write-lock scope**: 增量索引的读取、分词、图计算、JSON 发布与 claim graph 构建在全局 SQLite 写事务外执行，仍由共享 index 文件锁串行化。该批次的 FTS 修改和旧向量作废共用短事务；提交后才发布文件并刷新 page projection。文件发布失败会向调用方抛出，outbox 保留重试意图；衍生投影可能暂时部分更新，不能把 SQL 提交当作投影完成。索引入口拒绝外层 SQLite 事务，避免 SQLite → index 锁序倒置。写锁竞争诊断在 commit/rollback 释放锁后记录，不通过 `inspect.stack()` 读取源码；BEGIN 等待预算不包含业务 SQL、投影刷新或诊断持久化时间。全量 page projection、批量 SQL 与 best-effort Tantivy 镜像仍可能持有写锁，其成本另行优化；本改动不承诺消除全部写锁竞争。
 * **Projection refresh costs**: page projection 的 full refresh 仍核对所有节点的八列，并删除不在权威键集合中的行，但完全相同的行不再删除／重写；有变化的行沿用 `INSERT OR REPLACE`，不改成保持 rowid 的 UPSERT。行 JSON 与权威键列表在写事务外准备；边 digest、边刷新、状态戳、partial fallback 与缓存失效保持原路径。返回字段 `nodes_written` 保留历史含义（本次准备／处理的行数），不代表实际被 SQLite 修改的行数。此优化降低写放大，不取消全量节点比较／序列化、边摘要或现有跨事务部分发布边界。
 * **Projection health costs**: `projection_registry.status()` 内，同一 connection 的成功 compound COUNT／anti-join 只执行一次，计数仅在该同步调用内共享，结束或异常后丢弃；嵌套调用与并发 context 独立，直接 health／reconcile 在普通独立调用中仍重新读取。失败仍显式报告 degraded，不转换为 no-data／healthy。它不是跨请求健康缓存，也不是覆盖全部投影的一致性数据库快照；不跳过 `runtime_health` 的目录、canonical、JSON 或深度检查。
-* **Graph candidate costs**: Python／Rust 只在保守的、按原评分括号顺序计算且按各后端规则舍入的亲和度上界仍低于入边阈值时，跳过零权邻居桶与零权来源桶；直接链接、非零贡献、可达阈值的亲和度，以及非有限／负乘数／溢出的回退路径保留。Rust 对存在未列入 `links` 的显式 triple 的两个端点禁用此优化，保留原生路径借共享桶计分的既有行为。不截断候选、不改评分／舍入／prune；真实密集证据仍可能二次方展开。两后端既有评分／截断与原生同权边排序差异不在此处宣称修复，保真验证分别对照各自冻结实现；原生全资格集合的对照使用 cap ≥ 节点数，不冒充同权截断结果的确定性证明。
-* **Concurrency & Atomicity**: 多页变更经 `MutationCoordinator` 在单个 `BEGIN IMMEDIATE` 事务内提交 canonical 状态与 `mutation_outbox` 意图，再物化为 Markdown 投影；事务失败整体回滚，投影失败由 outbox 重试。**Wiki 页面本身没有自动 `*.bak` 备份**——删除类命令（`gc` / `delete`）会先写恢复点目录（`backup/gc/`、`backup/delete-source/`），其余写入依赖 canonical 状态重建。数据库副本写在 `.meta/backups/`（`vector_lake_<ts>.db.bak` 及 `-wal` / `-shm` sidecar），其总量由 `backup-retention` 约束。
+* **Graph candidate costs**: Python／Rust 只在保守的、按原评分括号顺序计算且按各后端规则舍入的亲和度上界仍低于入边阈值时，跳过零权邻居桶与零权来源桶；直接链接、非零贡献、可达阈值的亲和度，以及非有限／负乘数／溢出的回退路径保留。Rust 对存在未列入 `links` 的显式 triple 的两个端点禁用此优化，保留原生路径借共享桶计分的既有行为。不截断候选、不改评分／舍入／prune；真实密集证据仍可能二次方展开。零贡献桶优化的保真验证分别对照各后端冻结实现；原生全资格集合的对照使用 cap ≥ 节点数。剪枝另由 core 0.2.2 统一每节点 15 条 incident 边与同权端点字典序；这不证明两后端的全部评分与证据归一化等价。
+* **Concurrency & Atomicity**: 多页变更经 `MutationCoordinator` 在单个 `BEGIN IMMEDIATE` 事务内提交 canonical 状态与 `mutation_outbox` 意图，再物化为 Markdown 投影；事务失败整体回滚，投影失败由 outbox 重试。**Wiki 页面本身没有自动 `*.bak` 备份**——删除类命令（`gc` / `delete`）会先写恢复点目录（`backup/gc/`、`backup/delete-source/`），其余写入依赖 canonical 状态重建。数据库副本通过 SQLite backup API 写入 `.meta/backups/`，完整性检查后原子发布独立的 `vector_lake_<ts>_<unique>.db.bak` 和 `.verified.json` 回执，不附带运行中的 WAL/SHM。`backup-retention` 只回收验证通过且成员哈希匹配的集合，未知、未完成或变化的集合保留，实际占用可能超过预算。数据库副本不包含 wiki/raw/任务包；完整恢复还需协调这些文件，关闭全部连接后处理原 DB/WAL/SHM，禁止把旧 WAL 混入独立恢复副本。
 
 ```text
 MEMORY/
@@ -435,7 +434,7 @@ MEMORY/
       purpose_vectors.json <-- Legacy fallback for intent weights
       vector_lake.db       <-- Unified SQLite Store (entities, claims, graph, timeline,
                            <--   operational memory, page_index_* projection, vec_embeddings)
-      backups/             <-- Bounded SQLite copies (.db.bak + -wal / -shm sidecars)
+      backups/             <-- Verified standalone SQLite copies + .verified.json receipts
       runtime/             <-- Runner / supervisor / 锁争用状态 JSON
 ```
 
@@ -793,7 +792,7 @@ CJK 分词仅使用 `rjieba`（统一入口 `vector_lake/tokenizer.py`）。无�
 
 #### 原生性能加速 (Rust Native Acceleration)
 
-可选原生核心 `vector_lake_core` 位于 `crates/vector_lake_core`，采用 `cp38-abi3`。各调用路径是否有回退由自身契约决定，安装成功不等于正在运行的宿主已经加载新版本。
+可选原生核心 `vector_lake_core` 当前版本为 **0.2.2**，位于 `crates/vector_lake_core`，采用 `cp38-abi3`。各调用路径是否有回退由自身契约决定，安装成功不等于正在运行的宿主已经加载新版本。
 
 |模块|调用路径|当前职责|
 |-|-|-|
@@ -840,6 +839,7 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 |`vector_lake/thread_supervision.py`|Loop 线程注册表：死线程重启与上报，并区分“按设计结束”与“崩掉”|
 |`vector_lake/process_control.py`|受控子进程启动、进程族收束与共享模型时间预算|
 |`vector_lake/runtime_environment.py`|导入数值库前设置进程级线程默认值，保留显式库配置|
+|`vector_lake/runtime_identity.py`|只读进程身份与选定已加载函数核验；不导入未加载的业务/core 模块|
 
 存储与一致性：
 
@@ -851,11 +851,12 @@ FTS5 更新使用 `fts_rowid` 定位并核对键，避免按页面键扫描虚�
 |`vector_lake/runtime_health.py`|运行时健康评估与写入门（硬故障阻断 / 可修复降级放行）|
 |`vector_lake/wiki_utils.py`|路径解析、frontmatter、原子写入与位置辅助（runtime/outbox 信号目录等）；**命名与身份词表的唯一所有者**（`normalize_entity_name` 决定文件名，`entity_identity_key` 决定比较，`canonical_source_name` 决定 Source 页名）|
 |`vector_lake/node_vocabulary.py`|节点类型词表的唯一来源（类型 ⇄ 前缀、严格文件名模式），零 import 的叶片模块|
+|`vector_lake/path_safety.py`|兼容 Python 3.10 的符号链接／Windows reparse-point 检查|
 |`vector_lake/schema_validator.py`|frontmatter 与正文结构的 schema 校验（含标签与实体命名空间的隔离门）|
 |`vector_lake/defense_hook.py`|写入前防御钩子（schema + purpose 契约统一入口）|
 |`vector_lake/purpose_contract.py`|战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值|
 |`vector_lake/yaml_utils.py`|YAML 存取封装|
-|`vector_lake/backup_retention.py`|`.meta/backups` 的扫描、边界解析与剪枝（最新一份永不删除）|
+|`vector_lake/backup_retention.py`|目录锁、完成回执与成员 SHA-256 验证后的保守回收；保护最新验证副本及未知／变化集合|
 
 索引、检索与记忆：
 
