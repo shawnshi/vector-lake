@@ -189,8 +189,8 @@ def shortlist_keys(
     """
     rows = conn.execute(
         f"SELECT page_key FROM {BITS_TABLE}"
-        " WHERE bits MATCH vec_bit(vec_quantize_binary(vec_f32(?)))"
-        " ORDER BY distance LIMIT ?",
+        " WHERE bits MATCH vec_bit(vec_quantize_binary(vec_f32(?))) AND k = ?"
+        " ORDER BY distance",
         (query_blob, max(1, int(k))),
     ).fetchall()
     return [row[0] for row in rows]

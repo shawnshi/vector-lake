@@ -510,7 +510,13 @@ def test_mid_refresh_raw_edit_is_refused_and_real_finalizer_rejects_old_snapshot
     assert governance_store.canonical_page_versions({payload["canonical_name"][:-3]}).get(payload["canonical_name"][:-3], "") == ""
 
 
-def test_stale_dispatch_handoff_and_failure_cannot_change_new_owner(isolated_memory):
+def test_stale_dispatch_handoff_and_failure_cannot_change_new_owner(isolated_memory, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    class Clock(datetime):
+        current = None
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
     db_store.init_db()
     payload = {"filepath": "raw/synthetic.md", "hash": "synthetic", "canonical_name": "Source_synthetic.md"}
     job_id = db_store.enqueue_job("ingest", payload)
@@ -518,6 +524,8 @@ def test_stale_dispatch_handoff_and_failure_cannot_change_new_owner(isolated_mem
     conn = db_store.get_connection()
     with db_store.transaction():
         conn.execute("UPDATE jobs SET lease_until='2000-01-01T00:00:00+00:00' WHERE job_id=?", (job_id,))
+    Clock.current = datetime.fromisoformat(claim["lease_until"]) - timedelta(seconds=119)
+    monkeypatch.setattr(db_store, "datetime", Clock)
     new_claim = db_store.claim_pending_jobs(limit=1, lease_seconds=120)[0]
     assert new_claim["lease_until"] != claim["lease_until"]
     with pytest.raises(db_store.DispatchClaimLost):

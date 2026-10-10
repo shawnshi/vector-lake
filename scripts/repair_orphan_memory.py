@@ -72,10 +72,19 @@ class Deadline:
         return int(time.monotonic() >= self.end)
 
 
+def clear_authorizer(conn):
+    # Passing None only disables the callback on Python >=3.11. On 3.10 it
+    # leaves an unusable callback which silently denies subsequent SQL.
+    if sys.version_info >= (3, 11):
+        conn.set_authorizer(None)
+    else:
+        conn.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
+
+
 def cleanup_connection(conn, old_timeout):
     errors = []
     actions = (
-        ("authorizer", lambda: conn.set_authorizer(None)),
+        ("authorizer", lambda: clear_authorizer(conn)),
         ("progress_handler", lambda: conn.set_progress_handler(None, 0)),
         ("busy_timeout", lambda: conn.execute("PRAGMA busy_timeout=" + str(old_timeout))),
     )
@@ -238,6 +247,10 @@ def maintain(db_path, directory, mode="dry-run", *, approved_count=None,
     if conn.in_transaction or getattr(db_store._LOCAL, "in_transaction", False):
         raise RuntimeError("Maintenance must own its transaction; nested entry is forbidden")
     positions = recovery_rowids(directory, manifest, rows, budget)
+    # Older SQLite declares the eponymous table via internal schema actions.
+    # Prepare this fixed, empty read before installing the mutation-only guard;
+    # never authorize sqlite_master writes during the protected transaction.
+    conn.execute("SELECT value FROM json_each('[]')").fetchall()
     old_busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
     ids_json = json.dumps([row["memory_id"] for row in rows])
     selected = "memory_id IN (SELECT value FROM json_each(?))"
@@ -353,6 +366,7 @@ def refresh_triggers(db_path, directory, *, approved_count, approved_sha256):
     conn = db_store.get_connection()
     if conn.in_transaction or getattr(db_store._LOCAL, "in_transaction", False):
         raise RuntimeError("Trigger refresh must own its transaction")
+    conn.execute("SELECT value FROM json_each('[]')").fetchall()
     names = ("trg_om_index_insert", "trg_om_index_update")
     names_json = json.dumps(names)
     old_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]

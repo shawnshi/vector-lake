@@ -395,7 +395,7 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
             # Using match because it's fast. It returns L2 distance.
             # Cosine similarity for normalized vectors: 1 - L2^2 / 2
             cursor = conn.execute(
-                "SELECT page_key, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                "SELECT page_key, distance FROM vec_embeddings WHERE embedding MATCH ? AND k = ? ORDER BY distance",
                 (query_blob, limit)
             )
             scored = [(row["page_key"], row["distance"]) for row in cursor.fetchall()]

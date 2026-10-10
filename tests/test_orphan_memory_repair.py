@@ -7,6 +7,17 @@ from scripts.repair_orphan_memory import candidates, freeze, maintain, readonly
 from vector_lake import db_store, memory_gram_index
 
 
+def test_cleanup_restores_read_and_write_after_authorizer(isolated_memory):
+    from scripts.repair_orphan_memory import cleanup_connection
+    conn = db_store.get_connection()
+    timeout = conn.execute('PRAGMA busy_timeout').fetchone()[0]
+    conn.set_authorizer(lambda *_: sqlite3.SQLITE_DENY)
+    assert cleanup_connection(conn, timeout) == []
+    assert conn.execute('SELECT 1').fetchone()[0] == 1
+    conn.execute('CREATE TEMP TABLE cleanup_probe(value)')
+    conn.execute('DROP TABLE cleanup_probe')
+
+
 def seed_memory(conn, memory_id, claim_id, page, *, live_claim=False):
     payload = {"memory_id": memory_id, "memory_type": "fact", "source_claim_id": claim_id,
                "source_page": page + ".md", "text": "Synthetic regression fact",

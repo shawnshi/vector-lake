@@ -670,10 +670,10 @@ def sanitize_wiki_node(filepath: str | Path):
         return
 
     frontmatter, body, _ = read_markdown_file(filepath)
-    today = datetime.datetime.now().strftime("%Y%m%d")
+    today = datetime.datetime.now().date()
     if not frontmatter.get("id"):
-        frontmatter["id"] = f"{today}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
-    frontmatter["updated"] = today
+        frontmatter["id"] = f"{today.strftime('%Y%m%d')}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
+    frontmatter["updated"] = today.isoformat()
     write_markdown_file(filepath, frontmatter, body, skip_validation=False)
 
 

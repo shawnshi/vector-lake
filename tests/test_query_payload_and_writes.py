@@ -23,6 +23,28 @@ from tests.test_ingest_contract import _concept_content, _synthesis_content
 from tests.test_mutation_coordinator import _write_purpose_contract
 
 
+@pytest.mark.parametrize('existing_id', [None, 'existing_identifier'])
+def test_sanitizer_keeps_id_format_and_writes_iso_updated(isolated_memory, monkeypatch, existing_id):
+    from datetime import datetime
+    from types import SimpleNamespace
+    from vector_lake import wiki_utils
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 10, 12)
+    monkeypatch.setattr(wiki_utils, 'datetime', SimpleNamespace(datetime=Clock))
+    monkeypatch.setattr(wiki_utils.random, 'choices', lambda alphabet, k: list('abc123'))
+    _write_purpose_contract(isolated_memory)
+    path = isolated_memory / 'wiki' / 'Concept_Target.md'
+    content = _concept_content()
+    content = content.replace('id: concept_target\n', '' if existing_id is None else f'id: {existing_id}\n')
+    path.write_text(content, encoding='utf-8')
+    wiki_utils.sanitize_wiki_node(path)  # real schema gate and canonical write
+    frontmatter, _, _ = wiki_utils.read_markdown_file(path)
+    assert frontmatter['id'] == (existing_id or '20261010_abc123')
+    assert str(frontmatter['updated']) == '2026-10-10'
+
+
 def _context(**overrides):
     """A complete ``assemble_context`` result, shaped like the real one."""
     context = {

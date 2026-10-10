@@ -48,6 +48,10 @@ def test_windows_reparse_tags_reject_mount_and_symlink_and_unknown(monkeypatch,t
             return SimpleNamespace(st_mode=stat.S_IFDIR,st_file_attributes=0x400,st_reparse_tag=tag)
     with monkeypatch.context() as windows:
         windows.setattr(path_safety.os,'name','nt')
+        # Emulate the Windows stat surface too; Linux correctly lacks these.
+        windows.setattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400, raising=False)
+        windows.setattr(stat, 'IO_REPARSE_TAG_MOUNT_POINT', 0xA0000003, raising=False)
+        windows.setattr(stat, 'IO_REPARSE_TAG_SYMLINK', 0xA000000C, raising=False)
         assert path_safety.is_link_or_junction(LegacyPath()) is expected
 
 

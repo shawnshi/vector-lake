@@ -104,11 +104,17 @@ def test_live_report_json_and_native_identity_are_observations():
 
 def test_missing_native_file_is_not_a_successful_identity(tmp_path, monkeypatch):
     from vector_lake import runtime_identity as ri
+    import importlib.machinery
+    for name in list(sys.modules):
+        if name == 'vector_lake_core' or name.startswith('vector_lake_core.'):
+            monkeypatch.delitem(sys.modules, name)
     core = types.ModuleType('vector_lake_core')
-    core.__file__ = str(tmp_path / 'missing.pyd')
+    core.__file__ = str(tmp_path / ('missing' + importlib.machinery.EXTENSION_SUFFIXES[0]))
     core.version = lambda: 'fixture'
     monkeypatch.setitem(sys.modules, 'vector_lake_core', core)
-    assert ri._native_record()['status'] == 'unverifiable'
+    record = ri._native_record()
+    assert record['status'] == 'unverifiable'
+    assert record['error_type'] == 'FileNotFoundError'
 
 
 def test_mcp_surface_is_readonly_structured_json():

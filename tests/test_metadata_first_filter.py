@@ -427,7 +427,7 @@ def test_supported_binary_backend_keeps_tied_prefixes_across_chunks():
         for i in range(2050):
             blob = bytes([i % 3] * 2) if i % 2 else rng.integers(0, 256, 2, dtype=np.uint8).tobytes()
             conn.execute("INSERT INTO bits_test VALUES (?, vec_bit(?))", (f"p{i:04d}", blob))
-        sql = "SELECT page_key FROM bits_test WHERE bits MATCH vec_bit(?) ORDER BY distance LIMIT ?"
+        sql = "SELECT page_key FROM bits_test WHERE bits MATCH vec_bit(?) AND k = ? ORDER BY distance"
         for query in (bytes([0, 0]), bytes([255, 255]), bytes([0, 255])):
             pool = list(conn.execute(sql, (query, 4096)))
             for depth in (5, 25, 50, 100, 256, 512, 1024, 2048):
