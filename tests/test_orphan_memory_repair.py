@@ -529,7 +529,6 @@ def test_post_commit_cleanup_failure_reports_committed_state(isolated_memory, tm
 
 
 def test_recovery_verification_honors_an_expired_deadline(isolated_memory, tmp_path):
-    import time
     from scripts.repair_orphan_memory import recovery_rowids, load_archive, Deadline
     seed_scope()
     database = db_store.get_db_path()
@@ -537,7 +536,8 @@ def test_recovery_verification_honors_an_expired_deadline(isolated_memory, tmp_p
     freeze(database, archive, 1)
     manifest, rows = load_archive(archive, database)
     budget = Deadline(0.001)
-    time.sleep(0.002)
+    # A short sleep cannot establish expiry on a coarse Windows clock.
+    budget.end -= 1.0
     with pytest.raises(TimeoutError, match="deadline"):
         recovery_rowids(archive, manifest, rows, budget)
     assert not (archive / "recovery-rowids.json").exists()
